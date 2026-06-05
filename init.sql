@@ -181,6 +181,8 @@ CREATE TABLE IF NOT EXISTS `task_runs` (
 
   `dry_run` TINYINT DEFAULT 1,
 
+  `task_mode` VARCHAR(32) DEFAULT 'dry_run',
+
   `error_message` TEXT NULL,
 
   `screenshot_path` VARCHAR(512) NULL,

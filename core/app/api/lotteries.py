@@ -33,6 +33,7 @@ from app.utils.canonicalizer import GenericCanonicalizer
 router = APIRouter()
 PHASES = ["followed", "liked", "commented", "reposted"]
 TASK_FAILURE_DIR = Path("/profiles/task-failures")
+TASK_SHADOW_DIR = Path("/profiles/shadow-runs")
 ADAPTER_PROBE_DIR = Path("/profiles/adapter-probes")
 
 
@@ -369,8 +370,10 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     selector_config = await load_runtime_selector_config()
     platform_selectors = selector_config.get(lottery["platform"], {})
     real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, lottery["platform"])
+    task_mode = resolve_task_mode(data)
+    dry_run = task_mode != "real_run"
 
-    if not data.dry_run:
+    if task_mode == "real_run":
         require_min_role(request, "admin")
         try:
             require_confirmation(request)
@@ -405,6 +408,27 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 actor_id=actor["actor_id"],
             )
             raise
+    elif task_mode == "shadow_run":
+        breaker_allowed, breaker_reason = await circuit_breaker_allows(lottery["platform"])
+        if not breaker_allowed:
+            await audit_event(
+                request,
+                action="lottery.dispatch.shadow",
+                resource_type="lottery",
+                resource_id=lottery_id,
+                result="blocked",
+                risk_level="high",
+                detail={"platform": lottery["platform"], "reason": breaker_reason},
+            )
+            await record_event(
+                aggregate="lottery",
+                aggregate_id=lottery_id,
+                event_type="ShadowRunDenied",
+                payload={"platform": lottery["platform"], "reason": breaker_reason},
+                actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+            raise HTTPException(423, detail=f"Circuit breaker blocks shadow-run: {breaker_reason}")
 
     account = await pick_account(data.account_id, lottery["platform"])
     if not account:
@@ -412,7 +436,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             aggregate="lottery",
             aggregate_id=lottery_id,
             event_type="TaskDispatchBlocked",
-            payload={"platform": lottery["platform"], "reason": "no_available_account", "dry_run": data.dry_run},
+            payload={"platform": lottery["platform"], "reason": "no_available_account", "dry_run": dry_run, "mode": task_mode},
             actor_type="operator",
             actor_id=actor["actor_id"],
         )
@@ -420,9 +444,15 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
 
     task_id = str(uuid.uuid4())
     await database.execute(
-        """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run)
-           VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run)""",
-        {"task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "dry_run": int(data.dry_run)},
+        """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode)
+           VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode)""",
+        {
+            "task_id": task_id,
+            "account_id": account["id"],
+            "lottery_id": lottery_id,
+            "dry_run": int(dry_run),
+            "task_mode": task_mode,
+        },
     )
     await database.execute(
         "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
@@ -437,11 +467,12 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "platform": lottery["platform"],
             "raw_url": lottery["raw_url"],
             "canonical_url": lottery["canonical_url"],
-            "dry_run": "1" if data.dry_run else "0",
+            "dry_run": "1" if dry_run else "0",
+            "mode": task_mode,
             "selector_config": json.dumps(platform_selectors, ensure_ascii=False) if isinstance(platform_selectors, dict) else "{}",
         },
     )
-    if not data.dry_run:
+    if task_mode == "real_run":
         await audit_event(
             request,
             action="lottery.dispatch.real",
@@ -449,6 +480,16 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             resource_id=lottery_id,
             result="queued",
             risk_level="critical",
+            detail={"platform": lottery["platform"], "task_id": task_id, "account_id": account["id"]},
+        )
+    elif task_mode == "shadow_run":
+        await audit_event(
+            request,
+            action="lottery.dispatch.shadow",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="queued",
+            risk_level="medium",
             detail={"platform": lottery["platform"], "task_id": task_id, "account_id": account["id"]},
         )
     await record_event(
@@ -459,7 +500,8 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "platform": lottery["platform"],
             "account_id": account["id"],
             "lottery_id": lottery_id,
-            "dry_run": data.dry_run,
+            "dry_run": dry_run,
+            "mode": task_mode,
             "raw_url": lottery["raw_url"],
         },
         correlation_id=task_id,
@@ -470,12 +512,12 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         aggregate="lottery",
         aggregate_id=lottery_id,
         event_type="LotteryDispatchQueued",
-        payload={"task_id": task_id, "account_id": account["id"], "dry_run": data.dry_run},
+        payload={"task_id": task_id, "account_id": account["id"], "dry_run": dry_run, "mode": task_mode},
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
     )
-    return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id}
+    return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "mode": task_mode}
 
 
 @router.get("/tasks/runs")
@@ -581,8 +623,8 @@ async def get_task_screenshot(task_id: str):
         raise HTTPException(404, detail="Task screenshot not found")
 
     path = Path(row["screenshot_path"]).resolve()
-    safe_root = TASK_FAILURE_DIR.resolve()
-    if not path.exists() or not path.is_file() or not path.is_relative_to(safe_root):
+    safe_roots = [TASK_FAILURE_DIR.resolve(), TASK_SHADOW_DIR.resolve()]
+    if not path.exists() or not path.is_file() or not any(path.is_relative_to(root) for root in safe_roots):
         raise HTTPException(404, detail="Task screenshot not found")
     return FileResponse(path, media_type="image/png")
 
@@ -656,6 +698,12 @@ async def pick_account(account_id: int | None, platform: str):
            LIMIT 1""",
         {"platform": platform},
     )
+
+
+def resolve_task_mode(data: DispatchTaskRequest) -> str:
+    if data.mode:
+        return data.mode.value if hasattr(data.mode, "value") else str(data.mode)
+    return "dry_run" if data.dry_run else "real_run"
 
 
 def parse_json_field(value):

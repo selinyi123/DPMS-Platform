@@ -77,6 +77,7 @@ async def list_accounts():
                       'lottery_id', tr.lottery_id,
                       'status', tr.status,
                       'dry_run', tr.dry_run,
+                      'task_mode', tr.task_mode,
                       'started_at', tr.started_at,
                       'finished_at', tr.finished_at,
                       'error_message', tr.error_message
@@ -93,6 +94,7 @@ async def list_accounts():
                       'lottery_id', tr.lottery_id,
                       'status', tr.status,
                       'dry_run', tr.dry_run,
+                      'task_mode', tr.task_mode,
                       'started_at', tr.started_at,
                       'finished_at', tr.finished_at,
                       'error_message', tr.error_message

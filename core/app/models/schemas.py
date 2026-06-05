@@ -29,6 +29,15 @@ class AccountStatusEnum(StrEnum):
     banned = "banned"
 
 
+class TaskModeEnum(StrEnum):
+
+    dry_run = "dry_run"
+
+    shadow_run = "shadow_run"
+
+    real_run = "real_run"
+
+
 
 class AccountCreate(BaseModel):
 
@@ -193,6 +202,8 @@ class TrackedSourceCreate(BaseModel):
 class DispatchTaskRequest(BaseModel):
 
     account_id: Optional[int] = None
+
+    mode: Optional[TaskModeEnum] = None
 
     dry_run: bool = True
 

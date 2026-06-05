@@ -244,6 +244,14 @@ async def ensure_runtime_schema():
         await database.execute("ALTER TABLE task_runs ADD COLUMN screenshot_path VARCHAR(512) NULL")
     except Exception as exc:
         structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE task_runs ADD COLUMN screenshot_path", error=str(exc))
+    try:
+        await database.execute("ALTER TABLE task_runs ADD COLUMN task_mode VARCHAR(32) NOT NULL DEFAULT 'dry_run' AFTER dry_run")
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE task_runs ADD COLUMN task_mode", error=str(exc))
+    try:
+        await database.execute("UPDATE task_runs SET task_mode = IF(dry_run = 1, 'dry_run', 'real_run') WHERE task_mode IS NULL OR task_mode = ''")
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_backfill_skipped", statement="UPDATE task_runs task_mode", error=str(exc))
     await database.execute(
         """CREATE TABLE IF NOT EXISTS adapter_calibrations (
           id BIGINT AUTO_INCREMENT PRIMARY KEY,

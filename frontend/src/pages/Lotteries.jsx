@@ -15,7 +15,7 @@ export default function Lotteries() {
   const [adapters, setAdapters] = useState([]);
   const [error, setError] = useState('');
   const [discoveryMessage, setDiscoveryMessage] = useState('');
-  const [dispatchMode, setDispatchMode] = useState('dry');
+  const [dispatchMode, setDispatchMode] = useState('dry_run');
   const [selectedAccount, setSelectedAccount] = useState('');
   const [form, setForm] = useState({ platform: 'bilibili', raw_url: 'https://www.bilibili.com/', value_score: 50 });
   const [targetImport, setTargetImport] = useState({ platform: 'bilibili', content: '', value_score: 50 });
@@ -167,10 +167,11 @@ export default function Lotteries() {
       const lottery = lotteries.find(item => item.id === id);
       const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
       await postJSON(`/lotteries/${id}/dispatch`, {
-        dry_run: dispatchMode !== 'real',
-        confirm: dispatchMode === 'real',
+        mode: dispatchMode,
+        dry_run: dispatchMode !== 'real_run',
+        confirm: dispatchMode === 'real_run',
         account_id: selectedMatches ? Number(selectedAccount) : null,
-      }, { confirm: dispatchMode === 'real' });
+      }, { confirm: dispatchMode === 'real_run' });
       notify(t('lotteries.dispatchQueued'), 'success');
       await load();
     } catch (err) {
@@ -225,8 +226,9 @@ export default function Lotteries() {
             {safeAccounts.map(account => <option value={account.id} key={account.id}>A{account.id} / {account.platform} / {t('lotteries.calibrated')}</option>)}
           </select>
           <div className="segmented">
-            <button className={dispatchMode === 'dry' ? 'active' : ''} onClick={() => setDispatchMode('dry')}>{t('lotteries.dryRun')}</button>
-            <button className={dispatchMode === 'real' ? 'active danger' : ''} onClick={() => setDispatchMode('real')}>{t('lotteries.real')}</button>
+            <button className={dispatchMode === 'dry_run' ? 'active' : ''} onClick={() => setDispatchMode('dry_run')}>{t('lotteries.dryRun')}</button>
+            <button className={dispatchMode === 'shadow_run' ? 'active' : ''} onClick={() => setDispatchMode('shadow_run')}>{t('lotteries.shadowRun')}</button>
+            <button className={dispatchMode === 'real_run' ? 'active danger' : ''} onClick={() => setDispatchMode('real_run')}>{t('lotteries.real')}</button>
           </div>
         </div>
       </header>
@@ -384,11 +386,15 @@ export default function Lotteries() {
                   <td className="action-cell">
                     <button
                       onClick={() => dispatch(lottery.id)}
-                      disabled={!safeAccountCount(lottery.platform) || (dispatchMode === 'real' && !realActionReady(lottery.platform))}
-                      title={dispatchMode === 'real' && !realActionReady(lottery.platform) ? t('lotteries.realAdapterMissing') : ''}
-                      className={dispatchMode === 'real' ? 'btn-danger' : 'btn-primary'}
+                      disabled={!safeAccountCount(lottery.platform) || (dispatchMode === 'real_run' && !realActionReady(lottery.platform))}
+                      title={dispatchMode === 'real_run' && !realActionReady(lottery.platform) ? t('lotteries.realAdapterMissing') : ''}
+                      className={dispatchMode === 'real_run' ? 'btn-danger' : 'btn-primary'}
                     >
-                      {!safeAccountCount(lottery.platform) ? t('lotteries.noSafeAccount') : (dispatchMode === 'real' && !realActionReady(lottery.platform) ? t('lotteries.adapterPending') : (dispatchMode === 'real' ? t('lotteries.dispatchReal') : t('lotteries.dispatchDry')))}
+                      {!safeAccountCount(lottery.platform)
+                        ? t('lotteries.noSafeAccount')
+                        : (dispatchMode === 'real_run' && !realActionReady(lottery.platform)
+                            ? t('lotteries.adapterPending')
+                            : t(`lotteries.dispatch_${dispatchMode}`))}
                     </button>
                     <button onClick={() => markResult(lottery.id, 'won')} className="btn-ghost">{t('lotteries.won')}</button>
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
@@ -462,7 +468,7 @@ export default function Lotteries() {
                   <td>A{run.account_id}</td>
                   <td>L{run.lottery_id}</td>
                   <td><StatusBadge status={run.status} /></td>
-                  <td>{run.dry_run ? t('lotteries.dryRun') : t('lotteries.real')}</td>
+                  <td>{modeLabel(run, t)}</td>
                   <td className="small-text">
                     {run.screenshot_path ? (
                       <a
@@ -496,4 +502,10 @@ function safeJson(value) {
 
 function formatText(template, values) {
   return String(template).replace(/\{(\w+)\}/g, (_, key) => values?.[key] ?? '');
+}
+
+function modeLabel(run, t) {
+  const mode = run.task_mode || (run.dry_run ? 'dry_run' : 'real_run');
+  const label = t(`lotteries.${mode}`);
+  return label === `lotteries.${mode}` ? mode : label;
 }

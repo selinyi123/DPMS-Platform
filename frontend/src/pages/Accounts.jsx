@@ -232,7 +232,7 @@ export default function Accounts() {
         <div className="runtime-summary">
           <StatusBadge status={current.status} />
           <span className="mono small-text">T{String(current.task_id || '').slice(0, 8)} / L{current.lottery_id}</span>
-          <span className="small-text">{current.dry_run ? t('lotteries.dryRun') : t('lotteries.real')}</span>
+          <span className="small-text">{modeLabel(current, t)}</span>
         </div>
       );
     }
@@ -483,3 +483,9 @@ const accountText = {
     staleExecutingCooled: 'Stale executing cooled',
   },
 };
+
+function modeLabel(run, t) {
+  const mode = run.task_mode || (run.dry_run ? 'dry_run' : 'real_run');
+  const label = t(`lotteries.${mode}`);
+  return label === `lotteries.${mode}` ? mode : label;
+}
