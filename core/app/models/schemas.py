@@ -215,6 +215,11 @@ class RealRunSettingUpdate(BaseModel):
     enabled: bool
 
 
+class RuntimeRollbackRequest(BaseModel):
+
+    reason: Optional[str] = "manual runtime rollback"
+
+
 class AdapterProbeRequest(BaseModel):
 
     account_id: Optional[int] = None

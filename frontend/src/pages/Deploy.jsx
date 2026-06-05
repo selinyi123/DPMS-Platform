@@ -18,6 +18,8 @@ export default function Deploy() {
   const [adapterConfig, setAdapterConfig] = useState(null);
   const [runtimeSettings, setRuntimeSettings] = useState(null);
   const [realRunArmed, setRealRunArmed] = useState(false);
+  const [rollbackArmed, setRollbackArmed] = useState(false);
+  const [rollbackReason, setRollbackReason] = useState('manual rollback');
   const [selectorJson, setSelectorJson] = useState(defaultSelectorJson);
   const [selectorB64, setSelectorB64] = useState('');
   const [notify, setNotify] = useState({ channel: 'serverchan', title: 'DPMS test', content: 'Notification channel test' });
@@ -202,6 +204,20 @@ export default function Deploy() {
     }
   };
 
+  const runtimeRollback = async () => {
+    try {
+      const result = await postJSON('/metrics/runtime/rollback', { reason: rollbackReason }, { confirm: true });
+      setRollbackArmed(false);
+      const text = formatText(t('deploy.rollbackDone'), { count: result.queued_real_runs_cancelled || 0 });
+      setMessage(text);
+      toast(text, 'warning');
+      await loadNotify();
+    } catch (err) {
+      setMessage(err.message);
+      toast(err.message, 'error');
+    }
+  };
+
   return (
     <section className="page-stack">
       <header className="page-header">
@@ -224,6 +240,15 @@ export default function Deploy() {
               {runtimeSettings?.real_run_enabled ? 'Enabled' : 'Disabled'}
             </span>
           </div>
+          <div className="version-row">
+            <span>{t('deploy.globalBreaker')}</span>
+            <span className={`badge ${runtimeSettings?.global_circuit_breaker?.status === 'open' ? 'badge-danger' : 'badge-ready'}`}>
+              {runtimeSettings?.global_circuit_breaker?.status || 'closed'}
+            </span>
+          </div>
+          {runtimeSettings?.global_circuit_breaker?.reason && (
+            <p className="muted-text tight-text">{runtimeSettings.global_circuit_breaker.reason}</p>
+          )}
           <label className="check-row">
             <input type="checkbox" checked={realRunArmed} onChange={e => setRealRunArmed(e.target.checked)} />
             <span>Confirm real-run switch change</span>
@@ -236,6 +261,26 @@ export default function Deploy() {
               onClick={() => toggleRealRun(!runtimeSettings?.real_run_enabled)}
             >
               {runtimeSettings?.real_run_enabled ? 'Disable real-run' : 'Enable real-run'}
+            </button>
+          </div>
+          <div className="rollback-box">
+            <div className="panel-kicker">{t('deploy.runtimeRollback')}</div>
+            <p className="muted-text tight-text">{t('deploy.rollbackHint')}</p>
+            <label>
+              <span>{t('deploy.rollbackReason')}</span>
+              <input className="input" value={rollbackReason} onChange={e => setRollbackReason(e.target.value)} />
+            </label>
+            <label className="check-row">
+              <input type="checkbox" checked={rollbackArmed} onChange={e => setRollbackArmed(e.target.checked)} />
+              <span>{t('deploy.rollbackArmed')}</span>
+            </label>
+            <button
+              type="button"
+              className="btn-danger"
+              disabled={!rollbackArmed}
+              onClick={runtimeRollback}
+            >
+              {t('deploy.applyRollback')}
             </button>
           </div>
           <label className="check-row">

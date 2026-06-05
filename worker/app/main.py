@@ -46,6 +46,37 @@ async def heartbeat_loop(shutdown_event: asyncio.Event):
         await asyncio.sleep(10)
 
 
+async def reload_signal_loop(shutdown_event: asyncio.Event):
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe("worker:reload")
+    try:
+        while not shutdown_event.is_set():
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+            if not message:
+                await asyncio.sleep(0.2)
+                continue
+            signal_value = message.get("data")
+            structured_log("warning", "worker_reload_signal_received", signal=signal_value)
+            await record_event(
+                aggregate="worker",
+                aggregate_id=WORKER_ID,
+                event_type="WorkerReloadSignalReceived",
+                payload={"signal": signal_value},
+                actor_type="system",
+                actor_id=WORKER_ID,
+            )
+            shutdown_event.set()
+            break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            await pubsub.unsubscribe("worker:reload")
+            await pubsub.close()
+        except Exception:
+            pass
+
+
 async def main():
     await database.connect()
     await redis_client.initialize()
@@ -74,6 +105,7 @@ async def main():
     loop.add_signal_handler(signal.SIGINT, handle_sigterm)
 
     heartbeat_task = asyncio.create_task(heartbeat_loop(shutdown_event))
+    reload_signal_task = asyncio.create_task(reload_signal_loop(shutdown_event))
     login_task = asyncio.create_task(login_loop(pool, shutdown_event))
     calibration_task = asyncio.create_task(calibration_loop(pool, shutdown_event))
     probe_task = asyncio.create_task(probe_loop(pool, shutdown_event))
@@ -85,8 +117,9 @@ async def main():
     probe_task.cancel()
     calibration_task.cancel()
     login_task.cancel()
+    reload_signal_task.cancel()
     heartbeat_task.cancel()
-    for task in (worker_task, probe_task, calibration_task, login_task, heartbeat_task):
+    for task in (worker_task, probe_task, calibration_task, login_task, reload_signal_task, heartbeat_task):
         try:
             await task
         except asyncio.CancelledError:

@@ -8,8 +8,9 @@ from fastapi.responses import StreamingResponse
 from app.config import settings
 from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
 from app.db import database, redis
+from app.event_store.service import record_event
 from app.api.notify import configured_channels
-from app.models.schemas import RealRunSettingUpdate
+from app.models.schemas import RealRunSettingUpdate, RuntimeRollbackRequest
 from app.platforms import get_platforms
 from app.security import audit_event, is_real_run_enabled, require_confirmation, require_min_role, set_runtime_setting
 
@@ -778,8 +779,12 @@ async def reload_worker(request: Request):
 
 @router.get("/runtime/settings")
 async def runtime_settings():
+    breaker = await database.fetch_one(
+        "SELECT status, reason, opened_at, updated_at FROM circuit_breakers WHERE scope = 'global'"
+    )
     return {
         "real_run_enabled": await is_real_run_enabled(),
+        "global_circuit_breaker": dict(breaker) if breaker else None,
     }
 
 
@@ -788,6 +793,14 @@ async def update_real_run_setting(payload: RealRunSettingUpdate, request: Reques
     require_min_role(request, "owner")
     require_confirmation(request)
     await set_runtime_setting("real_run_enabled", "true" if payload.enabled else "false")
+    if payload.enabled:
+        await database.execute(
+            """UPDATE circuit_breakers
+               SET status = 'closed',
+                   reason = NULL,
+                   updated_at = NOW()
+               WHERE scope = 'global'"""
+        )
     await audit_event(
         request,
         action="runtime.real_run.update",
@@ -795,6 +808,95 @@ async def update_real_run_setting(payload: RealRunSettingUpdate, request: Reques
         resource_id="real_run_enabled",
         result="enabled" if payload.enabled else "disabled",
         risk_level="critical" if payload.enabled else "high",
-        detail={"enabled": payload.enabled},
+        detail={"enabled": payload.enabled, "global_circuit_breaker": "closed" if payload.enabled else "unchanged"},
     )
     return {"status": "updated", "real_run_enabled": payload.enabled}
+
+
+@router.post("/runtime/rollback")
+async def runtime_rollback(payload: RuntimeRollbackRequest, request: Request):
+    actor = require_min_role(request, "owner")
+    require_confirmation(request)
+    reason = (payload.reason or "manual runtime rollback").strip()[:255]
+
+    queued_rows = await database.fetch_all(
+        """SELECT task_id, lottery_id
+           FROM task_runs
+           WHERE task_mode = 'real_run'
+             AND status = 'queued'"""
+    )
+    running_count = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM task_runs
+           WHERE task_mode = 'real_run'
+             AND status = 'running'"""
+    )
+
+    await set_runtime_setting("real_run_enabled", "false")
+    await database.execute(
+        """INSERT INTO circuit_breakers (scope, status, reason, opened_at)
+           VALUES ('global', 'open', :reason, NOW())
+           ON DUPLICATE KEY UPDATE
+             status = 'open',
+             reason = :reason,
+             opened_at = NOW(),
+             updated_at = NOW()""",
+        {"reason": reason},
+    )
+    await database.execute(
+        """UPDATE lotteries l
+           JOIN task_runs tr ON tr.lottery_id = l.id
+           SET l.status = 'pending',
+               l.execution_lock = NULL,
+               l.locked_at = NULL
+           WHERE tr.task_mode = 'real_run'
+             AND tr.status = 'queued'"""
+    )
+    await database.execute(
+        """UPDATE task_runs
+           SET status = 'failed',
+               error_message = :error_message,
+               finished_at = NOW()
+           WHERE task_mode = 'real_run'
+             AND status = 'queued'""",
+        {"error_message": f"Runtime rollback: {reason}"},
+    )
+    await redis.publish("worker:reload", "runtime_rollback")
+    await redis.xadd(
+        "notify_events",
+        {
+            "title": "DPMS runtime rollback applied",
+            "content": f"Real-run disabled and global circuit breaker opened. Reason: {reason}",
+            "status": "rollback",
+            "channels": "all",
+        },
+    )
+
+    queued_task_ids = [row["task_id"] for row in queued_rows]
+    result = {
+        "status": "rollback_applied",
+        "real_run_enabled": False,
+        "circuit_breaker": "global=open",
+        "queued_real_runs_cancelled": len(queued_task_ids),
+        "running_real_runs_observed": int(running_count["cnt"] if running_count else 0),
+        "queued_task_ids": queued_task_ids,
+        "reason": reason,
+    }
+    await audit_event(
+        request,
+        action="runtime.rollback",
+        resource_type="runtime",
+        resource_id="global",
+        result="applied",
+        risk_level="critical",
+        detail=result,
+    )
+    await record_event(
+        aggregate="runtime",
+        aggregate_id="global",
+        event_type="RuntimeRollbackApplied",
+        payload=result,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return result
