@@ -1,0 +1,569 @@
+import uuid
+import json
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
+
+from app.db import database, redis
+from app.event_store.service import record_event
+from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
+from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart
+from app.platforms import get_platform, get_platforms
+from app.services.risk_engine import check_all_accounts_health
+from app.security import audit_event, require_confirmation, require_min_role
+from app.services.state_machine import transition_account
+from app.utils.cookies import normalize_cookie_payload
+from app.utils.crypto import cookie_vault
+
+
+PROFILES_DIR = Path("/profiles")
+CALIBRATION_DIR = PROFILES_DIR / "account-calibrations"
+router = APIRouter()
+
+
+@router.get("/platforms")
+async def list_platforms():
+    selector_config = await load_runtime_selector_config()
+    return [
+        {
+            "id": key,
+            "label": value["label"],
+            "qr_login": value.get("qr_login", False),
+            "cookie_login": value.get("cookie_login", True),
+            "action_adapter": value.get("action_adapter", False) or platform_selectors_complete(selector_config, key),
+            "adapter_status": "configured" if platform_selectors_complete(selector_config, key) else value.get("adapter_status", "planned"),
+            "cookie_domain": value.get("cookie_domain"),
+            "account_check_url": value.get("account_check_url"),
+        }
+        for key, value in get_platforms().items()
+    ]
+
+
+@router.get("/")
+async def list_accounts():
+    rows = await database.fetch_all(
+        """SELECT a.*,
+                  (
+                    SELECT JSON_OBJECT(
+                      'id', r.id,
+                      'event_type', r.event_type,
+                      'detail', r.detail,
+                      'created_at', r.created_at
+                    )
+                    FROM risk_events r
+                    WHERE r.account_id = a.id
+                    ORDER BY r.created_at DESC
+                    LIMIT 1
+                  ) AS latest_risk_event
+                  ,(
+                    SELECT JSON_OBJECT(
+                      'calibration_id', c.calibration_id,
+                      'status', c.status,
+                      'result', c.result,
+                      'error_message', c.error_message,
+                      'screenshot_path', c.screenshot_path,
+                      'created_at', c.created_at,
+                      'finished_at', c.finished_at
+                    )
+                    FROM account_calibrations c
+                    WHERE c.account_id = a.id
+                    ORDER BY c.created_at DESC
+                    LIMIT 1
+                  ) AS latest_calibration
+                  ,(
+                    SELECT JSON_OBJECT(
+                      'task_id', tr.task_id,
+                      'lottery_id', tr.lottery_id,
+                      'status', tr.status,
+                      'dry_run', tr.dry_run,
+                      'started_at', tr.started_at,
+                      'finished_at', tr.finished_at,
+                      'error_message', tr.error_message
+                    )
+                    FROM task_runs tr
+                    WHERE tr.account_id = a.id
+                      AND tr.status IN ('queued', 'running')
+                    ORDER BY tr.id DESC
+                    LIMIT 1
+                  ) AS current_task_run
+                  ,(
+                    SELECT JSON_OBJECT(
+                      'task_id', tr.task_id,
+                      'lottery_id', tr.lottery_id,
+                      'status', tr.status,
+                      'dry_run', tr.dry_run,
+                      'started_at', tr.started_at,
+                      'finished_at', tr.finished_at,
+                      'error_message', tr.error_message
+                    )
+                    FROM task_runs tr
+                    WHERE tr.account_id = a.id
+                    ORDER BY tr.id DESC
+                    LIMIT 1
+                  ) AS latest_task_run
+           FROM accounts a
+           ORDER BY a.id DESC"""
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        credential = item.pop("encrypted_credential", None)
+        item["credential_ready"] = bool(credential)
+        if item.get("latest_risk_event"):
+            item["latest_risk_event"] = parse_json_field(item["latest_risk_event"])
+        if item.get("latest_calibration"):
+            item["latest_calibration"] = parse_json_field(item["latest_calibration"])
+        if item.get("current_task_run"):
+            item["current_task_run"] = parse_json_field(item["current_task_run"])
+        if item.get("latest_task_run"):
+            item["latest_task_run"] = parse_json_field(item["latest_task_run"])
+        result.append(item)
+    return result
+
+
+@router.post("/")
+async def create_account(data: AccountCreate, request: Request):
+    actor = require_min_role(request, "operator")
+    if not get_platform(data.platform):
+        raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+    if data.proxy_id is not None:
+        await validate_proxy_assignment(data.proxy_id)
+    fingerprint_id = data.fingerprint_id or await ensure_default_fingerprint(data.platform)
+    credential = b""
+    status = "login_required"
+    if data.encrypted_credential:
+        try:
+            normalized = normalize_cookie_payload(data.platform, data.encrypted_credential)
+        except Exception as e:
+            raise HTTPException(400, detail=str(e))
+        credential = cookie_vault.encrypt(normalized)
+        status = "warming"
+
+    account_id = await database.execute(
+        """INSERT INTO accounts (platform, fingerprint_id, proxy_id, encrypted_credential, status)
+           VALUES (:platform, :fid, :pid, :cred, :status)""",
+        {
+            "platform": data.platform,
+            "fid": fingerprint_id,
+            "pid": data.proxy_id,
+            "cred": credential,
+            "status": status,
+        },
+    )
+    calibration = None
+    if credential:
+        calibration = await queue_account_calibration(account_id, data.platform)
+    await audit_event(
+        request,
+        action="account.create",
+        resource_type="account",
+        resource_id=account_id,
+        result="created",
+        risk_level="high" if credential else "medium",
+        detail={"platform": data.platform, "credential_imported": bool(credential), "calibration": calibration},
+    )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountCreated",
+        payload={
+            "platform": data.platform,
+            "status": status,
+            "credential_imported": bool(credential),
+            "calibration": calibration,
+        },
+        correlation_id=calibration.get("calibration_id") if calibration else None,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    if credential:
+        await record_event(
+            aggregate="account",
+            aggregate_id=account_id,
+            event_type="AccountCredentialImported",
+            payload={"platform": data.platform, "calibration": calibration},
+            correlation_id=calibration.get("calibration_id") if calibration else None,
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+    return {"status": "created", "id": account_id, "calibration": calibration}
+
+
+@router.post("/login/qr")
+async def start_qr_login(data: QRLoginStart, request: Request):
+    actor = require_min_role(request, "operator")
+    platform_cfg = get_platform(data.platform)
+    if not platform_cfg:
+        raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+    session_id = str(uuid.uuid4())
+    image_path = f"/profiles/login-sessions/{session_id}.png"
+
+    await database.execute(
+        """INSERT INTO login_sessions (session_id, platform, status, login_url, qr_image_path, expires_at)
+           VALUES (:session_id, :platform, 'queued', :login_url, :image_path, DATE_ADD(NOW(), INTERVAL 5 MINUTE))""",
+        {
+            "session_id": session_id,
+            "platform": data.platform,
+            "login_url": platform_cfg["login_url"],
+            "image_path": image_path,
+        },
+    )
+    await redis.xadd(
+        "login_requests",
+        {"session_id": session_id, "platform": data.platform, "login_url": platform_cfg["login_url"]},
+    )
+    await audit_event(
+        request,
+        action="account.login_qr.start",
+        resource_type="login_session",
+        resource_id=session_id,
+        result="queued",
+        risk_level="medium",
+        detail={"platform": data.platform},
+    )
+    await record_event(
+        aggregate="browser",
+        aggregate_id=session_id,
+        event_type="QrLoginRequested",
+        payload={"platform": data.platform, "login_url": platform_cfg["login_url"]},
+        correlation_id=session_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"session_id": session_id, "status": "queued"}
+
+
+@router.get("/login/qr/{session_id}")
+async def get_qr_login_status(session_id: str):
+    row = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+    if not row:
+        raise HTTPException(404, detail="Login session not found")
+    return dict(row)
+
+
+@router.get("/login/qr/{session_id}/image")
+async def get_qr_login_image(session_id: str):
+    row = await database.fetch_one("SELECT qr_image_path FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+    if not row or not row["qr_image_path"]:
+        raise HTTPException(404, detail="QR image not ready")
+
+    path = Path(row["qr_image_path"]).resolve()
+    if not path.exists() or not path.is_file() or not path.is_relative_to(PROFILES_DIR):
+        raise HTTPException(404, detail="QR image not ready")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.put("/{account_id}/credential")
+async def update_credential(account_id: int, data: AccountCredentialUpdate, request: Request):
+    actor = require_min_role(request, "operator")
+    row = await database.fetch_one("SELECT platform FROM accounts WHERE id = :id", {"id": account_id})
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+
+    try:
+        normalized = normalize_cookie_payload(row["platform"], data.encrypted_credential)
+    except Exception as e:
+        raise HTTPException(400, detail=str(e))
+
+    await database.execute(
+        """UPDATE accounts
+           SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(), version = version + 1
+           WHERE id = :id""",
+        {"id": account_id, "credential": cookie_vault.encrypt(normalized)},
+    )
+    calibration = await queue_account_calibration(account_id, row["platform"])
+    await audit_event(
+        request,
+        action="account.credential.update",
+        resource_type="account",
+        resource_id=account_id,
+        result="updated",
+        risk_level="high",
+        detail={"platform": row["platform"], "calibration": calibration},
+    )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountCredentialImported",
+        payload={"platform": row["platform"], "calibration": calibration},
+        correlation_id=calibration.get("calibration_id") if calibration else None,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "credential_updated", "calibration": calibration}
+
+
+@router.put("/{account_id}/status")
+async def change_status(account_id: int, data: AccountUpdateStatus, request: Request):
+    actor = require_min_role(request, "operator")
+    try:
+        row = await database.fetch_one(
+            """SELECT status,
+                      OCTET_LENGTH(encrypted_credential) AS credential_size,
+                      (
+                        SELECT c.status FROM account_calibrations c
+                        WHERE c.account_id = accounts.id
+                        ORDER BY c.created_at DESC
+                        LIMIT 1
+                      ) AS latest_calibration_status
+               FROM accounts WHERE id = :id""",
+            {"id": account_id},
+        )
+        if not row:
+            raise HTTPException(404, detail="Account not found")
+        if data.target == "ready" and row["credential_size"] == 0:
+            raise HTTPException(400, detail="Cannot mark an account ready before importing a credential")
+        if data.target == "ready" and row["latest_calibration_status"] != "succeeded":
+            raise HTTPException(400, detail="Cannot mark an account ready before successful login calibration")
+        await transition_account(account_id, data.version, data.target)
+        await record_event(
+            aggregate="account",
+            aggregate_id=account_id,
+            event_type="AccountStatusChanged",
+            payload={"from": row["status"], "to": data.target, "version": data.version},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(409, detail=str(e))
+
+
+@router.put("/{account_id}/proxy")
+async def update_account_proxy(account_id: int, data: AccountProxyUpdate, request: Request):
+    actor = require_min_role(request, "operator")
+    row = await database.fetch_one("SELECT id, status FROM accounts WHERE id = :id", {"id": account_id})
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot change proxy while account is executing")
+
+    if data.proxy_id is None:
+        await database.execute(
+            "UPDATE accounts SET proxy_id = NULL, updated_at = NOW(), version = version + 1 WHERE id = :id",
+            {"id": account_id},
+        )
+        await record_event(
+            aggregate="account",
+            aggregate_id=account_id,
+            event_type="AccountProxyUnassigned",
+            payload={"previous_status": row["status"]},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+        return {"status": "proxy_unassigned", "id": account_id, "proxy_id": None}
+
+    await validate_proxy_assignment(data.proxy_id, account_id)
+    await database.execute(
+        """UPDATE accounts
+           SET proxy_id = :proxy_id, updated_at = NOW(), version = version + 1
+           WHERE id = :id""",
+        {"id": account_id, "proxy_id": data.proxy_id},
+    )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountProxyAssigned",
+        payload={"proxy_id": data.proxy_id, "previous_status": row["status"]},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "proxy_assigned", "id": account_id, "proxy_id": data.proxy_id}
+
+
+@router.delete("/{account_id}")
+async def delete_account(account_id: int, request: Request):
+    actor = require_min_role(request, "admin")
+    require_confirmation(request)
+    row = await database.fetch_one("SELECT id, status FROM accounts WHERE id = :id", {"id": account_id})
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot delete an account while it is executing")
+
+    for statement in [
+        "DELETE FROM task_phases WHERE account_id = :id",
+        "DELETE FROM task_runs WHERE account_id = :id",
+        "DELETE FROM adapter_calibrations WHERE account_id = :id",
+        "DELETE FROM account_calibrations WHERE account_id = :id",
+        "DELETE FROM risk_events WHERE account_id = :id",
+        "UPDATE login_sessions SET account_id = NULL WHERE account_id = :id",
+        "DELETE FROM accounts WHERE id = :id",
+    ]:
+        await database.execute(statement, {"id": account_id})
+    await audit_event(
+        request,
+        action="account.delete",
+        resource_type="account",
+        resource_id=account_id,
+        result="deleted",
+        risk_level="critical",
+        detail={"previous_status": row["status"]},
+    )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountDeleted",
+        payload={"previous_status": row["status"]},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "deleted", "id": account_id}
+
+
+@router.post("/health/recheck")
+async def recheck_account_health(data: AccountHealthRecheckRequest):
+    return await check_all_accounts_health(
+        cooldown_minutes=data.cooldown_minutes,
+        stale_execution_minutes=data.stale_execution_minutes,
+    )
+
+
+@router.get("/calibrations")
+async def list_account_calibrations(limit: int = 50):
+    rows = await database.fetch_all(
+        """SELECT c.*, a.status AS account_status
+           FROM account_calibrations c
+           JOIN accounts a ON a.id = c.account_id
+           ORDER BY c.created_at DESC
+           LIMIT :limit""",
+        {"limit": max(1, min(limit, 200))},
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["result"] = parse_json_field(item.get("result"))
+        result.append(item)
+    return result
+
+
+@router.post("/{account_id}/calibrate")
+async def calibrate_account(account_id: int, data: AccountCalibrationRequest, request: Request):
+    actor = require_min_role(request, "operator")
+    row = await database.fetch_one(
+        "SELECT platform, status, OCTET_LENGTH(encrypted_credential) AS credential_size FROM accounts WHERE id = :id",
+        {"id": account_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+    if row["credential_size"] == 0:
+        raise HTTPException(400, detail="Cannot calibrate an account before importing a credential")
+    if row["status"] in {"executing", "banned"} and not data.force:
+        raise HTTPException(409, detail=f"Cannot calibrate account while status is {row['status']}")
+    await database.execute(
+        """UPDATE accounts
+           SET status = 'warming', updated_at = NOW(), version = version + 1
+           WHERE id = :id AND status NOT IN ('executing', 'banned')""",
+        {"id": account_id},
+    )
+    calibration = await queue_account_calibration(account_id, row["platform"])
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountCalibrationQueued",
+        payload={"platform": row["platform"], "force": data.force, "calibration": calibration},
+        correlation_id=calibration.get("calibration_id") if calibration else None,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "queued", "calibration": calibration}
+
+
+@router.get("/calibrations/{calibration_id}/screenshot")
+async def get_account_calibration_screenshot(calibration_id: str):
+    row = await database.fetch_one(
+        "SELECT screenshot_path FROM account_calibrations WHERE calibration_id = :calibration_id",
+        {"calibration_id": calibration_id},
+    )
+    if not row or not row["screenshot_path"]:
+        raise HTTPException(404, detail="Calibration screenshot not ready")
+    path = Path(row["screenshot_path"]).resolve()
+    if not path.exists() or not path.is_file() or not path.is_relative_to(CALIBRATION_DIR):
+        raise HTTPException(404, detail="Calibration screenshot not ready")
+    return FileResponse(path, media_type="image/png")
+
+
+async def queue_account_calibration(account_id: int, platform: str):
+    platform_cfg = get_platform(platform)
+    if not platform_cfg:
+        raise HTTPException(400, detail=f"Unsupported platform: {platform}")
+    calibration_id = str(uuid.uuid4())
+    check_url = platform_cfg.get("account_check_url") or platform_cfg["login_url"]
+    await database.execute(
+        """INSERT INTO account_calibrations (calibration_id, platform, account_id, check_url, status)
+           VALUES (:calibration_id, :platform, :account_id, :check_url, 'queued')""",
+        {
+            "calibration_id": calibration_id,
+            "platform": platform,
+            "account_id": account_id,
+            "check_url": check_url,
+        },
+    )
+    await redis.xadd(
+        "account_calibration_requests",
+        {
+            "calibration_id": calibration_id,
+            "platform": platform,
+            "account_id": str(account_id),
+            "check_url": check_url,
+        },
+    )
+    return {"calibration_id": calibration_id, "status": "queued", "check_url": check_url}
+
+
+def parse_json_field(value):
+    if isinstance(value, (dict, list)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+async def ensure_default_fingerprint(platform: str) -> int:
+    if not get_platform(platform):
+        raise HTTPException(400, detail=f"Unsupported platform: {platform}")
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+    row = await database.fetch_one(
+        "SELECT id FROM fingerprints WHERE platform = :platform AND user_agent = :ua",
+        {"platform": platform, "ua": user_agent},
+    )
+    if row:
+        return row["id"]
+    return await database.execute(
+        """INSERT INTO fingerprints (platform, user_agent, viewport_width, viewport_height, timezone, locale)
+           VALUES (:platform, :ua, 1920, 1080, 'Asia/Shanghai', 'zh-CN')""",
+        {"platform": platform, "ua": user_agent},
+    )
+
+
+async def validate_proxy_assignment(proxy_id: int, account_id: int | None = None):
+    row = await database.fetch_one(
+        """SELECT p.id, p.status,
+                  (p.cooldown_until IS NOT NULL AND p.cooldown_until > NOW()) AS cooling_active,
+                  a.id AS assigned_account_id
+           FROM proxies p
+           LEFT JOIN accounts a ON a.proxy_id = p.id
+           WHERE p.id = :id""",
+        {"id": proxy_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Proxy not found")
+    if row["assigned_account_id"] and row["assigned_account_id"] != account_id:
+        raise HTTPException(409, detail=f"Proxy is already assigned to account {row['assigned_account_id']}")
+    if row["status"] == "dead":
+        raise HTTPException(400, detail="Cannot assign a dead proxy")
+    if row["cooling_active"]:
+        raise HTTPException(400, detail="Cannot assign a proxy that is in cooldown")
+
+
+def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
+    configured = selector_config.get(platform, {})
+    if not isinstance(configured, dict):
+        return False
+    return all(bool(configured.get(phase)) for phase in ADAPTER_PHASES)

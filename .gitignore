@@ -1,0 +1,43 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+.venv*/
+
+# Node
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data and account material
+browser-profiles/
+logs/
+backups/
+releases/
+*.sqlite
+*.sqlite3
+*.db
+
+# Local tooling artifacts
+.playwright-cli/
+output/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

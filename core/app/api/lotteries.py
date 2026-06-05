@@ -1,0 +1,751 @@
+import json
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
+
+from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
+from app.db import database, redis
+from app.event_store.service import record_event
+from app.models.schemas import (
+    AdapterSelectorConfigUpdate,
+    AdapterProbeRequest,
+    DispatchTaskRequest,
+    LotteryCreate,
+    LotteryResultUpdate,
+    LotteryTargetImport,
+    TrackedSourceCreate,
+)
+from app.platforms import get_platform, get_platforms
+from app.services.discovery import run_discovery
+from app.security import (
+    audit_event,
+    circuit_breaker_allows,
+    is_real_run_enabled,
+    require_confirmation,
+    require_min_role,
+)
+from app.utils.canonicalizer import GenericCanonicalizer
+
+
+router = APIRouter()
+PHASES = ["followed", "liked", "commented", "reposted"]
+TASK_FAILURE_DIR = Path("/profiles/task-failures")
+ADAPTER_PROBE_DIR = Path("/profiles/adapter-probes")
+
+
+@router.get("/adapters")
+async def list_adapters():
+    selector_config = await load_runtime_selector_config()
+    return [
+        {
+            "platform": key,
+            "label": cfg["label"],
+            "dry_run": True,
+            "real_actions": cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, key),
+            "adapter_status": "configured" if platform_selectors_complete(selector_config, key) else cfg.get("adapter_status", "planned"),
+            "phases": PHASES,
+            "notes": "real actions require gray calibration"
+            if cfg.get("action_adapter") or platform_selectors_complete(selector_config, key)
+            else "login and dry-run only until adapter calibration is implemented",
+        }
+        for key, cfg in get_platforms().items()
+    ]
+
+
+@router.get("/adapters/config")
+async def get_adapter_config_status():
+    config = await load_runtime_selector_config()
+    platforms = []
+    for platform in get_platforms():
+        phase_status = {}
+        configured = config.get(platform, {})
+        if not isinstance(configured, dict):
+            configured = {}
+        for phase in ADAPTER_PHASES:
+            phase_status[phase] = bool(configured.get(phase))
+        platforms.append(
+            {
+                "platform": platform,
+                "configured": all(phase_status.values()),
+                "phases": phase_status,
+            }
+        )
+    return {
+        "preferred_env": "DPMS_ADAPTER_SELECTORS_B64",
+        "fallback_env": "DPMS_ADAPTER_SELECTORS",
+        "required_phases": list(ADAPTER_PHASES),
+        "platforms": platforms,
+    }
+
+
+@router.put("/adapters/config")
+async def save_adapter_config(data: AdapterSelectorConfigUpdate, request: Request):
+    actor = require_min_role(request, "admin")
+    if not isinstance(data.config, dict) or not data.config:
+        raise HTTPException(400, detail="config must be a non-empty object")
+    saved = []
+    invalid = []
+    for platform, config in data.config.items():
+        if not get_platform(platform):
+            invalid.append({"platform": platform, "error": "unsupported platform"})
+            continue
+        if not isinstance(config, dict):
+            invalid.append({"platform": platform, "error": "platform config must be an object"})
+            continue
+        phase_status = {phase: bool(config.get(phase)) for phase in ADAPTER_PHASES}
+        await save_platform_selector_config(platform, config)
+        saved.append({"platform": platform, "configured": all(phase_status.values()), "phases": phase_status})
+    if not saved:
+        raise HTTPException(400, detail={"message": "no valid platform config", "invalid": invalid})
+    await audit_event(
+        request,
+        action="adapter_selector_config.save",
+        resource_type="adapter_selector_config",
+        result="saved",
+        risk_level="high",
+        detail={"saved": saved, "invalid_count": len(invalid)},
+    )
+    for item in saved:
+        await record_event(
+            aggregate="platform",
+            aggregate_id=item["platform"],
+            event_type="AdapterSelectorConfigSaved",
+            payload={"configured": item["configured"], "phases": item["phases"], "invalid_count": len(invalid)},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+    return {"status": "saved", "saved": saved, "invalid": invalid}
+
+
+@router.delete("/adapters/config/{platform}")
+async def clear_adapter_config(platform: str, request: Request):
+    actor = require_min_role(request, "admin")
+    require_confirmation(request)
+    if not get_platform(platform):
+        raise HTTPException(404, detail="Platform not found")
+    await database.execute("DELETE FROM adapter_selector_configs WHERE platform = :platform", {"platform": platform})
+    await audit_event(
+        request,
+        action="adapter_selector_config.clear",
+        resource_type="adapter_selector_config",
+        resource_id=platform,
+        result="cleared",
+        risk_level="high",
+    )
+    await record_event(
+        aggregate="platform",
+        aggregate_id=platform,
+        event_type="AdapterSelectorConfigCleared",
+        payload={"platform": platform},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "cleared", "platform": platform}
+
+
+@router.get("/")
+async def list_lotteries(status: str = None, limit: int = 50):
+    query = "SELECT * FROM lotteries"
+    values = {"limit": limit}
+    if status:
+        query += " WHERE status = :status"
+        values["status"] = status
+    query += " ORDER BY id DESC LIMIT :limit"
+    rows = await database.fetch_all(query, values)
+    return [dict(r) for r in rows]
+
+
+@router.get("/sources")
+async def list_tracked_sources():
+    rows = await database.fetch_all("SELECT * FROM tracked_sources ORDER BY id DESC")
+    return [dict(row) for row in rows]
+
+
+@router.post("/sources")
+async def create_tracked_source(data: TrackedSourceCreate, request: Request):
+    actor = require_min_role(request, "operator")
+    if not get_platform(data.platform):
+        raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+    if data.source_type not in {"url_list", "keyword", "up"}:
+        raise HTTPException(400, detail="source_type must be url_list, keyword, or up")
+    if data.scan_interval_minutes < 1:
+        raise HTTPException(400, detail="scan_interval_minutes must be >= 1")
+    source_id = await database.execute(
+        """INSERT INTO tracked_sources (platform, source_type, source_value, scan_interval_minutes, active)
+           VALUES (:platform, :source_type, :source_value, :scan_interval_minutes, 1)
+           ON DUPLICATE KEY UPDATE scan_interval_minutes = :scan_interval_minutes, active = 1""",
+        {
+            "platform": data.platform,
+            "source_type": data.source_type,
+            "source_value": data.source_value.strip(),
+            "scan_interval_minutes": data.scan_interval_minutes,
+        },
+    )
+    await record_event(
+        aggregate="source",
+        aggregate_id=source_id or f"{data.platform}:{data.source_type}:{data.source_value.strip()}",
+        event_type="DiscoverySourceCreated",
+        payload={
+            "platform": data.platform,
+            "source_type": data.source_type,
+            "scan_interval_minutes": data.scan_interval_minutes,
+        },
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "created", "id": source_id}
+
+
+@router.post("/sources/scan")
+async def scan_tracked_sources(request: Request):
+    actor = require_min_role(request, "operator")
+    stats = await run_discovery()
+    await record_event(
+        aggregate="system",
+        aggregate_id="discovery",
+        event_type="DiscoveryScanCompleted",
+        payload=stats,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "scanned", **stats}
+
+
+@router.post("/")
+async def create_lottery(data: LotteryCreate, request: Request):
+    actor = require_min_role(request, "operator")
+    if not get_platform(data.platform):
+        raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+
+    canonical_url = data.canonical_url or data.raw_url.strip()
+    try:
+        lottery_id = await database.execute(
+            """INSERT INTO lotteries (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
+               VALUES (:platform, :source_type, :source_id, :raw_url, :canonical_url, :value_score, :expires_at, 'pending')""",
+            {
+                "platform": data.platform,
+                "source_type": data.source_type,
+                "source_id": data.source_id,
+                "raw_url": data.raw_url.strip(),
+                "canonical_url": canonical_url,
+                "value_score": data.value_score,
+                "expires_at": data.expires_at,
+            },
+        )
+        await record_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="LotteryDiscovered",
+            payload={
+                "platform": data.platform,
+                "source_type": data.source_type,
+                "source_id": data.source_id,
+                "raw_url": data.raw_url.strip(),
+                "canonical_url": canonical_url,
+                "value_score": data.value_score,
+                "manual": True,
+            },
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+        return {"status": "created", "id": lottery_id}
+    except Exception:
+        row = await database.fetch_one(
+            "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
+            {"canonical_url": canonical_url},
+        )
+        if row:
+            return {"status": "exists", "id": row["id"]}
+        raise
+
+
+@router.post("/targets/import")
+async def import_lottery_targets(data: LotteryTargetImport, request: Request):
+    actor = require_min_role(request, "operator")
+    if not get_platform(data.platform):
+        raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+    if not data.content.strip():
+        raise HTTPException(400, detail="content is required")
+
+    rows = parse_target_lines(data.content, data.platform, data.value_score)
+    if not rows:
+        raise HTTPException(400, detail="No valid target lines found")
+
+    import_id = str(uuid.uuid4())
+    created = []
+    duplicates = []
+    invalid = []
+    for row in rows:
+        if row.get("error"):
+            invalid.append(row)
+            continue
+        try:
+            canonical_url = await GenericCanonicalizer.canonicalize(row["platform"], row["raw_url"])
+            lottery_id = await database.execute(
+                """INSERT INTO lotteries (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
+                   VALUES (:platform, :source_type, :source_id, :raw_url, :canonical_url, :value_score, :expires_at, 'pending')""",
+                {
+                    "platform": row["platform"],
+                    "source_type": data.source_type,
+                    "source_id": data.source_id,
+                    "raw_url": row["raw_url"],
+                    "canonical_url": canonical_url,
+                    "value_score": row["value_score"],
+                    "expires_at": row["expires_at"],
+                },
+            )
+            created.append({"line": row["line"], "id": lottery_id, "url": row["raw_url"], "platform": row["platform"]})
+            await record_event(
+                aggregate="lottery",
+                aggregate_id=lottery_id,
+                event_type="LotteryDiscovered",
+                payload={
+                    "platform": row["platform"],
+                    "source_type": data.source_type,
+                    "source_id": data.source_id,
+                    "raw_url": row["raw_url"],
+                    "canonical_url": canonical_url,
+                    "value_score": row["value_score"],
+                    "line": row["line"],
+                    "import_id": import_id,
+                },
+                correlation_id=import_id,
+                actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+        except Exception:
+            existing = await database.fetch_one(
+                "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
+                {"canonical_url": await GenericCanonicalizer.canonicalize(row["platform"], row["raw_url"])},
+            )
+            if existing:
+                duplicates.append({"line": row["line"], "id": existing["id"], "url": row["raw_url"], "platform": row["platform"]})
+            else:
+                invalid.append({"line": row["line"], "raw": row["raw"], "error": "insert failed"})
+
+    result = {
+        "status": "imported",
+        "received": len(rows),
+        "created_count": len(created),
+        "duplicate_count": len(duplicates),
+        "invalid_count": len(invalid),
+        "created": created[:50],
+        "duplicates": duplicates[:50],
+        "invalid": invalid[:50],
+    }
+    await record_event(
+        aggregate="lottery_import",
+        aggregate_id=import_id,
+        event_type="LotteryTargetImportCompleted",
+        payload={
+            "default_platform": data.platform,
+            "source_type": data.source_type,
+            "received": len(rows),
+            "created_count": len(created),
+            "duplicate_count": len(duplicates),
+            "invalid_count": len(invalid),
+        },
+        correlation_id=import_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return result
+
+
+@router.post("/{lottery_id}/dispatch")
+async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: Request):
+    actor = require_min_role(request, "operator")
+    lottery = await database.fetch_one("SELECT * FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+
+    platform_cfg = get_platform(lottery["platform"])
+    if not platform_cfg:
+        raise HTTPException(400, detail=f"Unsupported platform: {lottery['platform']}")
+
+    selector_config = await load_runtime_selector_config()
+    platform_selectors = selector_config.get(lottery["platform"], {})
+    real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, lottery["platform"])
+
+    if not data.dry_run:
+        require_min_role(request, "admin")
+        try:
+            require_confirmation(request)
+            if not data.confirm:
+                raise HTTPException(409, detail="Real-run body confirmation required")
+            if not await is_real_run_enabled():
+                raise HTTPException(403, detail="Global real-run switch is disabled")
+            breaker_allowed, breaker_reason = await circuit_breaker_allows(lottery["platform"])
+            if not breaker_allowed:
+                raise HTTPException(423, detail=f"Circuit breaker blocks real-run: {breaker_reason}")
+            if not real_adapter_enabled:
+                raise HTTPException(
+                    400,
+                    detail=f"Real actions for {lottery['platform']} are not implemented yet. Use dry run or wait for adapter calibration.",
+                )
+        except HTTPException as exc:
+            await audit_event(
+                request,
+                action="lottery.dispatch.real",
+                resource_type="lottery",
+                resource_id=lottery_id,
+                result="blocked",
+                risk_level="critical",
+                detail={"platform": lottery["platform"], "reason": exc.detail},
+            )
+            await record_event(
+                aggregate="lottery",
+                aggregate_id=lottery_id,
+                event_type="RealRunDenied",
+                payload={"platform": lottery["platform"], "reason": exc.detail},
+                actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+            raise
+
+    account = await pick_account(data.account_id, lottery["platform"])
+    if not account:
+        await record_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="TaskDispatchBlocked",
+            payload={"platform": lottery["platform"], "reason": "no_available_account", "dry_run": data.dry_run},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+        raise HTTPException(400, detail="No available account. Create a ready account first.")
+
+    task_id = str(uuid.uuid4())
+    await database.execute(
+        """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run)
+           VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run)""",
+        {"task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "dry_run": int(data.dry_run)},
+    )
+    await database.execute(
+        "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
+        {"task_id": task_id, "id": lottery_id},
+    )
+    await redis.xadd(
+        "lottery_tasks",
+        {
+            "task_id": task_id,
+            "account_id": str(account["id"]),
+            "lottery_id": str(lottery_id),
+            "platform": lottery["platform"],
+            "raw_url": lottery["raw_url"],
+            "canonical_url": lottery["canonical_url"],
+            "dry_run": "1" if data.dry_run else "0",
+            "selector_config": json.dumps(platform_selectors, ensure_ascii=False) if isinstance(platform_selectors, dict) else "{}",
+        },
+    )
+    if not data.dry_run:
+        await audit_event(
+            request,
+            action="lottery.dispatch.real",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="queued",
+            risk_level="critical",
+            detail={"platform": lottery["platform"], "task_id": task_id, "account_id": account["id"]},
+        )
+    await record_event(
+        aggregate="task",
+        aggregate_id=task_id,
+        event_type="TaskDispatched",
+        payload={
+            "platform": lottery["platform"],
+            "account_id": account["id"],
+            "lottery_id": lottery_id,
+            "dry_run": data.dry_run,
+            "raw_url": lottery["raw_url"],
+        },
+        correlation_id=task_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    await record_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type="LotteryDispatchQueued",
+        payload={"task_id": task_id, "account_id": account["id"], "dry_run": data.dry_run},
+        correlation_id=task_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id}
+
+
+@router.get("/tasks/runs")
+async def list_task_runs(limit: int = 50):
+    rows = await database.fetch_all(
+        """SELECT tr.*, l.raw_url, l.platform
+           FROM task_runs tr
+           JOIN lotteries l ON tr.lottery_id = l.id
+           ORDER BY tr.id DESC LIMIT :limit""",
+        {"limit": limit},
+    )
+    return [dict(r) for r in rows]
+
+
+@router.get("/probes")
+async def list_adapter_probes(limit: int = 50):
+    rows = await database.fetch_all(
+        """SELECT ac.*, l.raw_url
+           FROM adapter_calibrations ac
+           LEFT JOIN lotteries l ON ac.lottery_id = l.id
+           ORDER BY ac.id DESC LIMIT :limit""",
+        {"limit": limit},
+    )
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["result"] = parse_json_field(item.get("result"))
+        result.append(item)
+    return result
+
+
+@router.post("/{lottery_id}/probe")
+async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, request: Request):
+    actor = require_min_role(request, "operator")
+    lottery = await database.fetch_one("SELECT * FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+    if not get_platform(lottery["platform"]):
+        raise HTTPException(400, detail=f"Unsupported platform: {lottery['platform']}")
+
+    account = await pick_account(data.account_id, lottery["platform"])
+    if not account:
+        raise HTTPException(400, detail=f"No calibrated ready account is available for {lottery['platform']}")
+
+    probe_id = str(uuid.uuid4())
+    target_url = lottery["canonical_url"] or lottery["raw_url"]
+    await database.execute(
+        """INSERT INTO adapter_calibrations (probe_id, platform, account_id, lottery_id, target_url, status)
+           VALUES (:probe_id, :platform, :account_id, :lottery_id, :target_url, 'queued')""",
+        {
+            "probe_id": probe_id,
+            "platform": lottery["platform"],
+            "account_id": account["id"],
+            "lottery_id": lottery_id,
+            "target_url": target_url,
+        },
+    )
+    await redis.xadd(
+        "adapter_probe_requests",
+        {
+            "probe_id": probe_id,
+            "platform": lottery["platform"],
+            "account_id": str(account["id"]),
+            "lottery_id": str(lottery_id),
+            "target_url": target_url,
+        },
+    )
+    await record_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type="AdapterProbeQueued",
+        payload={"probe_id": probe_id, "platform": lottery["platform"], "account_id": account["id"], "target_url": target_url},
+        correlation_id=probe_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "queued", "probe_id": probe_id, "account_id": account["id"]}
+
+
+@router.get("/probes/{probe_id}/screenshot")
+async def get_probe_screenshot(probe_id: str):
+    row = await database.fetch_one(
+        "SELECT screenshot_path FROM adapter_calibrations WHERE probe_id = :probe_id",
+        {"probe_id": probe_id},
+    )
+    if not row or not row["screenshot_path"]:
+        raise HTTPException(404, detail="Probe screenshot not found")
+
+    path = Path(row["screenshot_path"]).resolve()
+    safe_root = ADAPTER_PROBE_DIR.resolve()
+    if not path.exists() or not path.is_file() or not path.is_relative_to(safe_root):
+        raise HTTPException(404, detail="Probe screenshot not found")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.get("/tasks/runs/{task_id}/screenshot")
+async def get_task_screenshot(task_id: str):
+    row = await database.fetch_one(
+        "SELECT screenshot_path FROM task_runs WHERE task_id = :task_id",
+        {"task_id": task_id},
+    )
+    if not row or not row["screenshot_path"]:
+        raise HTTPException(404, detail="Task screenshot not found")
+
+    path = Path(row["screenshot_path"]).resolve()
+    safe_root = TASK_FAILURE_DIR.resolve()
+    if not path.exists() or not path.is_file() or not path.is_relative_to(safe_root):
+        raise HTTPException(404, detail="Task screenshot not found")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.put("/{lottery_id}/result")
+async def update_lottery_result(lottery_id: int, data: LotteryResultUpdate, request: Request):
+    actor = require_min_role(request, "operator")
+    if data.status not in {"participated", "won", "lost", "expired"}:
+        raise HTTPException(400, detail="status must be participated, won, lost, or expired")
+
+    lottery = await database.fetch_one("SELECT id FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+
+    await database.execute(
+        "UPDATE lotteries SET status = :status WHERE id = :id",
+        {"id": lottery_id, "status": data.status},
+    )
+    if data.note:
+        await database.execute(
+            """INSERT INTO notify_logs (channel, title, content, success)
+               VALUES ('manual', :title, :content, 1)""",
+            {"title": f"Lottery {lottery_id} result", "content": data.note},
+        )
+    event_type = {
+        "participated": "LotteryJoined",
+        "won": "LotteryWon",
+        "lost": "LotteryLost",
+        "expired": "LotteryExpired",
+    }[data.status]
+    await record_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type=event_type,
+        payload={"status": data.status, "note": data.note},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "updated", "lottery_id": lottery_id, "result": data.status}
+
+
+async def pick_account(account_id: int | None, platform: str):
+    if account_id is not None:
+        return await database.fetch_one(
+            """SELECT * FROM accounts a
+               WHERE a.id = :id
+                 AND a.platform = :platform
+                 AND a.status = 'ready'
+                 AND OCTET_LENGTH(a.encrypted_credential) > 0
+                 AND (
+                   SELECT c.status FROM account_calibrations c
+                   WHERE c.account_id = a.id
+                   ORDER BY c.created_at DESC
+                   LIMIT 1
+                 ) = 'succeeded'""",
+            {"id": account_id, "platform": platform},
+        )
+
+    return await database.fetch_one(
+        """SELECT * FROM accounts a
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'
+           ORDER BY daily_task_count ASC, id ASC
+           LIMIT 1""",
+        {"platform": platform},
+    )
+
+
+def parse_json_field(value):
+    if isinstance(value, (dict, list)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+async def save_platform_selector_config(platform: str, config: dict):
+    row = await database.fetch_one(
+        "SELECT id FROM adapter_selector_configs WHERE platform = :platform",
+        {"platform": platform},
+    )
+    values = {"platform": platform, "config_json": json.dumps(config, ensure_ascii=False)}
+    if row:
+        await database.execute(
+            "UPDATE adapter_selector_configs SET config_json = :config_json, updated_at = NOW() WHERE platform = :platform",
+            values,
+        )
+        return
+    await database.execute(
+        "INSERT INTO adapter_selector_configs (platform, config_json) VALUES (:platform, :config_json)",
+        values,
+    )
+
+
+def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
+    configured = selector_config.get(platform, {})
+    if not isinstance(configured, dict):
+        return False
+    return all(bool(configured.get(phase)) for phase in ADAPTER_PHASES)
+
+
+def parse_target_lines(content: str, default_platform: str, default_score: int):
+    rows = []
+    for index, raw_line in enumerate(content.splitlines(), start=1):
+        raw = raw_line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = [part.strip() for part in raw.replace("\t", ",").split(",")]
+        parts = [part for part in parts if part]
+        platform = default_platform
+        url = parts[0] if parts else ""
+        score = default_score
+        expires_at = None
+
+        if len(parts) >= 2 and not looks_like_url(parts[0]):
+            platform = parts[0]
+            url = parts[1]
+            if len(parts) >= 3:
+                score = parse_int(parts[2], default_score)
+            if len(parts) >= 4:
+                expires_at = parts[3]
+        elif len(parts) >= 2:
+            score = parse_int(parts[1], default_score)
+            if len(parts) >= 3:
+                expires_at = parts[2]
+
+        if not get_platform(platform):
+            rows.append({"line": index, "raw": raw, "error": f"Unsupported platform: {platform}"})
+            continue
+        if not looks_like_url(url):
+            rows.append({"line": index, "raw": raw, "error": "Invalid URL"})
+            continue
+
+        rows.append(
+            {
+                "line": index,
+                "raw": raw,
+                "platform": platform,
+                "raw_url": url,
+                "value_score": score,
+                "expires_at": expires_at,
+            }
+        )
+    return rows
+
+
+def looks_like_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def parse_int(value: str, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
