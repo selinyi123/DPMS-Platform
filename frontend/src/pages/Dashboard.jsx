@@ -100,6 +100,15 @@ export default function Dashboard() {
     };
   };
 
+  const localizeStrategy = (item) => {
+    const title = t(`dashboard.strategyMap.${item.code}Title`);
+    const detail = t(`dashboard.strategyMap.${item.code}Detail`);
+    return {
+      title: title === `dashboard.strategyMap.${item.code}Title` ? item.title : title,
+      detail: detail === `dashboard.strategyMap.${item.code}Detail` ? item.detail : detail,
+    };
+  };
+
   const statusText = (status) => {
     const label = t(`status.${status}`);
     return label === `status.${status}` ? status : label;
@@ -167,6 +176,34 @@ export default function Dashboard() {
             );
           })}
           {!readiness?.actions?.length && <div className="empty-cell">{t('dashboard.noActions')}</div>}
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">{t('dashboard.strategyAdvice')}</div>
+        <p className="muted-text tight-text">
+          {formatText(t('dashboard.strategyWindow'), { days: readiness?.strategy_advice?.review_window_days ?? 7 })}
+        </p>
+        <div className="action-plan-list">
+          {readiness?.strategy_advice?.advice?.map(item => {
+            const localized = localizeStrategy(item);
+            return (
+              <div className="action-plan-row" key={item.code}>
+                <div className="action-priority">
+                  <span className={`badge ${item.priority === 'P0' ? 'badge-danger' : item.priority === 'P1' ? 'badge-warn' : 'badge-info'}`}>
+                    {item.priority}
+                  </span>
+                  <span className="mono small-text muted-text">{item.target}</span>
+                </div>
+                <div className="action-copy">
+                  <div className="action-title">{localized.title}</div>
+                  <p className="muted-text">{localized.detail}</p>
+                  <div className="mono small-text muted-text">{JSON.stringify(item.evidence || {})}</div>
+                </div>
+              </div>
+            );
+          })}
+          {!readiness?.strategy_advice?.advice?.length && <div className="empty-cell">{t('dashboard.noStrategyAdvice')}</div>}
         </div>
       </div>
 

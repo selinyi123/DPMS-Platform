@@ -238,6 +238,7 @@ async def readiness():
 
     production_checks = build_production_checks(platforms, summary)
     summary["production_ready"] = all(check["passed"] for check in production_checks if check["priority"] == "P0")
+    strategy_advice = await build_strategy_advice(summary)
 
     return {
 
@@ -247,6 +248,7 @@ async def readiness():
 
         "actions": build_next_actions(platforms, summary),
         "production_checks": production_checks,
+        "strategy_advice": strategy_advice,
 
     }
 
@@ -497,6 +499,168 @@ def build_next_actions(platforms, summary):
         })
 
     return actions
+
+
+async def build_strategy_advice(summary):
+    window_days = 7
+    mode_rows = await database.fetch_all(
+        """SELECT COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) AS mode,
+                  status,
+                  COUNT(*) AS cnt
+           FROM task_runs
+           WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+           GROUP BY mode, status"""
+    )
+    risk_rows = await database.fetch_all(
+        """SELECT account_id, COUNT(*) AS cnt
+           FROM risk_events
+           WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+           GROUP BY account_id
+           ORDER BY cnt DESC
+           LIMIT 3"""
+    )
+    high_value_pending = await database.fetch_one(
+        "SELECT COUNT(*) AS cnt FROM lotteries WHERE status = 'pending' AND value_score >= 70"
+    )
+    stale_active_tasks = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM task_runs
+           WHERE status IN ('queued','running')
+             AND created_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE)"""
+    )
+
+    mode_counts = [dict(row) for row in mode_rows]
+    mode_success = {
+        row["mode"]: int(row["cnt"])
+        for row in mode_counts
+        if row["status"] == "succeeded"
+    }
+    mode_failed = {
+        row["mode"]: int(row["cnt"])
+        for row in mode_counts
+        if row["status"] == "failed"
+    }
+    shadow_success = mode_success.get("shadow_run", 0)
+    dry_success = mode_success.get("dry_run", 0)
+    real_success = mode_success.get("real_run", 0)
+    failed_total = sum(mode_failed.values())
+    advice = []
+
+    if summary.get("notification_channels_configured", 0) == 0:
+        advice.append(strategy_item(
+            "configure_notifications",
+            "P0",
+            "notify",
+            "Configure notification before autonomous runs",
+            "No external notification channel is configured, so wins, failures, captcha, or bans may only be visible in logs.",
+            {"configured_channels": 0},
+        ))
+
+    if summary.get("pending_targets", 0) > 0 and shadow_success == 0:
+        advice.append(strategy_item(
+            "run_shadow_before_real",
+            "P0",
+            "workflow",
+            "Run shadow-run before real-run",
+            "Pending targets exist, but no successful shadow-run was recorded in the last 7 days.",
+            {"pending_targets": summary.get("pending_targets", 0), "shadow_success_7d": shadow_success},
+        ))
+
+    if dry_success > 0 and shadow_success == 0:
+        advice.append(strategy_item(
+            "promote_dry_to_shadow",
+            "P1",
+            "workflow",
+            "Promote dry-run validation into shadow-run",
+            "Dry-run is succeeding, so the next safe step is opening real pages with no side effects to validate login state and risk signals.",
+            {"dry_success_7d": dry_success},
+        ))
+
+    if shadow_success > 0 and summary.get("real_run_ready", 0) == 0:
+        advice.append(strategy_item(
+            "complete_real_gate",
+            "P1",
+            "strategy",
+            "Complete the real-run gate after shadow evidence",
+            "Shadow-run evidence exists, but no platform currently satisfies real-run readiness.",
+            {"shadow_success_7d": shadow_success, "real_run_ready": summary.get("real_run_ready", 0)},
+        ))
+
+    if failed_total > 0:
+        advice.append(strategy_item(
+            "review_failed_runs",
+            "P1",
+            "review",
+            "Review failed runs before increasing volume",
+            "Recent task failures should be inspected through evidence screenshots and event timeline before scaling the scheduler.",
+            {"failed_runs_7d": failed_total},
+        ))
+
+    if summary.get("recent_risk_events_24h", 0) > 0 or risk_rows:
+        advice.append(strategy_item(
+            "cooldown_risky_accounts",
+            "P1",
+            "risk",
+            "Cooldown and recalibrate risky accounts",
+            "Risk events were recorded recently; affected accounts should be cooled, recalibrated, or assigned safer proxy exits.",
+            {
+                "risk_24h": summary.get("recent_risk_events_24h", 0),
+                "hot_accounts": [dict(row) for row in risk_rows],
+            },
+        ))
+
+    if int(high_value_pending["cnt"] if high_value_pending else 0) > 0 and summary.get("safe_accounts_total", 0) > 0:
+        advice.append(strategy_item(
+            "prioritize_high_value_targets",
+            "P2",
+            "strategy",
+            "Prioritize high-value pending targets",
+            "High-score pending targets exist and safe accounts are available; dispatch order should favor expected value after shadow-run clears.",
+            {
+                "high_value_pending": int(high_value_pending["cnt"]),
+                "safe_accounts": summary.get("safe_accounts_total", 0),
+            },
+        ))
+
+    if int(stale_active_tasks["cnt"] if stale_active_tasks else 0) > 0:
+        advice.append(strategy_item(
+            "recover_stale_tasks",
+            "P1",
+            "worker",
+            "Recover stale active tasks",
+            "Queued or running tasks older than 30 minutes were found; inspect Worker health and recovery daemon behavior.",
+            {"stale_active_tasks": int(stale_active_tasks["cnt"])},
+        ))
+
+    if not advice and real_success > 0:
+        advice.append(strategy_item(
+            "continue_controlled_real_run",
+            "P2",
+            "strategy",
+            "Continue controlled real-run cadence",
+            "Recent real-run tasks succeeded and no urgent blocker was detected by the strategy review.",
+            {"real_success_7d": real_success},
+        ))
+
+    return {
+        "review_window_days": window_days,
+        "mode_counts": mode_counts,
+        "high_value_pending": int(high_value_pending["cnt"] if high_value_pending else 0),
+        "stale_active_tasks": int(stale_active_tasks["cnt"] if stale_active_tasks else 0),
+        "risk_hot_accounts": [dict(row) for row in risk_rows],
+        "advice": advice[:8],
+    }
+
+
+def strategy_item(code, priority, target, title, detail, evidence):
+    return {
+        "code": code,
+        "priority": priority,
+        "target": target,
+        "title": title,
+        "detail": detail,
+        "evidence": evidence,
+    }
 
 
 def build_production_checks(platforms, summary):
