@@ -47,7 +47,7 @@ npm install
 npm run build
 ```
 
-构建产物输出到 `dashboard/dist`，供 Nginx 容器服务。
+构建产物输出到 `dashboard/dist`，供 Nginx 容器服务。前端 API 路径默认是 `/api`，如需部署到不同网关路径，可在构建前设置 `VITE_API_BASE`；请求超时默认 `15000ms`，可通过 `VITE_API_TIMEOUT_MS` 调整。
 
 ## 重要安全说明
 
