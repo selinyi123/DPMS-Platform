@@ -12,7 +12,7 @@ function confirmedHeaders(extra = {}) {
   return adminHeaders({ ...extra, 'x-confirm-action': 'true' });
 }
 
-function apiUrl(path) {
+export function apiPath(path) {
   if (/^https?:\/\//i.test(path)) return path;
   const normalizedBase = BASE.endsWith('/') ? BASE.slice(0, -1) : BASE;
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -54,7 +54,7 @@ async function requestJSON(path, options = {}) {
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(apiUrl(path), {
+    const res = await fetch(apiPath(path), {
       ...options.fetchOptions,
       method: options.method || 'GET',
       headers: options.headers,

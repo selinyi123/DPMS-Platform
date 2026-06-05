@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-import { deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
+import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
 import { useUi } from '../uiContext';
 
 export default function Deploy() {
@@ -50,7 +50,7 @@ export default function Deploy() {
   }, [t, toast]);
 
   const restart = async () => {
-    const res = await fetch('/api/metrics/worker/restart', { method: 'POST', headers: getConfirmedHeaders() });
+    const res = await fetch(apiPath('/metrics/worker/restart'), { method: 'POST', headers: getConfirmedHeaders() });
     const text = res.ok ? t('deploy.reloadSent') : t('deploy.operationFailed');
     setMessage(text);
     toast(text, res.ok ? 'success' : 'error');
@@ -69,7 +69,7 @@ export default function Deploy() {
     }
     const form = new FormData();
     form.append('file', file);
-    const res = await fetch('/api/update/upload', { method: 'POST', headers: getConfirmedHeaders({ signature: uploadSignature }), body: form });
+    const res = await fetch(apiPath('/update/upload'), { method: 'POST', headers: getConfirmedHeaders({ signature: uploadSignature }), body: form });
     const text = res.ok ? t('deploy.uploadDone') : t('deploy.uploadFailed');
     setMessage(text);
     toast(text, res.ok ? 'success' : 'error');
@@ -390,7 +390,7 @@ export default function Deploy() {
           {notifyGuide?.apply_steps?.map(step => <div className="ops-check-item" key={step}>{step}</div>)}
         </div>
         <p className="muted-text tight-text">
-          {formatText(t('deploy.testEndpoint'), { endpoint: notifyGuide?.test_endpoint || 'POST /api/notify/send' })}
+          {formatText(t('deploy.testEndpoint'), { endpoint: `POST ${apiPath('/notify/send')}` })}
         </p>
       </div>
 

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import { fetchJSON, postJSON, putJSON } from '../api';
+import { apiPath, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
 import { useUi } from '../uiContext';
 
@@ -431,7 +431,7 @@ export default function Lotteries() {
                       {item.screenshot_path ? (
                         <a
                           className="badge badge-warn evidence-link"
-                          href={`/api/lotteries/probes/${item.probe_id}/screenshot`}
+                          href={apiPath(`/lotteries/probes/${item.probe_id}/screenshot`)}
                           target="_blank"
                           rel="noreferrer"
                         >
@@ -467,7 +467,7 @@ export default function Lotteries() {
                     {run.screenshot_path ? (
                       <a
                         className="badge badge-warn evidence-link"
-                        href={`/api/lotteries/tasks/runs/${run.task_id}/screenshot`}
+                        href={apiPath(`/lotteries/tasks/runs/${run.task_id}/screenshot`)}
                         target="_blank"
                         rel="noreferrer"
                       >
