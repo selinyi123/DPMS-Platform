@@ -695,6 +695,81 @@ button:disabled {
   background: #f8fafc;
 }
 
+.knowledge-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.knowledge-stat {
+  min-height: 86px;
+  display: grid;
+  gap: 6px;
+  align-content: center;
+  padding: 12px;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.knowledge-stat span,
+.knowledge-stat em {
+  color: #64748b;
+  font-size: 12px;
+  font-style: normal;
+}
+
+.knowledge-stat strong {
+  color: #111827;
+  font-size: 28px;
+  line-height: 1;
+}
+
+.knowledge-grid {
+  margin-top: 8px;
+}
+
+.knowledge-section {
+  min-width: 0;
+}
+
+.knowledge-gap-list {
+  margin-top: 14px;
+}
+
+.compact-data-table th,
+.compact-data-table td {
+  padding: 8px 10px;
+}
+
+.knowledge-score {
+  min-width: 92px;
+  display: grid;
+  grid-template-columns: 32px minmax(48px, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.knowledge-score span {
+  color: #111827;
+  font-weight: 800;
+}
+
+.knowledge-score div {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.knowledge-score i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #2563eb;
+}
+
 .action-priority {
   display: flex;
   align-items: center;
@@ -1063,11 +1138,26 @@ button:disabled {
 :root[data-theme="dark"] .notify-health-row,
 :root[data-theme="dark"] .notify-guide-row,
 :root[data-theme="dark"] .ops-check-item,
+:root[data-theme="dark"] .knowledge-stat,
 :root[data-theme="dark"] .action-plan-row,
 :root[data-theme="dark"] .production-check-row {
   background: #111c2e;
   border-color: #314158;
   color: #dbe7f6;
+}
+
+:root[data-theme="dark"] .knowledge-stat strong,
+:root[data-theme="dark"] .knowledge-score span {
+  color: #f8fafc;
+}
+
+:root[data-theme="dark"] .knowledge-stat span,
+:root[data-theme="dark"] .knowledge-stat em {
+  color: #96a6ba;
+}
+
+:root[data-theme="dark"] .knowledge-score div {
+  background: #314158;
 }
 
 :root[data-theme="dark"] .rollback-box {
@@ -1236,6 +1326,10 @@ button:disabled {
   }
 
   .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .knowledge-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

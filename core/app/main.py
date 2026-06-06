@@ -21,7 +21,7 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge
 
 from app.config import settings
 
@@ -365,6 +365,8 @@ app.include_router(proxies.router, prefix="/api/proxies", tags=["proxies"])
 app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
 
 app.include_router(events.router, prefix="/api/events", tags=["events"])
+
+app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
 
 
 @app.get("/api/auth/me")
