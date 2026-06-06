@@ -267,8 +267,10 @@ export default function Lotteries() {
                 <th>{t('lotteries.rank')}</th>
                 <th>{t('lotteries.activity')}</th>
                 <th>{t('lotteries.priorityScore')}</th>
+                <th>{t('lotteries.expectedValue')}</th>
                 <th>{t('lotteries.recommendedMode')}</th>
-                <th>{t('lotteries.safeAccounts')}</th>
+                <th>{t('lotteries.recommendedAccount')}</th>
+                <th>{t('lotteries.knowledge')}</th>
                 <th>{t('lotteries.reasons')}</th>
                 <th>{t('lotteries.action')}</th>
               </tr>
@@ -282,8 +284,30 @@ export default function Lotteries() {
                     <div className="truncate-cell small-text" title={item.raw_url}>{item.raw_url}</div>
                   </td>
                   <td>{item.strategy_score}</td>
+                  <td>
+                    <div className="mono">{formatNumber(item.expected_value)}</div>
+                    <div className="small-text muted-text">{formatRate(item.estimated_win_probability)}</div>
+                  </td>
                   <td><span className={`badge ${item.recommended_mode === 'blocked' ? 'badge-danger' : item.recommended_mode === 'real_run' ? 'badge-warn' : 'badge-info'}`}>{modeText(item.recommended_mode, t)}</span></td>
-                  <td>{item.safe_accounts}</td>
+                  <td>
+                    {item.recommended_account ? (
+                      <div className="strategy-account">
+                        <span className="mono">A{item.recommended_account.account_id}</span>
+                        <div className="knowledge-score compact-score">
+                          <span>{item.recommended_account.reputation_score}</span>
+                          <div><i style={{ width: `${item.recommended_account.reputation_score || 0}%` }} /></div>
+                        </div>
+                      </div>
+                    ) : (
+                      <span className="badge badge-muted">{t('lotteries.autoPick')}</span>
+                    )}
+                  </td>
+                  <td>
+                    <div className="strategy-account">
+                      <span className="mono">{item.platform_knowledge?.knowledge_confidence ?? 0}</span>
+                      <div className="small-text muted-text">{formatRate(item.platform_knowledge?.win_rate)}</div>
+                    </div>
+                  </td>
                   <td>
                     <div className="blocker-list">
                       {item.blockers?.map(reason => <span className="badge badge-danger" key={reason}>{reason}</span>)}
@@ -301,7 +325,7 @@ export default function Lotteries() {
                   </td>
                 </tr>
               ))}
-              {!strategyQueue.length && <tr><td className="empty-cell" colSpan="7">{t('lotteries.noStrategyTargets')}</td></tr>}
+              {!strategyQueue.length && <tr><td className="empty-cell" colSpan="9">{t('lotteries.noStrategyTargets')}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -572,4 +596,14 @@ function modeText(mode, t) {
 function reasonText(code, t) {
   const label = t(`lotteries.strategyReasons.${code}`);
   return label === `lotteries.strategyReasons.${code}` ? code : label;
+}
+
+function formatRate(value) {
+  if (value === null || value === undefined) return '-';
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
+function formatNumber(value) {
+  if (value === null || value === undefined) return '-';
+  return Number(value).toFixed(2);
 }

@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
 from app.db import database, redis
 from app.event_store.service import record_event
+from app.knowledge.service import account_reputation
 from app.models.schemas import (
     AdapterSelectorConfigUpdate,
     AdapterProbeRequest,
@@ -163,6 +164,8 @@ async def list_lotteries(status: str = None, limit: int = 50):
 async def strategy_queue(limit: int = 20):
     selector_config = await load_runtime_selector_config()
     real_run_enabled = await is_real_run_enabled()
+    platform_knowledge = await load_strategy_platform_knowledge()
+    account_recommendations = await load_strategy_account_recommendations()
     rows = await database.fetch_all(
         """SELECT l.*,
                   (
@@ -260,6 +263,30 @@ async def strategy_queue(limit: int = 20):
         if item["value_score"] >= 70:
             reason_codes.append("high_value")
 
+        knowledge = platform_knowledge.get(platform) or empty_platform_knowledge(platform)
+        recommended_account = first_or_none(account_recommendations.get(platform, []))
+        account_reputation_score = recommended_account["reputation_score"] if recommended_account else 0
+        estimated_win_probability = estimate_win_probability(
+            knowledge.get("win_rate"),
+            knowledge.get("knowledge_confidence", 0),
+        )
+        trust_score = estimate_trust_score(
+            account_reputation_score=account_reputation_score,
+            recent_platform_risk=recent_risk,
+            knowledge_confidence=knowledge.get("knowledge_confidence", 0),
+        )
+        expected_value = round(int(item["value_score"] or 0) * estimated_win_probability * trust_score, 4)
+        if knowledge.get("knowledge_confidence", 0) >= 40:
+            reason_codes.append("platform_knowledge_used")
+        elif knowledge.get("total_lotteries", 0) or knowledge.get("total_runs", 0):
+            reason_codes.append("low_knowledge_confidence")
+        if knowledge.get("win_rate") is not None:
+            reason_codes.append("historical_win_rate_used")
+        if recommended_account:
+            reason_codes.append("account_reputation_used")
+            if account_reputation_score < 60:
+                reason_codes.append("account_reputation_low")
+
         score = strategy_score(
             value_score=int(item["value_score"] or 0),
             recommended_mode=recommended_mode,
@@ -267,6 +294,10 @@ async def strategy_queue(limit: int = 20):
             shadow_success=shadow_success,
             failed_runs=failed_runs,
             recent_risk=recent_risk,
+            knowledge_confidence=knowledge.get("knowledge_confidence", 0),
+            estimated_win_probability=estimated_win_probability,
+            account_reputation_score=account_reputation_score,
+            expected_value=expected_value,
         )
         items.append(
             {
@@ -276,9 +307,14 @@ async def strategy_queue(limit: int = 20):
                 "status": item["status"],
                 "value_score": item["value_score"],
                 "strategy_score": score,
+                "expected_value": expected_value,
+                "estimated_win_probability": estimated_win_probability,
+                "trust_score": trust_score,
                 "recommended_mode": recommended_mode,
                 "reason_codes": reason_codes,
                 "blockers": blockers,
+                "platform_knowledge": knowledge,
+                "recommended_account": recommended_account,
                 "safe_accounts": safe_accounts,
                 "active_runs": active_runs,
                 "dry_success": dry_success,
@@ -822,6 +858,11 @@ async def pick_account(account_id: int | None, platform: str):
             {"id": account_id, "platform": platform},
         )
 
+    recommendations = await load_strategy_account_recommendations(platform)
+    recommended = first_or_none(recommendations.get(platform, []))
+    if recommended:
+        return await database.fetch_one("SELECT * FROM accounts WHERE id = :id", {"id": recommended["account_id"]})
+
     return await database.fetch_one(
         """SELECT * FROM accounts a
            WHERE a.platform = :platform
@@ -888,6 +929,10 @@ def strategy_score(
     shadow_success: int,
     failed_runs: int,
     recent_risk: int,
+    knowledge_confidence: int,
+    estimated_win_probability: float,
+    account_reputation_score: int,
+    expected_value: float,
 ) -> float:
     mode_multiplier = {
         "real_run": 1.0,
@@ -897,7 +942,294 @@ def strategy_score(
     }.get(recommended_mode, 0.0)
     validation_bonus = min(dry_success, 3) * 3 + min(shadow_success, 3) * 6
     risk_penalty = min(recent_risk * 8 + failed_runs * 7, 45)
-    return round(max(0, value_score * mode_multiplier + validation_bonus - risk_penalty), 2)
+    knowledge_bonus = min(knowledge_confidence * 0.08, 8)
+    account_bonus = min(max(account_reputation_score - 50, 0) * 0.16, 8)
+    expected_value_bonus = min(expected_value * 10, 12)
+    probability_bonus = min(estimated_win_probability * 20, 10)
+    return round(
+        max(
+            0,
+            value_score * mode_multiplier
+            + validation_bonus
+            + knowledge_bonus
+            + account_bonus
+            + expected_value_bonus
+            + probability_bonus
+            - risk_penalty,
+        ),
+        2,
+    )
+
+
+async def load_strategy_platform_knowledge(window_days: int = 30) -> dict[str, dict]:
+    rows = await database.fetch_all(
+        """SELECT platform,
+                  COUNT(*) AS total_lotteries,
+                  SUM(status = 'pending') AS pending_lotteries,
+                  SUM(status = 'won') AS won_lotteries,
+                  SUM(status = 'lost') AS lost_lotteries,
+                  SUM(value_score >= 70) AS high_value_lotteries,
+                  AVG(value_score) AS avg_value_score
+           FROM lotteries
+           WHERE extracted_at >= DATE_SUB(NOW(), INTERVAL :window_days DAY)
+           GROUP BY platform""",
+        {"window_days": window_days},
+    )
+    task_rows = await database.fetch_all(
+        """SELECT l.platform,
+                  COUNT(*) AS total_runs,
+                  SUM(tr.status = 'succeeded') AS succeeded_runs,
+                  SUM(tr.status = 'failed') AS failed_runs,
+                  SUM(COALESCE(tr.task_mode, IF(tr.dry_run = 1, 'dry_run', 'real_run')) = 'shadow_run'
+                      AND tr.status = 'succeeded') AS shadow_success,
+                  SUM(COALESCE(tr.task_mode, IF(tr.dry_run = 1, 'dry_run', 'real_run')) = 'real_run'
+                      AND tr.status = 'succeeded') AS real_success
+           FROM task_runs tr
+           JOIN lotteries l ON l.id = tr.lottery_id
+           WHERE tr.created_at >= DATE_SUB(NOW(), INTERVAL :window_days DAY)
+           GROUP BY l.platform""",
+        {"window_days": window_days},
+    )
+    risk_rows = await database.fetch_all(
+        """SELECT a.platform,
+                  COUNT(*) AS risk_events
+           FROM risk_events r
+           JOIN accounts a ON a.id = r.account_id
+           WHERE r.created_at >= DATE_SUB(NOW(), INTERVAL :window_days DAY)
+           GROUP BY a.platform""",
+        {"window_days": window_days},
+    )
+
+    result: dict[str, dict] = {}
+    for platform in get_platforms():
+        result[platform] = empty_platform_knowledge(platform)
+    for row in rows:
+        platform = row["platform"]
+        result.setdefault(platform, empty_platform_knowledge(platform))
+        won = as_int(row["won_lotteries"])
+        lost = as_int(row["lost_lotteries"])
+        result[platform].update(
+            {
+                "total_lotteries": as_int(row["total_lotteries"]),
+                "pending_lotteries": as_int(row["pending_lotteries"]),
+                "won_lotteries": won,
+                "lost_lotteries": lost,
+                "high_value_lotteries": as_int(row["high_value_lotteries"]),
+                "avg_value_score": round(as_float(row["avg_value_score"]), 2),
+                "win_rate": safe_ratio(won, won + lost),
+            }
+        )
+    for row in task_rows:
+        platform = row["platform"]
+        result.setdefault(platform, empty_platform_knowledge(platform))
+        succeeded = as_int(row["succeeded_runs"])
+        total_runs = as_int(row["total_runs"])
+        result[platform].update(
+            {
+                "total_runs": total_runs,
+                "succeeded_runs": succeeded,
+                "failed_runs": as_int(row["failed_runs"]),
+                "task_success_rate": safe_ratio(succeeded, total_runs),
+                "shadow_success": as_int(row["shadow_success"]),
+                "real_success": as_int(row["real_success"]),
+            }
+        )
+    for row in risk_rows:
+        platform = row["platform"]
+        result.setdefault(platform, empty_platform_knowledge(platform))
+        result[platform]["risk_events"] = as_int(row["risk_events"])
+
+    for item in result.values():
+        item["knowledge_confidence"] = strategy_knowledge_confidence(item)
+    return result
+
+
+async def load_strategy_account_recommendations(platform: str | None = None, window_days: int = 30) -> dict[str, list[dict]]:
+    platform_filter = "AND a.platform = :platform" if platform else ""
+    values = {"window_days": window_days}
+    if platform:
+        values["platform"] = platform
+    rows = await database.fetch_all(
+        f"""SELECT a.id,
+                   a.platform,
+                   a.status,
+                   a.risk_score,
+                   a.daily_task_count,
+                   a.last_active_at,
+                   (
+                     SELECT c.status
+                     FROM account_calibrations c
+                     WHERE c.account_id = a.id
+                     ORDER BY c.created_at DESC
+                     LIMIT 1
+                   ) AS latest_calibration_status,
+                   COALESCE(t.total_runs, 0) AS total_runs,
+                   COALESCE(t.succeeded_runs, 0) AS succeeded_runs,
+                   COALESCE(t.failed_runs, 0) AS failed_runs,
+                   COALESCE(t.dry_runs, 0) AS dry_runs,
+                   COALESCE(t.shadow_runs, 0) AS shadow_runs,
+                   COALESCE(t.real_runs, 0) AS real_runs,
+                   t.latest_run_at,
+                   COALESCE(r.risk_events, 0) AS risk_events,
+                   r.latest_risk_at
+            FROM accounts a
+            LEFT JOIN (
+              SELECT account_id,
+                     COUNT(*) AS total_runs,
+                     SUM(status = 'succeeded') AS succeeded_runs,
+                     SUM(status = 'failed') AS failed_runs,
+                     SUM(COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) = 'dry_run') AS dry_runs,
+                     SUM(COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) = 'shadow_run') AS shadow_runs,
+                     SUM(COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) = 'real_run') AS real_runs,
+                     MAX(created_at) AS latest_run_at
+              FROM task_runs
+              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :window_days DAY)
+              GROUP BY account_id
+            ) t ON t.account_id = a.id
+            LEFT JOIN (
+              SELECT account_id,
+                     COUNT(*) AS risk_events,
+                     MAX(created_at) AS latest_risk_at
+              FROM risk_events
+              WHERE created_at >= DATE_SUB(NOW(), INTERVAL :window_days DAY)
+              GROUP BY account_id
+            ) r ON r.account_id = a.id
+            WHERE a.status = 'ready'
+              AND OCTET_LENGTH(a.encrypted_credential) > 0
+              AND (
+                SELECT c.status
+                FROM account_calibrations c
+                WHERE c.account_id = a.id
+                ORDER BY c.created_at DESC
+                LIMIT 1
+              ) = 'succeeded'
+              {platform_filter}
+            ORDER BY a.platform ASC, a.daily_task_count ASC, a.id ASC""",
+        values,
+    )
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        item = dict(row)
+        reputation = account_reputation(
+            status=item["status"],
+            risk_score=as_int(item["risk_score"]),
+            latest_calibration_status=item.get("latest_calibration_status"),
+            total_runs=as_int(item["total_runs"]),
+            succeeded_runs=as_int(item["succeeded_runs"]),
+            failed_runs=as_int(item["failed_runs"]),
+            shadow_runs=as_int(item["shadow_runs"]),
+            real_runs=as_int(item["real_runs"]),
+            risk_events=as_int(item["risk_events"]),
+        )
+        recommendation = {
+            "account_id": item["id"],
+            "platform": item["platform"],
+            "reputation_score": reputation,
+            "risk_score": as_int(item["risk_score"]),
+            "risk_events": as_int(item["risk_events"]),
+            "daily_task_count": as_int(item["daily_task_count"]),
+            "total_runs": as_int(item["total_runs"]),
+            "succeeded_runs": as_int(item["succeeded_runs"]),
+            "failed_runs": as_int(item["failed_runs"]),
+            "dry_runs": as_int(item["dry_runs"]),
+            "shadow_runs": as_int(item["shadow_runs"]),
+            "real_runs": as_int(item["real_runs"]),
+            "task_success_rate": safe_ratio(as_int(item["succeeded_runs"]), as_int(item["total_runs"])),
+            "latest_run_at": item["latest_run_at"],
+            "latest_risk_at": item["latest_risk_at"],
+            "last_active_at": item["last_active_at"],
+        }
+        grouped.setdefault(item["platform"], []).append(recommendation)
+
+    for items in grouped.values():
+        items.sort(
+            key=lambda account: (
+                account["reputation_score"],
+                -account["daily_task_count"],
+                -account["risk_events"],
+                -account["failed_runs"],
+            ),
+            reverse=True,
+        )
+    return grouped
+
+
+def empty_platform_knowledge(platform: str) -> dict:
+    return {
+        "platform": platform,
+        "total_lotteries": 0,
+        "pending_lotteries": 0,
+        "won_lotteries": 0,
+        "lost_lotteries": 0,
+        "high_value_lotteries": 0,
+        "avg_value_score": 0,
+        "win_rate": None,
+        "total_runs": 0,
+        "succeeded_runs": 0,
+        "failed_runs": 0,
+        "task_success_rate": None,
+        "shadow_success": 0,
+        "real_success": 0,
+        "risk_events": 0,
+        "knowledge_confidence": 0,
+    }
+
+
+def strategy_knowledge_confidence(item: dict) -> int:
+    result_labels = as_int(item.get("won_lotteries")) + as_int(item.get("lost_lotteries"))
+    return clamp(
+        min(as_int(item.get("total_lotteries")) * 4, 28)
+        + min(result_labels * 8, 24)
+        + min(as_int(item.get("total_runs")) * 5, 22)
+        + min(as_int(item.get("shadow_success")) * 8, 16)
+        + min(as_int(item.get("real_success")) * 8, 10),
+        0,
+        100,
+    )
+
+
+def estimate_win_probability(win_rate: float | None, knowledge_confidence: int) -> float:
+    baseline = 0.05
+    if win_rate is None:
+        return baseline
+    confidence_weight = min(max(knowledge_confidence, 0) / 100, 0.75)
+    return round(baseline * (1 - confidence_weight) + float(win_rate) * confidence_weight, 4)
+
+
+def estimate_trust_score(*, account_reputation_score: int, recent_platform_risk: int, knowledge_confidence: int) -> float:
+    account_trust = max(0.25, min(account_reputation_score, 100) / 100) if account_reputation_score else 0.35
+    risk_penalty = min(recent_platform_risk * 0.08, 0.48)
+    confidence_bonus = min(max(knowledge_confidence, 0) / 100 * 0.12, 0.12)
+    return round(max(0.05, min(account_trust + confidence_bonus - risk_penalty, 1.0)), 4)
+
+
+def first_or_none(items):
+    return items[0] if items else None
+
+
+def safe_ratio(numerator: int, denominator: int) -> float | None:
+    if not denominator:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def as_int(value) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def as_float(value) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
+def clamp(value: int | float, low: int, high: int) -> int:
+    return int(max(low, min(high, round(value))))
 
 
 def parse_json_field(value):

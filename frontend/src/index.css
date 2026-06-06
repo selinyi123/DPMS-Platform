@@ -661,6 +661,17 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.strategy-account {
+  display: grid;
+  gap: 4px;
+  min-width: 104px;
+}
+
+.compact-score {
+  min-width: 86px;
+  grid-template-columns: 28px minmax(44px, 1fr);
+}
+
 .action-plan-list {
   display: flex;
   flex-direction: column;
