@@ -10,6 +10,7 @@ export default function Lotteries() {
   const [runs, setRuns] = useState([]);
   const [probes, setProbes] = useState([]);
   const [sources, setSources] = useState([]);
+  const [strategyQueue, setStrategyQueue] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [platforms, setPlatforms] = useState([]);
   const [adapters, setAdapters] = useState([]);
@@ -47,11 +48,12 @@ export default function Lotteries() {
 
   const load = async () => {
     try {
-      const [lotteryRows, runRows, probeRows, sourceRows, accountRows, platformRows, adapterRows] = await Promise.all([
+      const [lotteryRows, runRows, probeRows, sourceRows, strategyRows, accountRows, platformRows, adapterRows] = await Promise.all([
         fetchJSON('/lotteries/'),
         fetchJSON('/lotteries/tasks/runs'),
         fetchJSON('/lotteries/probes'),
         fetchJSON('/lotteries/sources'),
+        fetchJSON('/lotteries/strategy/queue'),
         fetchJSON('/accounts/'),
         fetchJSON('/accounts/platforms'),
         fetchJSON('/lotteries/adapters'),
@@ -60,6 +62,7 @@ export default function Lotteries() {
       setRuns(runRows);
       setProbes(probeRows);
       setSources(sourceRows);
+      setStrategyQueue(strategyRows.items || []);
       setAccounts(accountRows);
       setPlatforms(platformRows);
       setAdapters(adapterRows);
@@ -161,17 +164,18 @@ export default function Lotteries() {
     }
   };
 
-  const dispatch = async (id) => {
+  const dispatch = async (id, modeOverride = dispatchMode) => {
     setError('');
     try {
       const lottery = lotteries.find(item => item.id === id);
+      const mode = modeOverride || dispatchMode;
       const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
       await postJSON(`/lotteries/${id}/dispatch`, {
-        mode: dispatchMode,
-        dry_run: dispatchMode !== 'real_run',
-        confirm: dispatchMode === 'real_run',
+        mode,
+        dry_run: mode !== 'real_run',
+        confirm: mode === 'real_run',
         account_id: selectedMatches ? Number(selectedAccount) : null,
-      }, { confirm: dispatchMode === 'real_run' });
+      }, { confirm: mode === 'real_run' });
       notify(t('lotteries.dispatchQueued'), 'success');
       await load();
     } catch (err) {
@@ -251,6 +255,56 @@ export default function Lotteries() {
             <div className="capability-row"><span>{t('lotteries.cookieDomain')}</span><span className="mono small-text">{platform.cookie_domain}</span></div>
           </div>
         ))}
+      </div>
+
+      <div className="panel">
+        <div className="panel-title">{t('lotteries.strategyQueue')}</div>
+        <p className="muted-text tight-text">{t('lotteries.strategyQueueHint')}</p>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t('lotteries.rank')}</th>
+                <th>{t('lotteries.activity')}</th>
+                <th>{t('lotteries.priorityScore')}</th>
+                <th>{t('lotteries.recommendedMode')}</th>
+                <th>{t('lotteries.safeAccounts')}</th>
+                <th>{t('lotteries.reasons')}</th>
+                <th>{t('lotteries.action')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {strategyQueue.map(item => (
+                <tr key={item.lottery_id}>
+                  <td className="mono">#{item.rank}</td>
+                  <td>
+                    <div className="mono">L{item.lottery_id} / {item.platform}</div>
+                    <div className="truncate-cell small-text" title={item.raw_url}>{item.raw_url}</div>
+                  </td>
+                  <td>{item.strategy_score}</td>
+                  <td><span className={`badge ${item.recommended_mode === 'blocked' ? 'badge-danger' : item.recommended_mode === 'real_run' ? 'badge-warn' : 'badge-info'}`}>{modeText(item.recommended_mode, t)}</span></td>
+                  <td>{item.safe_accounts}</td>
+                  <td>
+                    <div className="blocker-list">
+                      {item.blockers?.map(reason => <span className="badge badge-danger" key={reason}>{reason}</span>)}
+                      {item.reason_codes?.map(code => <span className="badge badge-muted" key={code}>{reasonText(code, t)}</span>)}
+                    </div>
+                  </td>
+                  <td>
+                    <button
+                      className={item.recommended_mode === 'real_run' ? 'btn-danger' : 'btn-primary'}
+                      disabled={item.recommended_mode === 'blocked'}
+                      onClick={() => dispatch(item.lottery_id, item.recommended_mode)}
+                    >
+                      {t('lotteries.dispatchRecommended')}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {!strategyQueue.length && <tr><td className="empty-cell" colSpan="7">{t('lotteries.noStrategyTargets')}</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <div className="panel">
@@ -508,4 +562,14 @@ function modeLabel(run, t) {
   const mode = run.task_mode || (run.dry_run ? 'dry_run' : 'real_run');
   const label = t(`lotteries.${mode}`);
   return label === `lotteries.${mode}` ? mode : label;
+}
+
+function modeText(mode, t) {
+  const label = t(`lotteries.${mode}`);
+  return label === `lotteries.${mode}` ? mode : label;
+}
+
+function reasonText(code, t) {
+  const label = t(`lotteries.strategyReasons.${code}`);
+  return label === `lotteries.strategyReasons.${code}` ? code : label;
 }

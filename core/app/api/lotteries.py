@@ -159,6 +159,145 @@ async def list_lotteries(status: str = None, limit: int = 50):
     return [dict(r) for r in rows]
 
 
+@router.get("/strategy/queue")
+async def strategy_queue(limit: int = 20):
+    selector_config = await load_runtime_selector_config()
+    real_run_enabled = await is_real_run_enabled()
+    rows = await database.fetch_all(
+        """SELECT l.*,
+                  (
+                    SELECT COUNT(*)
+                    FROM accounts a
+                    WHERE a.platform = l.platform
+                      AND a.status = 'ready'
+                      AND OCTET_LENGTH(a.encrypted_credential) > 0
+                      AND (
+                        SELECT c.status FROM account_calibrations c
+                        WHERE c.account_id = a.id
+                        ORDER BY c.created_at DESC
+                        LIMIT 1
+                      ) = 'succeeded'
+                  ) AS safe_accounts,
+                  (
+                    SELECT COUNT(*)
+                    FROM risk_events r
+                    JOIN accounts a ON a.id = r.account_id
+                    WHERE a.platform = l.platform
+                      AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                  ) AS recent_platform_risk,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.status IN ('queued','running')
+                  ) AS active_runs,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND COALESCE(tr.task_mode, IF(tr.dry_run = 1, 'dry_run', 'real_run')) = 'dry_run'
+                      AND tr.status = 'succeeded'
+                  ) AS dry_success,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.task_mode = 'shadow_run'
+                      AND tr.status = 'succeeded'
+                  ) AS shadow_success,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.status = 'failed'
+                  ) AS failed_runs,
+                  (
+                    SELECT ac.result
+                    FROM adapter_calibrations ac
+                    WHERE ac.platform = l.platform
+                    ORDER BY ac.id DESC
+                    LIMIT 1
+                  ) AS latest_probe_result
+           FROM lotteries l
+           WHERE l.status IN ('pending','claimed')
+           ORDER BY l.value_score DESC, l.id ASC
+           LIMIT :limit""",
+        {"limit": min(max(limit, 1), 100)},
+    )
+
+    items = []
+    for row in rows:
+        item = dict(row)
+        platform = item["platform"]
+        cfg = get_platform(platform) or {}
+        safe_accounts = int(item.get("safe_accounts") or 0)
+        active_runs = int(item.get("active_runs") or 0)
+        dry_success = int(item.get("dry_success") or 0)
+        shadow_success = int(item.get("shadow_success") or 0)
+        failed_runs = int(item.get("failed_runs") or 0)
+        recent_risk = int(item.get("recent_platform_risk") or 0)
+        probe_result = parse_json_field(item.get("latest_probe_result"))
+        probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
+        adapter_ready = bool(cfg.get("action_adapter")) or platform_selectors_complete(selector_config, platform)
+        probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+        breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
+
+        recommended_mode, reason_codes, blockers = choose_strategy_mode(
+            safe_accounts=safe_accounts,
+            active_runs=active_runs,
+            dry_success=dry_success,
+            shadow_success=shadow_success,
+            adapter_ready=adapter_ready,
+            probe_ready=probe_ready,
+            real_run_enabled=real_run_enabled,
+            breaker_allowed=breaker_allowed,
+            breaker_reason=breaker_reason,
+        )
+        if recent_risk:
+            reason_codes.append("recent_platform_risk")
+        if failed_runs:
+            reason_codes.append("recent_failures")
+        if item["value_score"] >= 70:
+            reason_codes.append("high_value")
+
+        score = strategy_score(
+            value_score=int(item["value_score"] or 0),
+            recommended_mode=recommended_mode,
+            dry_success=dry_success,
+            shadow_success=shadow_success,
+            failed_runs=failed_runs,
+            recent_risk=recent_risk,
+        )
+        items.append(
+            {
+                "lottery_id": item["id"],
+                "platform": platform,
+                "raw_url": item["raw_url"],
+                "status": item["status"],
+                "value_score": item["value_score"],
+                "strategy_score": score,
+                "recommended_mode": recommended_mode,
+                "reason_codes": reason_codes,
+                "blockers": blockers,
+                "safe_accounts": safe_accounts,
+                "active_runs": active_runs,
+                "dry_success": dry_success,
+                "shadow_success": shadow_success,
+                "failed_runs": failed_runs,
+                "recent_platform_risk": recent_risk,
+                "adapter_ready": adapter_ready,
+                "probe_ready": probe_ready,
+                "real_run_enabled": real_run_enabled,
+                "breaker_allowed": breaker_allowed,
+            }
+        )
+
+    items.sort(key=lambda row: row["strategy_score"], reverse=True)
+    for rank, item in enumerate(items, start=1):
+        item["rank"] = rank
+    return {"items": items, "count": len(items)}
+
+
 @router.get("/sources")
 async def list_tracked_sources():
     rows = await database.fetch_all("SELECT * FROM tracked_sources ORDER BY id DESC")
@@ -704,6 +843,61 @@ def resolve_task_mode(data: DispatchTaskRequest) -> str:
     if data.mode:
         return data.mode.value if hasattr(data.mode, "value") else str(data.mode)
     return "dry_run" if data.dry_run else "real_run"
+
+
+def choose_strategy_mode(
+    *,
+    safe_accounts: int,
+    active_runs: int,
+    dry_success: int,
+    shadow_success: int,
+    adapter_ready: bool,
+    probe_ready: bool,
+    real_run_enabled: bool,
+    breaker_allowed: bool,
+    breaker_reason: str | None,
+) -> tuple[str, list[str], list[str]]:
+    reasons = []
+    blockers = []
+    if active_runs > 0:
+        return "blocked", ["active_run_in_progress"], ["target already has an active run"]
+    if safe_accounts <= 0:
+        return "blocked", ["no_safe_account"], ["no calibrated ready account"]
+    if not breaker_allowed:
+        return "blocked", ["circuit_breaker_open"], [breaker_reason or "circuit breaker open"]
+    if dry_success <= 0:
+        return "dry_run", ["dry_validation_needed"], blockers
+    if shadow_success <= 0:
+        return "shadow_run", ["shadow_validation_needed"], blockers
+    if adapter_ready and probe_ready and real_run_enabled:
+        return "real_run", ["real_gate_ready"], blockers
+    if not adapter_ready:
+        reasons.append("adapter_not_ready")
+    if not probe_ready:
+        reasons.append("probe_not_ready")
+    if not real_run_enabled:
+        reasons.append("real_run_disabled")
+    return "shadow_run", reasons or ["real_gate_not_ready"], blockers
+
+
+def strategy_score(
+    *,
+    value_score: int,
+    recommended_mode: str,
+    dry_success: int,
+    shadow_success: int,
+    failed_runs: int,
+    recent_risk: int,
+) -> float:
+    mode_multiplier = {
+        "real_run": 1.0,
+        "shadow_run": 0.78,
+        "dry_run": 0.52,
+        "blocked": 0.0,
+    }.get(recommended_mode, 0.0)
+    validation_bonus = min(dry_success, 3) * 3 + min(shadow_success, 3) * 6
+    risk_penalty = min(recent_risk * 8 + failed_runs * 7, 45)
+    return round(max(0, value_score * mode_multiplier + validation_bonus - risk_penalty), 2)
 
 
 def parse_json_field(value):
