@@ -211,6 +211,15 @@ export default function Lotteries() {
     }
   };
 
+  const runGateNextAction = async (lottery, gate) => {
+    const action = gate?.next_action || 'blocked';
+    if (action === 'probe') return probe(lottery.id);
+    if (action === 'shadow_run') return dispatch(lottery.id, 'shadow_run');
+    if (action === 'real_run') return dispatch(lottery.id, 'real_run');
+    const message = t(`lotteries.nextActionHints.${action}`);
+    notify(message === `lotteries.nextActionHints.${action}` ? gateTitle(gate, t) : message, 'warning');
+  };
+
   const realActionReady = lottery => Boolean(gateByLotteryId[lottery.id]?.allowed);
 
   const probeSummary = (probe) => {
@@ -480,6 +489,7 @@ export default function Lotteries() {
               {lotteries.map(lottery => {
                 const gate = gateByLotteryId[lottery.id];
                 const gateBlocked = dispatchMode === 'real_run' && !gate?.allowed;
+                const gateCanRunNext = gateBlocked && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
                 return (
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
@@ -493,10 +503,10 @@ export default function Lotteries() {
                   <td className="small-text">{lottery.expires_at || '-'}</td>
                   <td className="action-cell">
                     <button
-                      onClick={() => dispatch(lottery.id)}
-                      disabled={!safeAccountCount(lottery.platform) || gateBlocked}
+                      onClick={() => gateBlocked ? runGateNextAction(lottery, gate) : dispatch(lottery.id)}
+                      disabled={!safeAccountCount(lottery.platform) || (gateBlocked && !gateCanRunNext)}
                       title={gateBlocked ? gateTitle(gate, t) : ''}
-                      className={dispatchMode === 'real_run' ? 'btn-danger' : 'btn-primary'}
+                      className={dispatchMode === 'real_run' && !gateCanRunNext ? 'btn-danger' : 'btn-primary'}
                     >
                       {!safeAccountCount(lottery.platform)
                         ? t('lotteries.noSafeAccount')

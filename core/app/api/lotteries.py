@@ -1419,14 +1419,14 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
     next_action = "real_run"
     if "no_calibrated_ready_account" in blockers:
         next_action = "add_account"
-    elif "real_adapter_not_enabled" in blockers:
-        next_action = "configure_adapter"
-    elif "recent_complete_probe_required" in blockers:
-        next_action = "probe"
-    elif "recent_shadow_run_required" in blockers:
-        next_action = "shadow_run"
     elif "recent_account_risk_event" in blockers:
         next_action = "review_risk"
+    elif "recent_complete_probe_required" in blockers:
+        next_action = "probe"
+    elif not selector_ready:
+        next_action = "configure_adapter"
+    elif "recent_shadow_run_required" in blockers:
+        next_action = "shadow_run"
     elif "global_real_run_disabled" in blockers:
         next_action = "enable_real_run"
 

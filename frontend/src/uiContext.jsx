@@ -282,6 +282,13 @@ const dictionaries = {
         blocked: '门禁阻断',
         real_run: '派发真实任务',
       },
+      nextActionHints: {
+        add_account: '请先到账号登录页添加并校准 Bilibili 账号。',
+        configure_adapter: '请先到运维通知页，根据完整探针保存适配器选择器。',
+        review_risk: '请先到安全风控页复查账号近期风险。',
+        enable_real_run: '全局 real-run 开关需要管理员在运维页确认开启。',
+        blocked: 'Real-run 门禁尚未满足。',
+      },
       realGateBlockers: {
         no_calibrated_ready_account: '无校准账号',
         real_adapter_not_enabled: '适配器未启用',
@@ -786,6 +793,13 @@ const dictionaries = {
         enable_real_run: 'Enable global switch',
         blocked: 'Gate blocked',
         real_run: 'Dispatch real',
+      },
+      nextActionHints: {
+        add_account: 'Add and calibrate a Bilibili account on the Accounts page first.',
+        configure_adapter: 'Save adapter selectors from a complete probe on the Ops page first.',
+        review_risk: 'Review recent account risk on the Safety page first.',
+        enable_real_run: 'The global real-run switch requires admin confirmation on the Ops page.',
+        blocked: 'The real-run gate is not satisfied yet.',
       },
       realGateBlockers: {
         no_calibrated_ready_account: 'No calibrated account',
