@@ -774,6 +774,26 @@ button:disabled {
   margin: 14px 0;
 }
 
+.bilibili-workflow-bar {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.8fr) minmax(180px, 1fr) minmax(180px, 1fr);
+  gap: 1px;
+  margin-top: 14px;
+  overflow: hidden;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface-border);
+}
+
+.bilibili-workflow-bar > div {
+  min-height: 68px;
+  display: grid;
+  gap: 5px;
+  align-content: center;
+  padding: 10px 12px;
+  background: var(--surface-muted-bg);
+}
+
 .bilibili-readiness-step {
   min-height: 138px;
   display: flex;
@@ -1455,6 +1475,10 @@ button:disabled {
   .notify-guide-grid,
   .ops-checklist,
   .bilibili-readiness-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .bilibili-workflow-bar {
     grid-template-columns: 1fr;
   }
 }
