@@ -18,6 +18,7 @@ export default function Deploy() {
   const [probes, setProbes] = useState([]);
   const [adapterConfig, setAdapterConfig] = useState(null);
   const [runtimeSettings, setRuntimeSettings] = useState(null);
+  const [realRunEvidence, setRealRunEvidence] = useState([]);
   const [realRunArmed, setRealRunArmed] = useState(false);
   const [rollbackArmed, setRollbackArmed] = useState(false);
   const [rollbackReason, setRollbackReason] = useState('manual rollback');
@@ -26,7 +27,7 @@ export default function Deploy() {
   const [notify, setNotify] = useState({ channel: 'serverchan', title: 'DPMS test', content: 'Notification channel test' });
 
   const loadNotify = async () => {
-    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, runtimeRows] = await Promise.all([
+    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, runtimeRows, evidenceRows] = await Promise.all([
       fetchJSON('/notify/channels'),
       fetchJSON('/notify/status'),
       fetchJSON('/notify/config-guide'),
@@ -34,6 +35,7 @@ export default function Deploy() {
       fetchJSON('/lotteries/adapters/config'),
       fetchJSON('/lotteries/probes'),
       fetchJSON('/metrics/runtime/settings'),
+      fetchJSON('/lotteries/real-run/evidence'),
     ]);
     setChannels(channelRows);
     setNotifyStatus(statusRows);
@@ -42,6 +44,7 @@ export default function Deploy() {
     setAdapterConfig(adapterRows);
     setProbes(probeRows);
     setRuntimeSettings(runtimeRows);
+    setRealRunEvidence(evidenceRows.items || []);
   };
 
   useEffect(() => {
@@ -203,6 +206,16 @@ export default function Deploy() {
     .map(probe => ({ probe, draft: buildDraftFromProbe(probe) }))
     .filter(item => item.draft);
 
+  const bilibiliEvidence = realRunEvidence.find(item => item.platform === 'bilibili');
+  const bilibiliAdapter = adapterConfig?.platforms?.find(item => item.platform === 'bilibili');
+  const bilibiliProbeCandidate = probeCandidates.find(item => item.probe.platform === 'bilibili');
+  const bilibiliReadiness = buildBilibiliReadiness({
+    evidence: bilibiliEvidence,
+    adapter: bilibiliAdapter,
+    runtimeSettings,
+    probeCandidate: bilibiliProbeCandidate,
+  });
+
   const useProbeDraft = (item) => {
     setSelectorJson(JSON.stringify(item.draft, null, 2));
     setSelectorB64('');
@@ -358,6 +371,48 @@ export default function Deploy() {
       </div>
 
       {message && <div className="notice">{message}</div>}
+
+      <div className="panel">
+        <div className="notify-guide-head">
+          <div>
+            <div className="panel-title">{t('deploy.bilibiliReadiness')}</div>
+            <p className="muted-text tight-text">{t('deploy.bilibiliReadinessHint')}</p>
+          </div>
+          <span className={`badge ${bilibiliEvidence?.allowed ? 'badge-ready' : 'badge-warn'}`}>
+            {bilibiliEvidence?.allowed ? t('deploy.readyForReal') : t(`lotteries.nextActions.${bilibiliEvidence?.next_action || 'blocked'}`)}
+          </span>
+        </div>
+        <div className="bilibili-readiness-grid">
+          {bilibiliReadiness.map(step => (
+            <div className="bilibili-readiness-step" key={step.code}>
+              <div>
+                <span className={`badge ${step.ready ? 'badge-ready' : step.severity === 'danger' ? 'badge-danger' : 'badge-warn'}`}>
+                  {step.ready ? t('deploy.ready') : t('deploy.needsAction')}
+                </span>
+                <div className="action-title">{t(`deploy.bilibiliSteps.${step.code}Title`)}</div>
+                <p className="muted-text tight-text">{t(`deploy.bilibiliSteps.${step.code}Detail`)}</p>
+              </div>
+              <div className="small-text mono">{step.meta}</div>
+            </div>
+          ))}
+        </div>
+        <div className="toolbar">
+          <button
+            className="btn-primary"
+            type="button"
+            disabled={!bilibiliProbeCandidate}
+            onClick={() => useProbeDraft(bilibiliProbeCandidate)}
+          >
+            {t('deploy.loadBilibiliProbeDraft')}
+          </button>
+          <button className="btn-primary" type="button" onClick={saveSelectorConfig}>
+            {t('deploy.saveRuntimeSelectors')}
+          </button>
+          <button className="btn-ghost" type="button" onClick={loadNotify}>
+            {t('common.refresh')}
+          </button>
+        </div>
+      </div>
 
       <div className="panel">
         <div className="panel-title">{t('deploy.notificationHealth')}</div>
@@ -624,6 +679,43 @@ function buildDraftFromProbe(probe) {
 function probeReadyPhaseCount(probe) {
   const result = typeof probe?.result === 'string' ? safeJson(probe.result) : probe?.result;
   return result?._summary?.ready_phase_count ?? Object.keys(buildDraftFromProbe(probe)?.[probe.platform] || {}).length;
+}
+
+function buildBilibiliReadiness({ evidence, adapter, runtimeSettings, probeCandidate }) {
+  const blockers = new Set(evidence?.blockers || []);
+  const phaseCount = probeCandidate ? probeReadyPhaseCount(probeCandidate.probe) : 0;
+  return [
+    {
+      code: 'account',
+      ready: Boolean(evidence?.safe_accounts),
+      severity: 'danger',
+      meta: evidence?.safe_accounts ? `${evidence.safe_accounts} safe` : '0 safe',
+    },
+    {
+      code: 'probe',
+      ready: Boolean(evidence?.probe_ready),
+      severity: 'warning',
+      meta: evidence?.probe_ready ? 'complete' : `${phaseCount}/4`,
+    },
+    {
+      code: 'selector',
+      ready: Boolean(adapter?.configured || evidence?.selector_ready),
+      severity: 'warning',
+      meta: adapter?.configured || evidence?.selector_ready ? 'configured' : 'missing',
+    },
+    {
+      code: 'shadow',
+      ready: Boolean(evidence?.shadow_ready),
+      severity: 'warning',
+      meta: evidence?.shadow_ready ? '24h ok' : blockers.has('recent_shadow_run_required') ? 'required' : 'unknown',
+    },
+    {
+      code: 'global',
+      ready: Boolean(runtimeSettings?.real_run_enabled),
+      severity: 'danger',
+      meta: runtimeSettings?.real_run_enabled ? 'enabled' : 'disabled',
+    },
+  ];
 }
 
 function safeJson(value) {

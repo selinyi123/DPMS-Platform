@@ -767,6 +767,25 @@ button:disabled {
   background: var(--surface-muted-bg);
 }
 
+.bilibili-readiness-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.bilibili-readiness-step {
+  min-height: 138px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 8px;
+  background: var(--surface-muted-bg);
+}
+
 .knowledge-strip {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1434,7 +1453,8 @@ button:disabled {
   }
 
   .notify-guide-grid,
-  .ops-checklist {
+  .ops-checklist,
+  .bilibili-readiness-grid {
     grid-template-columns: 1fr;
   }
 }
