@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from app.config import settings
 from app.db import database
 from app.event_store.service import record_event
-from app.models.schemas import NotifyRequest, NotifySecretUpdate
+from app.models.schemas import NotifyRequest, NotifySecretBundleUpdate, NotifySecretUpdate
 from app.security import audit_event, require_confirmation, require_min_role
 from app.utils.crypto import cookie_vault
 
@@ -145,6 +145,49 @@ async def save_notification_secrets(channel: str, payload: NotifySecretUpdate, r
         "configured": not missing,
         "saved_keys": list(updates.keys()),
         "missing_required": missing,
+    }
+
+
+@router.put("/secrets")
+async def save_notification_secret_bundle(payload: NotifySecretBundleUpdate, request: Request):
+    actor = require_min_role(request, "admin")
+    parsed = parse_secret_bundle(payload.content)
+    if not parsed:
+        raise HTTPException(400, detail="No supported notification secret was found")
+
+    for env_name, value in parsed.items():
+        await save_secret(env_name, value)
+
+    channel_states = {}
+    for channel, keys in CHANNEL_SECRET_KEYS.items():
+        if any(key in parsed for key in keys):
+            missing = [key for key in keys if not await secret_configured(key)]
+            channel_states[channel] = {"configured": not missing, "missing_required": missing}
+
+    await audit_event(
+        request,
+        action="notification_secret.bundle_save",
+        resource_type="notification_channel",
+        resource_id="bundle",
+        result="saved",
+        risk_level="high",
+        detail={"saved_keys": list(parsed.keys()), "channels": channel_states},
+    )
+    await record_event(
+        aggregate="notification_channel",
+        aggregate_id="bundle",
+        event_type="NotificationSecretBundleSaved",
+        payload={"saved_keys": list(parsed.keys()), "channels": channel_states},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {
+        "status": "saved",
+        "saved_keys": list(parsed.keys()),
+        "channels": channel_states,
+        "configured_channels": [
+            channel for channel, state in channel_states.items() if state["configured"]
+        ],
     }
 
 
@@ -326,6 +369,39 @@ def extract_last_error(content: str | None) -> str | None:
     if marker not in content:
         return None
     return content.rsplit(marker, 1)[-1].strip()
+
+
+def parse_secret_bundle(content: str) -> dict[str, str]:
+    supported = set(SECRET_ATTRS.keys())
+    parsed = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in supported:
+            continue
+        value = value.strip().strip("'").strip('"')
+        if value and not looks_like_placeholder_secret(value):
+            parsed[key] = value
+    return parsed
+
+
+def looks_like_placeholder_secret(value: str) -> bool:
+    lowered = value.strip().lower()
+    return (
+        lowered in {"...", "changeme", "change-me", "your-key", "your-secret"}
+        or lowered.startswith("<") and lowered.endswith(">")
+        or "<token>" in lowered
+        or "<bot-token>" in lowered
+        or "<chat-id>" in lowered
+        or "<serverchan-send-key>" in lowered
+    )
 
 
 async def save_secret(key_name: str, value: str):

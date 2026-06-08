@@ -13,6 +13,7 @@ export default function Deploy() {
   const [notifyStatus, setNotifyStatus] = useState(null);
   const [notifyGuide, setNotifyGuide] = useState(null);
   const [secretDrafts, setSecretDrafts] = useState({});
+  const [secretBundle, setSecretBundle] = useState('');
   const [logs, setLogs] = useState([]);
   const [probes, setProbes] = useState([]);
   const [adapterConfig, setAdapterConfig] = useState(null);
@@ -112,6 +113,28 @@ export default function Deploy() {
       setSecretDrafts(prev => ({ ...prev, [channel.id]: {} }));
       setMessage(text);
       toast(text, result.configured ? 'success' : 'info');
+      await loadNotify();
+    } catch (err) {
+      setMessage(err.message);
+      toast(err.message, 'error');
+    }
+  };
+
+  const saveSecretBundle = async () => {
+    const content = secretBundle.trim();
+    if (!content) {
+      const text = t('deploy.secretBundleRequired');
+      setMessage(text);
+      toast(text, 'error');
+      return;
+    }
+    try {
+      const result = await putJSON('/notify/secrets', { content });
+      const savedKeys = result.saved_keys?.join(', ') || '-';
+      const text = formatText(t('deploy.secretBundleSaved'), { keys: savedKeys });
+      setSecretBundle('');
+      setMessage(text);
+      toast(text, result.configured_channels?.length ? 'success' : 'info');
       await loadNotify();
     } catch (err) {
       setMessage(err.message);
@@ -388,6 +411,27 @@ export default function Deploy() {
             <span>{t('deploy.fullEnv')}</span>
             <textarea className="input textarea code-textarea notify-env-output" readOnly value={notifyGuide?.env_bundle || ''} />
           </label>
+          <label>
+            <span>{t('deploy.secretBundle')}</span>
+            <textarea
+              className="input textarea code-textarea notify-env-output"
+              value={secretBundle}
+              onChange={e => setSecretBundle(e.target.value)}
+              placeholder={t('deploy.secretBundlePlaceholder')}
+              autoComplete="off"
+            />
+          </label>
+          <div className="toolbar">
+            <button className="btn-primary" type="button" onClick={saveSecretBundle}>
+              {t('deploy.saveSecretBundle')}
+            </button>
+            <button className="btn-ghost" type="button" onClick={() => setSecretBundle(notifyGuide?.minimum_env_bundle || '')}>
+              {t('deploy.useMinimumEnv')}
+            </button>
+            <button className="btn-ghost" type="button" onClick={() => setSecretBundle('')}>
+              {t('common.cancel')}
+            </button>
+          </div>
         </div>
         <div className="notify-guide-grid">
           {notifyGuide?.channels?.map(channel => (

@@ -158,6 +158,11 @@ class NotifySecretUpdate(BaseModel):
     telegram_chat_id: Optional[str] = None
 
 
+class NotifySecretBundleUpdate(BaseModel):
+
+    content: str
+
+
 class LotteryCreate(BaseModel):
 
     platform: str = "bilibili"
