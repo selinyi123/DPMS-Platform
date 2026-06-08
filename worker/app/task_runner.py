@@ -250,8 +250,9 @@ async def execute_real_task(task: dict, adapter, pool):
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id)
 
-        start_index = 0 if current_phase == "init" else PHASE_ORDER.index(current_phase)
+        start_index = 0 if current_phase == "init" else PHASE_ORDER.index(current_phase) + 1
         for phase_name in PHASE_ORDER[start_index:]:
+            await detect_page_risk(page, account_id)
             await phase_fn[phase_name](page)
             await detect_page_risk(page, account_id)
             await save_phase(task_id, account_id, lottery_id, phase_name)

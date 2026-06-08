@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
+from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config, selector_config_complete
 from app.db import database, redis
 from app.event_store.service import record_event
 from app.knowledge.service import account_reputation
@@ -67,11 +67,12 @@ async def get_adapter_config_status():
         if not isinstance(configured, dict):
             configured = {}
         for phase in ADAPTER_PHASES:
-            phase_status[phase] = bool(configured.get(phase))
+            phase_status[phase] = phase_configured(platform, configured, phase)
+        configured_complete = platform_selectors_complete(config, platform)
         platforms.append(
             {
                 "platform": platform,
-                "configured": all(phase_status.values()),
+                "configured": configured_complete,
                 "phases": phase_status,
             }
         )
@@ -97,9 +98,10 @@ async def save_adapter_config(data: AdapterSelectorConfigUpdate, request: Reques
         if not isinstance(config, dict):
             invalid.append({"platform": platform, "error": "platform config must be an object"})
             continue
-        phase_status = {phase: bool(config.get(phase)) for phase in ADAPTER_PHASES}
+        phase_status = {phase: phase_configured(platform, config, phase) for phase in ADAPTER_PHASES}
+        configured_complete = selector_config_complete(platform, config)
         await save_platform_selector_config(platform, config)
-        saved.append({"platform": platform, "configured": all(phase_status.values()), "phases": phase_status})
+        saved.append({"platform": platform, "configured": configured_complete, "phases": phase_status})
     if not saved:
         raise HTTPException(400, detail={"message": "no valid platform config", "invalid": invalid})
     await audit_event(
@@ -564,6 +566,9 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                     400,
                     detail=f"Real actions for {lottery['platform']} are not implemented yet. Use dry run or wait for adapter calibration.",
                 )
+            evidence = await validate_real_run_evidence(lottery, account_id=data.account_id)
+            if not evidence["allowed"]:
+                raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
         except HTTPException as exc:
             await audit_event(
                 request,
@@ -616,6 +621,19 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             actor_id=actor["actor_id"],
         )
         raise HTTPException(400, detail="No available account. Create a ready account first.")
+
+    if task_mode == "real_run":
+        evidence = await validate_real_run_evidence(lottery, account_id=account["id"])
+        if not evidence["allowed"]:
+            await record_event(
+                aggregate="lottery",
+                aggregate_id=lottery_id,
+                event_type="RealRunDenied",
+                payload={"platform": lottery["platform"], "account_id": account["id"], "blockers": evidence["blockers"]},
+                actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+            raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
 
     task_id = str(uuid.uuid4())
     await database.execute(
@@ -1263,9 +1281,92 @@ async def save_platform_selector_config(platform: str, config: dict):
 
 def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
     configured = selector_config.get(platform, {})
-    if not isinstance(configured, dict):
-        return False
-    return all(bool(configured.get(phase)) for phase in ADAPTER_PHASES)
+    return selector_config_complete(platform, configured)
+
+
+def phase_configured(platform: str, config: dict, phase: str) -> bool:
+    value = config.get(phase) if isinstance(config, dict) else None
+    if platform != "bilibili":
+        return bool(value)
+    if phase == "commented":
+        return isinstance(value, dict) and bool(
+            selector_values(value.get("input") or value.get("inputs"))
+            and selector_values(value.get("submit") or value.get("submits"))
+        )
+    if isinstance(value, dict):
+        value = value.get("click") or value.get("selectors") or value.get("buttons")
+    return bool(selector_values(value))
+
+
+def selector_values(value) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+async def validate_real_run_evidence(lottery, account_id: int | None = None) -> dict:
+    blockers = []
+    probe_values = {"platform": lottery["platform"], "lottery_id": lottery["id"]}
+    task_values = {"lottery_id": lottery["id"]}
+    account_filter = ""
+    if account_id is not None:
+        account_filter = "AND account_id = :account_id"
+        probe_values["account_id"] = account_id
+        task_values["account_id"] = account_id
+
+    probe = await database.fetch_one(
+        f"""SELECT result, status, created_at
+            FROM adapter_calibrations
+            WHERE platform = :platform
+              AND lottery_id = :lottery_id
+              AND status = 'succeeded'
+              AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              {account_filter}
+            ORDER BY id DESC
+            LIMIT 1""",
+        probe_values,
+    )
+    probe_summary = None
+    if probe and probe["result"]:
+        probe_result = parse_json_field(probe["result"])
+        probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
+    if not probe_summary or not probe_summary.get("ready_for_real_actions"):
+        blockers.append("recent_complete_probe_required")
+
+    shadow = await database.fetch_one(
+        f"""SELECT task_id, finished_at
+            FROM task_runs
+            WHERE lottery_id = :lottery_id
+              AND task_mode = 'shadow_run'
+              AND status = 'succeeded'
+              AND finished_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+              {account_filter}
+            ORDER BY id DESC
+            LIMIT 1""",
+        task_values,
+    )
+    if not shadow:
+        blockers.append("recent_shadow_run_required")
+
+    if account_id is not None:
+        risk = await database.fetch_one(
+            """SELECT COUNT(*) AS cnt
+               FROM risk_events
+               WHERE account_id = :account_id
+                 AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)""",
+            {"account_id": account_id},
+        )
+        if int(risk["cnt"] or 0) > 0:
+            blockers.append("recent_account_risk_event")
+
+    return {
+        "allowed": not blockers,
+        "blockers": blockers,
+        "probe_ready": bool(probe_summary and probe_summary.get("ready_for_real_actions")),
+        "shadow_ready": bool(shadow),
+    }
 
 
 def parse_target_lines(content: str, default_platform: str, default_score: int):

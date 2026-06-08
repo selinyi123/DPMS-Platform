@@ -35,4 +35,30 @@ def selectors_for(platform: str) -> dict:
 
 def has_complete_selectors(platform: str) -> bool:
     configured = selectors_for(platform)
-    return all(bool(configured.get(phase)) for phase in PHASES)
+    if platform == "bilibili" and not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
+        return False
+    if platform != "bilibili" and not all(bool(configured.get(phase)) for phase in PHASES):
+        return False
+    if platform != "bilibili":
+        return True
+    comment = configured.get("commented")
+    if not isinstance(comment, dict):
+        return False
+    return bool(
+        selector_values(comment.get("input") or comment.get("inputs"))
+        and selector_values(comment.get("submit") or comment.get("submits"))
+    )
+
+
+def click_selectors(value) -> list[str]:
+    if isinstance(value, dict):
+        value = value.get("click") or value.get("selectors") or value.get("buttons")
+    return selector_values(value)
+
+
+def selector_values(value) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []

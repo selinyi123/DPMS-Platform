@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 
 from app.db import database, redis
 from app.event_store.service import record_event
-from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
+from app.adapter_config import load_runtime_selector_config, selector_config_complete
 from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart
 from app.platforms import get_platform, get_platforms
 from app.services.risk_engine import check_all_accounts_health
@@ -566,6 +566,4 @@ async def validate_proxy_assignment(proxy_id: int, account_id: int | None = None
 
 def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
     configured = selector_config.get(platform, {})
-    if not isinstance(configured, dict):
-        return False
-    return all(bool(configured.get(phase)) for phase in ADAPTER_PHASES)
+    return selector_config_complete(platform, configured)

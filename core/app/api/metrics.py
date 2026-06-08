@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config
+from app.adapter_config import load_runtime_selector_config, selector_config_complete
 from app.db import database, redis
 from app.event_store.service import record_event
 from app.api.notify import configured_channels
@@ -376,9 +376,7 @@ async def count_worker_heartbeats(stale_seconds: int = 45) -> int:
 
 def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
     configured = selector_config.get(platform, {})
-    if not isinstance(configured, dict):
-        return False
-    return all(bool(configured.get(phase)) for phase in ADAPTER_PHASES)
+    return selector_config_complete(platform, configured)
 
 
 def build_next_actions(platforms, summary):

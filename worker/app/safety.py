@@ -4,18 +4,23 @@ from app.db import database, redis
 from app.utils.log import structured_log
 
 
-WINDOW_SECONDS = 5 * 60
-WINDOW_MAX_ACTIONS = 5
-DAILY_MAX_TASKS = 30
+WINDOW_SECONDS = 10 * 60
+WINDOW_MAX_ACTIONS = 2
+DAILY_MAX_TASKS = 8
 RISK_TEXTS = [
     "captcha",
-    "verify",
-    "risk",
-    "login",
+    "geetest",
+    "security verification",
+    "verify your identity",
+    "too many requests",
+    "account is abnormal",
     "\u9a8c\u8bc1\u7801",
     "\u5b89\u5168\u9a8c\u8bc1",
-    "\u767b\u5f55",
+    "\u8bf7\u5b8c\u6210\u9a8c\u8bc1",
+    "\u64cd\u4f5c\u9891\u7e41",
+    "\u8d26\u53f7\u5f02\u5e38",
 ]
+LOGIN_URL_MARKERS = ("passport.bilibili.com/login", "/passport/web/login", "/signin/login")
 
 
 async def ensure_account_can_run(account_id: int) -> None:
@@ -47,6 +52,10 @@ async def ensure_account_can_run(account_id: int) -> None:
 
 
 async def detect_page_risk(page, account_id: int) -> None:
+    current_url = str(getattr(page, "url", "") or "").lower()
+    if any(marker in current_url for marker in LOGIN_URL_MARKERS):
+        await set_account_status(account_id, "login_required", "redirected_to_login")
+        raise ValueError(f"Login is required for account {account_id}")
     try:
         body = await page.locator("body").text_content(timeout=2000)
     except Exception:
@@ -54,8 +63,7 @@ async def detect_page_risk(page, account_id: int) -> None:
     body = body or ""
     lower = body.lower()
     if any(text.lower() in lower for text in RISK_TEXTS):
-        target = "login_required" if "login" in lower or "\u767b\u5f55" in body else "cooling"
-        await set_account_status(account_id, target, "page_risk_signal")
+        await set_account_status(account_id, "cooling", "page_risk_signal")
         raise ValueError(f"Risk signal detected on page for account {account_id}")
 
 

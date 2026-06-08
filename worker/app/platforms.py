@@ -7,7 +7,7 @@ PLATFORMS = {
         "cookie_domain": ".bilibili.com",
         "qr_login": True,
         "cookie_login": True,
-        "action_adapter": True,
+        "action_adapter": False,
         "adapter_status": "gray",
     },
     "weibo": {

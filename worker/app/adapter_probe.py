@@ -163,13 +163,19 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
     for phase in phases:
         candidates = result.get(phase) if isinstance(result.get(phase), list) else []
         visible = [item for item in candidates if item.get("visible") and item.get("selector")]
+        ready = bool(visible)
+        if platform == "bilibili" and phase == "commented":
+            ready = bool(
+                first_selector_matching(visible, ["textarea", "contenteditable", "placeholder", "textbox"])
+                and first_selector_matching(visible, ["button", "\u53d1\u5e03", "\u8bc4\u8bba", "submit", "publish"])
+            )
         phase_status[phase] = {
             "candidate_count": len(candidates),
             "visible_count": len(visible),
-            "ready": bool(visible),
+            "ready": ready,
             "visible_selectors": [item["selector"] for item in visible],
         }
-        if visible:
+        if ready:
             visible_phases.append(phase)
     return {
         "platform": platform,
@@ -193,11 +199,7 @@ def build_recommended_config(platform: str, result: dict) -> dict:
     input_selector = first_selector_matching(comment_candidates, ["textarea", "contenteditable", "placeholder"])
     submit_selector = first_selector_matching(comment_candidates, ["button", "发布", "评论", "submit", "publish"])
     if input_selector and submit_selector and input_selector != submit_selector:
-        phases["commented"] = {"input": [input_selector], "submit": [submit_selector], "text": "Participate"}
-    else:
-        selector = first_visible_selector(result.get("commented"))
-        if selector:
-            phases["commented"] = [selector]
+        phases["commented"] = {"input": [input_selector], "submit": [submit_selector], "text": "\u53c2\u4e0e\u62bd\u5956"}
 
     return {platform: phases} if phases else {}
 
