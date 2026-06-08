@@ -42,7 +42,8 @@ async function parseResponse(res) {
 
   if (!res.ok) {
     const detail = data?.detail || data?.message || data?.error || res.statusText || `HTTP ${res.status}`;
-    throw new Error(`${res.status}: ${detail}`);
+    const message = typeof detail === 'string' ? detail : JSON.stringify(detail);
+    throw new Error(`${res.status}: ${message}`);
   }
 
   return data;

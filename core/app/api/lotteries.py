@@ -162,6 +162,25 @@ async def list_lotteries(status: str = None, limit: int = 50):
     return [dict(r) for r in rows]
 
 
+@router.get("/real-run/evidence")
+async def list_real_run_evidence(status: str = None, limit: int = 50):
+    query = "SELECT * FROM lotteries"
+    values = {"limit": min(max(limit, 1), 100)}
+    if status:
+        query += " WHERE status = :status"
+        values["status"] = status
+    query += " ORDER BY id DESC LIMIT :limit"
+    rows = await database.fetch_all(query, values)
+    selector_config = await load_runtime_selector_config()
+    real_run_enabled = await is_real_run_enabled()
+    items = []
+    for row in rows:
+        lottery = dict(row)
+        gate = await real_run_gate_status(lottery, selector_config=selector_config, real_run_enabled=real_run_enabled)
+        items.append(gate)
+    return {"items": items}
+
+
 @router.get("/strategy/queue")
 async def strategy_queue(limit: int = 20):
     selector_config = await load_runtime_selector_config()
@@ -1366,6 +1385,63 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         "blockers": blockers,
         "probe_ready": bool(probe_summary and probe_summary.get("ready_for_real_actions")),
         "shadow_ready": bool(shadow),
+    }
+
+
+async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabled: bool, account_id: int | None = None) -> dict:
+    platform = lottery["platform"]
+    cfg = get_platform(platform) or {}
+    safe_accounts = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM accounts a
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'""",
+        {"platform": platform},
+    )
+    selector_ready = platform_selectors_complete(selector_config, platform)
+    adapter_enabled = bool(cfg.get("action_adapter")) or selector_ready
+    evidence = await validate_real_run_evidence(lottery, account_id=account_id)
+    blockers = list(evidence["blockers"])
+    if not int(safe_accounts["cnt"] or 0):
+        blockers.insert(0, "no_calibrated_ready_account")
+    if not adapter_enabled:
+        blockers.insert(0, "real_adapter_not_enabled")
+    if not real_run_enabled:
+        blockers.insert(0, "global_real_run_disabled")
+
+    next_action = "real_run"
+    if "no_calibrated_ready_account" in blockers:
+        next_action = "add_account"
+    elif "real_adapter_not_enabled" in blockers:
+        next_action = "configure_adapter"
+    elif "recent_complete_probe_required" in blockers:
+        next_action = "probe"
+    elif "recent_shadow_run_required" in blockers:
+        next_action = "shadow_run"
+    elif "recent_account_risk_event" in blockers:
+        next_action = "review_risk"
+    elif "global_real_run_disabled" in blockers:
+        next_action = "enable_real_run"
+
+    return {
+        "lottery_id": lottery["id"],
+        "platform": platform,
+        "allowed": not blockers,
+        "blockers": blockers,
+        "next_action": next_action,
+        "real_run_enabled": real_run_enabled,
+        "adapter_enabled": adapter_enabled,
+        "selector_ready": selector_ready,
+        "safe_accounts": int(safe_accounts["cnt"] or 0),
+        "probe_ready": evidence["probe_ready"],
+        "shadow_ready": evidence["shadow_ready"],
     }
 
 

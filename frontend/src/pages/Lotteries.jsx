@@ -14,6 +14,8 @@ export default function Lotteries() {
   const [accounts, setAccounts] = useState([]);
   const [platforms, setPlatforms] = useState([]);
   const [adapters, setAdapters] = useState([]);
+  const [readiness, setReadiness] = useState(null);
+  const [realRunEvidence, setRealRunEvidence] = useState([]);
   const [error, setError] = useState('');
   const [discoveryMessage, setDiscoveryMessage] = useState('');
   const [dispatchMode, setDispatchMode] = useState('dry_run');
@@ -28,14 +30,19 @@ export default function Lotteries() {
     scan_interval_minutes: 30,
   });
 
-  const platformById = useMemo(
-    () => Object.fromEntries(platforms.map(platform => [platform.id, platform])),
-    [platforms],
-  );
-
   const adapterById = useMemo(
     () => Object.fromEntries(adapters.map(adapter => [adapter.platform, adapter])),
     [adapters],
+  );
+
+  const readinessById = useMemo(
+    () => Object.fromEntries((readiness?.platforms || []).map(platform => [platform.platform, platform])),
+    [readiness],
+  );
+
+  const gateByLotteryId = useMemo(
+    () => Object.fromEntries(realRunEvidence.map(item => [item.lottery_id, item])),
+    [realRunEvidence],
   );
 
   const safeAccounts = useMemo(
@@ -58,6 +65,10 @@ export default function Lotteries() {
         fetchJSON('/accounts/platforms'),
         fetchJSON('/lotteries/adapters'),
       ]);
+      const [readinessRows, evidenceRows] = await Promise.all([
+        fetchJSON('/metrics/readiness'),
+        fetchJSON('/lotteries/real-run/evidence'),
+      ]);
       setLotteries(lotteryRows);
       setRuns(runRows);
       setProbes(probeRows);
@@ -66,6 +77,8 @@ export default function Lotteries() {
       setAccounts(accountRows);
       setPlatforms(platformRows);
       setAdapters(adapterRows);
+      setReadiness(readinessRows);
+      setRealRunEvidence(evidenceRows.items || []);
     } catch (err) {
       setError(err.message);
       notify(err.message, 'error');
@@ -198,7 +211,7 @@ export default function Lotteries() {
     }
   };
 
-  const realActionReady = platformId => Boolean(platformById[platformId]?.action_adapter);
+  const realActionReady = lottery => Boolean(gateByLotteryId[lottery.id]?.allowed);
 
   const probeSummary = (probe) => {
     const result = typeof probe.result === 'string' ? safeJson(probe.result) : probe.result;
@@ -240,19 +253,31 @@ export default function Lotteries() {
       <div className="ops-grid three-columns">
         {platforms.map(platform => (
           <div className="panel platform-card" key={platform.id}>
+            {(() => {
+              const ready = readinessById[platform.id];
+              return (
+                <>
             <div className="panel-kicker">{platform.id}</div>
             <div className="panel-title">{platform.label}</div>
             <div className="capability-row"><span>{t('lotteries.qrLogin')}</span><StatusBadge status={platform.qr_login ? 'ready' : 'failed'} /></div>
             <div className="capability-row"><span>{t('lotteries.cookieLogin')}</span><StatusBadge status={platform.cookie_login ? 'ready' : 'failed'} /></div>
             <div className="capability-row">
               <span>{t('lotteries.realActions')}</span>
-              <StatusBadge status={platform.action_adapter ? 'gray' : 'pending'} />
+              <StatusBadge status={ready?.ready_for_real_run ? 'ready' : platform.action_adapter ? 'gray' : 'pending'} />
             </div>
             <div className="capability-row"><span>{t('lotteries.adapter')}</span><span className="mono small-text">{platform.adapter_status || 'planned'}</span></div>
             <div className="capability-row"><span>{t('lotteries.safeAccounts')}</span><span className="mono small-text">{safeAccountCount(platform.id)}</span></div>
-            <div className="capability-row"><span>{t('lotteries.phases')}</span><span className="mono small-text">{adapterById[platform.id]?.phases?.length || 0}</span></div>
+            <div className="capability-row"><span>{t('lotteries.probe')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/4` : '-'}</span></div>
             <p className="muted-text tight-text">{adapterById[platform.id]?.notes || t('lotteries.adapterLoading')}</p>
+            {!!ready?.blocker_codes?.length && (
+              <div className="blocker-list compact-blockers">
+                {ready.blocker_codes.map(code => <span className="badge badge-warn" key={code}>{gateBlockerText(code, t)}</span>)}
+              </div>
+            )}
             <div className="capability-row"><span>{t('lotteries.cookieDomain')}</span><span className="mono small-text">{platform.cookie_domain}</span></div>
+                </>
+              );
+            })()}
           </div>
         ))}
       </div>
@@ -449,37 +474,43 @@ export default function Lotteries() {
         <div className="table-wrap">
           <table className="data-table">
             <thead>
-              <tr><th>ID</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.url')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.score')}</th><th>{t('lotteries.safeAccounts')}</th><th>{t('lotteries.expires')}</th><th>{t('lotteries.action')}</th></tr>
+              <tr><th>ID</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.url')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.score')}</th><th>{t('lotteries.realGate')}</th><th>{t('lotteries.expires')}</th><th>{t('lotteries.action')}</th></tr>
             </thead>
             <tbody>
-              {lotteries.map(lottery => (
-                <tr key={lottery.id}>
+              {lotteries.map(lottery => {
+                const gate = gateByLotteryId[lottery.id];
+                const gateBlocked = dispatchMode === 'real_run' && !gate?.allowed;
+                return (
+                  <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
                   <td>{lottery.platform}</td>
                   <td className="truncate-cell" title={lottery.raw_url}>{lottery.raw_url}</td>
                   <td><StatusBadge status={lottery.status} /></td>
                   <td>{lottery.value_score}</td>
-                  <td>{safeAccountCount(lottery.platform)}</td>
+                  <td>
+                    <RealGateCell gate={gate} t={t} />
+                  </td>
                   <td className="small-text">{lottery.expires_at || '-'}</td>
                   <td className="action-cell">
                     <button
                       onClick={() => dispatch(lottery.id)}
-                      disabled={!safeAccountCount(lottery.platform) || (dispatchMode === 'real_run' && !realActionReady(lottery.platform))}
-                      title={dispatchMode === 'real_run' && !realActionReady(lottery.platform) ? t('lotteries.realAdapterMissing') : ''}
+                      disabled={!safeAccountCount(lottery.platform) || gateBlocked}
+                      title={gateBlocked ? gateTitle(gate, t) : ''}
                       className={dispatchMode === 'real_run' ? 'btn-danger' : 'btn-primary'}
                     >
                       {!safeAccountCount(lottery.platform)
                         ? t('lotteries.noSafeAccount')
-                        : (dispatchMode === 'real_run' && !realActionReady(lottery.platform)
-                            ? t('lotteries.adapterPending')
+                        : (gateBlocked
+                            ? t(`lotteries.nextActions.${gate?.next_action || 'blocked'}`)
                             : t(`lotteries.dispatch_${dispatchMode}`))}
                     </button>
                     <button onClick={() => markResult(lottery.id, 'won')} className="btn-ghost">{t('lotteries.won')}</button>
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
                     <button onClick={() => probe(lottery.id)} disabled={!safeAccountCount(lottery.platform)} className="btn-ghost">{t('lotteries.probe')}</button>
                   </td>
-                </tr>
-              ))}
+                  </tr>
+                );
+              })}
               {!lotteries.length && <tr><td className="empty-cell" colSpan="8">{t('lotteries.noActivities')}</td></tr>}
             </tbody>
           </table>
@@ -596,6 +627,30 @@ function modeText(mode, t) {
 function reasonText(code, t) {
   const label = t(`lotteries.strategyReasons.${code}`);
   return label === `lotteries.strategyReasons.${code}` ? code : label;
+}
+
+function gateBlockerText(code, t) {
+  const label = t(`lotteries.realGateBlockers.${code}`);
+  return label === `lotteries.realGateBlockers.${code}` ? code : label;
+}
+
+function gateTitle(gate, t) {
+  if (!gate?.blockers?.length) return t('lotteries.realAdapterMissing');
+  return gate.blockers.map(code => gateBlockerText(code, t)).join(' / ');
+}
+
+function RealGateCell({ gate, t }) {
+  if (!gate) return <span className="badge badge-muted">{t('lotteries.gateUnknown')}</span>;
+  return (
+    <div className="gate-cell">
+      <span className={`badge ${gate.allowed ? 'badge-ready' : 'badge-warn'}`}>
+        {gate.allowed ? t('lotteries.gateReady') : t('lotteries.gateBlocked')}
+      </span>
+      <div className="blocker-list compact-blockers">
+        {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
+      </div>
+    </div>
+  );
 }
 
 function formatRate(value) {
