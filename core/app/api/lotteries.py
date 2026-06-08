@@ -29,6 +29,7 @@ from app.security import (
     require_min_role,
 )
 from app.utils.canonicalizer import GenericCanonicalizer
+from app.utils.log import structured_log
 
 
 router = APIRouter()
@@ -606,6 +607,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 actor_type="operator",
                 actor_id=actor["actor_id"],
             )
+            await emit_real_run_gate_notification(lottery, exc.detail, actor_id=actor["actor_id"])
             raise
     elif task_mode == "shadow_run":
         breaker_allowed, breaker_reason = await circuit_breaker_allows(lottery["platform"])
@@ -650,6 +652,11 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 event_type="RealRunDenied",
                 payload={"platform": lottery["platform"], "account_id": account["id"], "blockers": evidence["blockers"]},
                 actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+            await emit_real_run_gate_notification(
+                lottery,
+                {"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"], "account_id": account["id"]},
                 actor_id=actor["actor_id"],
             )
             raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
@@ -1386,6 +1393,85 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         "probe_ready": bool(probe_summary and probe_summary.get("ready_for_real_actions")),
         "shadow_ready": bool(shadow),
     }
+
+
+async def emit_real_run_gate_notification(lottery, reason, *, actor_id: str | None = None):
+    if lottery["platform"] != "bilibili":
+        return
+
+    blockers = extract_real_run_blockers(reason)
+    next_action = next_action_for_blockers(blockers)
+    content_lines = [
+        f"Platform: {lottery['platform']}",
+        f"Lottery: L{lottery['id']}",
+        f"URL: {lottery['canonical_url'] or lottery['raw_url']}",
+        f"Next action: {next_action}",
+    ]
+    if blockers:
+        content_lines.append(f"Blockers: {', '.join(blockers)}")
+    else:
+        content_lines.append(f"Reason: {format_real_run_reason(reason)}")
+    if actor_id:
+        content_lines.append(f"Actor: {actor_id}")
+
+    try:
+        await redis.xadd(
+            "notify_events",
+            {
+                "event_type": "bilibili.real_run_gate.blocked",
+                "severity": "warning",
+                "title": f"Bilibili real-run gate blocked: L{lottery['id']}",
+                "content": "\n".join(content_lines),
+                "channels": "all",
+            },
+        )
+    except Exception as exc:
+        structured_log(
+            "error",
+            "real_run_gate_notification_failed",
+            lottery_id=lottery["id"],
+            platform=lottery["platform"],
+            exception=exc,
+        )
+
+
+def extract_real_run_blockers(reason) -> list[str]:
+    if isinstance(reason, dict):
+        blockers = reason.get("blockers")
+        if isinstance(blockers, list):
+            return [str(item) for item in blockers]
+        nested = reason.get("reason")
+        if nested is not None:
+            return extract_real_run_blockers(nested)
+    return []
+
+
+def next_action_for_blockers(blockers: list[str]) -> str:
+    if "no_calibrated_ready_account" in blockers:
+        return "add_account"
+    if "recent_account_risk_event" in blockers:
+        return "review_risk"
+    if "recent_complete_probe_required" in blockers:
+        return "probe"
+    if "real_adapter_not_enabled" in blockers:
+        return "configure_adapter"
+    if "recent_shadow_run_required" in blockers:
+        return "shadow_run"
+    if "global_real_run_disabled" in blockers:
+        return "enable_real_run"
+    return "review_gate"
+
+
+def format_real_run_reason(reason) -> str:
+    if isinstance(reason, dict):
+        message = reason.get("message") or reason.get("detail")
+        blockers = reason.get("blockers")
+        if message and blockers:
+            return f"{message}; blockers={', '.join(map(str, blockers))}"
+        if message:
+            return str(message)
+        return json.dumps(reason, ensure_ascii=False)
+    return str(reason)
 
 
 async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabled: bool, account_id: int | None = None) -> dict:
