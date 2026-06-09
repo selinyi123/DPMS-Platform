@@ -220,6 +220,10 @@ select {
   border-top: 1px solid var(--sidebar-border);
 }
 
+.settings-summary {
+  display: none;
+}
+
 .settings-panel label {
   display: flex;
   flex-direction: column;
@@ -460,6 +464,14 @@ select {
 .qr-frame img {
   width: 100%;
   max-height: 320px;
+  object-fit: contain;
+}
+
+.qr-frame img.official-qr {
+  width: min(100%, 320px);
+  aspect-ratio: 1;
+  padding: 8px;
+  background: #fff;
   object-fit: contain;
 }
 
@@ -1409,6 +1421,41 @@ button:disabled {
     min-width: 92px;
     flex: 1 1 92px;
     text-align: center;
+  }
+
+  .settings-panel {
+    padding: 8px 6px;
+  }
+
+  .settings-summary {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--sidebar-muted);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    list-style: none;
+  }
+
+  .settings-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .settings-auth-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--sidebar-muted);
+  }
+
+  .settings-auth-dot.auth-verified {
+    background: var(--success-text);
+  }
+
+  .settings-auth-dot.auth-failed {
+    background: var(--danger-text);
   }
 
   .main-pane {

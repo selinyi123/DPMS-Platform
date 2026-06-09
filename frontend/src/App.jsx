@@ -24,7 +24,10 @@ const pages = {
 
 export default function App() {
   const [page, setPage] = useState('dashboard');
-  const [tokenDraft, setTokenDraft] = useState(() => localStorage.getItem('dpms_admin_token') || '');
+  const [tokenDraft, setTokenDraft] = useState('');
+  const [settingsOpen, setSettingsOpen] = useState(
+    () => !window.matchMedia('(max-width: 920px)').matches,
+  );
   const [authState, setAuthState] = useState({ status: 'unknown', role: '', error: '' });
   const PageComponent = pages[page].Component;
   const { language, setLanguage, theme, setTheme, t } = useUi();
@@ -37,6 +40,7 @@ export default function App() {
       verified: 'Verified',
       missing: 'Not signed in',
       failed: 'Invalid token',
+      settings: 'Access & display settings',
     }
     : {
       label: '管理令牌',
@@ -46,6 +50,7 @@ export default function App() {
       verified: '已验证',
       missing: '未登录',
       failed: '令牌无效',
+      settings: '访问与显示设置',
     };
 
   const verifyToken = async () => {
@@ -65,6 +70,13 @@ export default function App() {
     verifyToken();
   }, []);
 
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 920px)');
+    const handleChange = event => setSettingsOpen(!event.matches);
+    media.addEventListener('change', handleChange);
+    return () => media.removeEventListener('change', handleChange);
+  }, []);
+
   const saveToken = async () => {
     const value = tokenDraft.trim();
     if (!value) {
@@ -73,6 +85,7 @@ export default function App() {
       localStorage.setItem('dpms_admin_token', value);
     }
     await verifyToken();
+    setTokenDraft('');
   };
 
   const clearToken = async () => {
@@ -100,7 +113,15 @@ export default function App() {
           ))}
         </nav>
 
-        <div className="settings-panel">
+        <details
+          className="settings-panel"
+          open={settingsOpen}
+          onToggle={event => setSettingsOpen(event.currentTarget.open)}
+        >
+          <summary className="settings-summary">
+            <span>{authText.settings}</span>
+            <span className={`settings-auth-dot auth-${authState.status}`} />
+          </summary>
           <label>
             <span>{authText.label}</span>
             <input
@@ -139,7 +160,7 @@ export default function App() {
               <option value="dark">{t('common.dark')}</option>
             </select>
           </label>
-        </div>
+        </details>
 
         <div className="sidebar-footer">
           <span className="status-dot" />

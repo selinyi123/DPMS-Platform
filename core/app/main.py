@@ -229,6 +229,7 @@ async def ensure_runtime_schema():
           platform VARCHAR(32) NOT NULL,
           status ENUM('queued','opening','waiting_scan','confirmed','expired','failed') DEFAULT 'queued',
           login_url VARCHAR(512) NOT NULL,
+          provider_key VARCHAR(128) NULL,
           qr_image_path VARCHAR(512) NULL,
           account_id BIGINT NULL,
           error_message TEXT NULL,
@@ -240,6 +241,18 @@ async def ensure_runtime_schema():
           INDEX idx_login_status (status, created_at)
         ) ENGINE=InnoDB"""
     )
+    try:
+        await database.execute("ALTER TABLE login_sessions ADD COLUMN provider_key VARCHAR(128) NULL AFTER login_url")
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions ADD COLUMN provider_key", error=str(exc))
+    try:
+        await database.execute(
+            """ALTER TABLE login_sessions
+               MODIFY status ENUM('queued','opening','waiting_scan','scanned','confirmed','expired','failed')
+               DEFAULT 'queued'"""
+        )
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions MODIFY status", error=str(exc))
     try:
         await database.execute("ALTER TABLE task_runs ADD COLUMN screenshot_path VARCHAR(512) NULL")
     except Exception as exc:

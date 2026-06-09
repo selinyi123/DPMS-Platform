@@ -10,10 +10,11 @@ from app.event_store.service import record_event
 from app.adapter_config import load_runtime_selector_config, selector_config_complete
 from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart
 from app.platforms import get_platform, get_platforms
+from app.services.bilibili_qr import generate_bilibili_qr, poll_bilibili_qr
 from app.services.risk_engine import check_all_accounts_health
 from app.security import audit_event, require_confirmation, require_min_role
 from app.services.state_machine import transition_account
-from app.utils.cookies import normalize_cookie_payload
+from app.utils.cookies import parse_cookie_payload, validate_required_cookies
 from app.utils.crypto import cookie_vault
 
 
@@ -136,7 +137,7 @@ async def create_account(data: AccountCreate, request: Request):
     status = "login_required"
     if data.encrypted_credential:
         try:
-            normalized = normalize_cookie_payload(data.platform, data.encrypted_credential)
+            normalized = normalize_and_validate_credential(data.platform, data.encrypted_credential)
         except Exception as e:
             raise HTTPException(400, detail=str(e))
         credential = cookie_vault.encrypt(normalized)
@@ -198,8 +199,51 @@ async def start_qr_login(data: QRLoginStart, request: Request):
     platform_cfg = get_platform(data.platform)
     if not platform_cfg:
         raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
+    if not platform_cfg.get("qr_login"):
+        raise HTTPException(400, detail=f"QR login is not supported for platform: {data.platform}")
     session_id = str(uuid.uuid4())
     image_path = f"/profiles/login-sessions/{session_id}.png"
+
+    if data.platform == "bilibili":
+        try:
+            qr_content, provider_key = await generate_bilibili_qr()
+        except Exception as exc:
+            raise HTTPException(502, detail="Bilibili QR service is unavailable") from exc
+        await database.execute(
+            """INSERT INTO login_sessions
+               (session_id, platform, status, login_url, provider_key, qr_image_path, expires_at)
+               VALUES (:session_id, :platform, 'waiting_scan', :login_url, :provider_key, NULL, DATE_ADD(NOW(), INTERVAL 3 MINUTE))""",
+            {
+                "session_id": session_id,
+                "platform": data.platform,
+                "login_url": qr_content,
+                "provider_key": provider_key,
+            },
+        )
+        await audit_event(
+            request,
+            action="account.login_qr.start",
+            resource_type="login_session",
+            resource_id=session_id,
+            result="waiting_scan",
+            risk_level="medium",
+            detail={"platform": data.platform, "login_mode": "official_qr"},
+        )
+        await record_event(
+            aggregate="browser",
+            aggregate_id=session_id,
+            event_type="QrLoginWaitingScan",
+            payload={"platform": data.platform, "login_mode": "official_qr"},
+            correlation_id=session_id,
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
+        return {
+            "session_id": session_id,
+            "status": "waiting_scan",
+            "login_mode": "official_qr",
+            "qr_content": qr_content,
+        }
 
     await database.execute(
         """INSERT INTO login_sessions (session_id, platform, status, login_url, qr_image_path, expires_at)
@@ -233,7 +277,7 @@ async def start_qr_login(data: QRLoginStart, request: Request):
         actor_type="operator",
         actor_id=actor["actor_id"],
     )
-    return {"session_id": session_id, "status": "queued"}
+    return {"session_id": session_id, "status": "queued", "login_mode": "browser"}
 
 
 @router.get("/login/qr/{session_id}")
@@ -241,7 +285,73 @@ async def get_qr_login_status(session_id: str):
     row = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
     if not row:
         raise HTTPException(404, detail="Login session not found")
-    return dict(row)
+    return serialize_login_session(row)
+
+
+@router.post("/login/qr/{session_id}/poll")
+async def poll_qr_login_status(session_id: str, request: Request):
+    actor = require_min_role(request, "operator")
+    await database.execute(
+        """UPDATE login_sessions
+           SET status = 'expired', error_message = 'QR login session expired', updated_at = NOW()
+           WHERE session_id = :sid
+             AND expires_at IS NOT NULL
+             AND expires_at <= NOW()
+             AND status NOT IN ('confirmed','expired','failed')""",
+        {"sid": session_id},
+    )
+    row = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+    if not row:
+        raise HTTPException(404, detail="Login session not found")
+    if row["platform"] != "bilibili" or not row["provider_key"]:
+        return serialize_login_session(row)
+    if row["status"] in {"confirmed", "expired", "failed"}:
+        return serialize_login_session(row)
+
+    try:
+        result = await poll_bilibili_qr(row["provider_key"])
+    except Exception as exc:
+        await database.execute(
+            """UPDATE login_sessions
+               SET error_message = :error, updated_at = NOW()
+               WHERE session_id = :session_id""",
+            {"session_id": session_id, "error": f"Temporary QR status check error: {exc}"},
+        )
+        current = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+        return serialize_login_session(current)
+
+    if result.status != "confirmed":
+        await database.execute(
+            """UPDATE login_sessions
+               SET status = :status, error_message = NULL, updated_at = NOW()
+               WHERE session_id = :session_id AND status NOT IN ('confirmed','expired','failed')""",
+            {"session_id": session_id, "status": result.status},
+        )
+        if result.status == "expired":
+            await record_event(
+                aggregate="browser",
+                aggregate_id=session_id,
+                event_type="QrLoginExpired",
+                payload={"platform": "bilibili", "login_mode": "official_qr"},
+                correlation_id=session_id,
+                actor_type="operator",
+                actor_id=actor["actor_id"],
+            )
+        updated = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+        return serialize_login_session(updated)
+
+    account_id = await finalize_bilibili_qr_login(session_id, result.cookies or [])
+    updated = await database.fetch_one("SELECT * FROM login_sessions WHERE session_id = :sid", {"sid": session_id})
+    await record_event(
+        aggregate="browser",
+        aggregate_id=session_id,
+        event_type="QrLoginCompleted",
+        payload={"platform": "bilibili", "account_id": account_id, "login_mode": "official_qr"},
+        correlation_id=session_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return serialize_login_session(updated)
 
 
 @router.get("/login/qr/{session_id}/image")
@@ -264,7 +374,7 @@ async def update_credential(account_id: int, data: AccountCredentialUpdate, requ
         raise HTTPException(404, detail="Account not found")
 
     try:
-        normalized = normalize_cookie_payload(row["platform"], data.encrypted_credential)
+        normalized = normalize_and_validate_credential(row["platform"], data.encrypted_credential)
     except Exception as e:
         raise HTTPException(400, detail=str(e))
 
@@ -525,6 +635,95 @@ def parse_json_field(value):
         return json.loads(value)
     except Exception:
         return value
+
+
+def normalize_and_validate_credential(platform: str, payload: str) -> str:
+    platform_cfg = get_platform(platform)
+    if not platform_cfg:
+        raise ValueError(f"Unsupported platform: {platform}")
+    cookies = parse_cookie_payload(platform, payload)
+    validate_required_cookies(cookies, platform_cfg.get("required_cookies", []))
+    return json.dumps(cookies, ensure_ascii=False, separators=(",", ":"))
+
+
+def serialize_login_session(row) -> dict:
+    item = dict(row)
+    official_qr = item["platform"] == "bilibili" and bool(item.get("provider_key"))
+    item.pop("provider_key", None)
+    item["login_mode"] = "official_qr" if official_qr else "browser"
+    if item["login_mode"] == "official_qr":
+        item["qr_content"] = item.pop("login_url")
+        item["qr_image_path"] = None
+    return item
+
+
+async def finalize_bilibili_qr_login(session_id: str, cookies: list[dict]) -> int:
+    validate_required_cookies(cookies, get_platform("bilibili").get("required_cookies", []))
+    normalized = json.dumps(cookies, ensure_ascii=False, separators=(",", ":"))
+    async with database.transaction():
+        row = await database.fetch_one(
+            "SELECT status, account_id FROM login_sessions WHERE session_id = :sid FOR UPDATE",
+            {"sid": session_id},
+        )
+        if not row:
+            raise HTTPException(404, detail="Login session not found")
+        if row["status"] == "confirmed" and row["account_id"]:
+            return int(row["account_id"])
+        if row["status"] in {"expired", "failed"}:
+            raise HTTPException(409, detail=f"Login session is {row['status']}")
+        fingerprint_id = await ensure_default_fingerprint("bilibili")
+        account_id = await database.execute(
+            """INSERT INTO accounts (platform, fingerprint_id, encrypted_credential, status)
+               VALUES ('bilibili', :fingerprint_id, :credential, 'warming')""",
+            {"fingerprint_id": fingerprint_id, "credential": cookie_vault.encrypt(normalized)},
+        )
+        await database.execute(
+            """UPDATE login_sessions
+               SET status = 'confirmed', account_id = :account_id, completed_at = NOW(),
+                   error_message = NULL, updated_at = NOW()
+               WHERE session_id = :session_id""",
+            {"session_id": session_id, "account_id": account_id},
+        )
+    calibration = None
+    try:
+        calibration = await queue_account_calibration(account_id, "bilibili")
+    except Exception as exc:
+        await database.execute(
+            """UPDATE login_sessions
+               SET error_message = :error, updated_at = NOW()
+               WHERE session_id = :session_id""",
+            {
+                "session_id": session_id,
+                "error": f"Account created, but calibration queue failed: {exc}",
+            },
+        )
+        await record_event(
+            aggregate="account",
+            aggregate_id=account_id,
+            event_type="AccountCalibrationQueueFailed",
+            payload={"platform": "bilibili", "error": str(exc), "manual_retry_available": True},
+            correlation_id=session_id,
+        )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountCreated",
+        payload={
+            "platform": "bilibili",
+            "credential_imported": True,
+            "source": "official_qr",
+            "calibration": calibration,
+        },
+        correlation_id=session_id,
+    )
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="AccountCredentialImported",
+        payload={"platform": "bilibili", "source": "official_qr", "calibration": calibration},
+        correlation_id=session_id,
+    )
+    return account_id
 
 
 async def ensure_default_fingerprint(platform: str) -> int:

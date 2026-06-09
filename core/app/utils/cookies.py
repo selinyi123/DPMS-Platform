@@ -15,6 +15,13 @@ def normalize_cookie_payload(platform: str, payload: str) -> str:
     return json.dumps(cookies, ensure_ascii=False, separators=(",", ":"))
 
 
+def validate_required_cookies(cookies: list[dict], required_names: list[str]) -> None:
+    present = {cookie.get("name") for cookie in cookies}
+    missing = sorted(set(required_names).difference(present))
+    if missing:
+        raise ValueError(f"缺少平台必需 Cookie: {', '.join(missing)}")
+
+
 def parse_cookie_payload(platform: str, payload: str) -> list[dict]:
     text = normalize_raw_cookie_text(payload)
     if not text:

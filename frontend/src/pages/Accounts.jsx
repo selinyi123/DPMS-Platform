@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import QRCode from 'qrcode';
 
 import { apiPath, deleteJSON, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
@@ -17,6 +18,7 @@ export default function Accounts() {
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [loginSession, setLoginSession] = useState(null);
   const [imageReady, setImageReady] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState('');
   const [recheckResult, setRecheckResult] = useState(null);
   const text = accountText[language] || accountText.zh;
 
@@ -44,26 +46,65 @@ export default function Accounts() {
 
   useEffect(() => {
     if (!loginSession?.session_id || ['confirmed', 'expired', 'failed'].includes(loginSession.status)) return undefined;
-    const timer = setInterval(async () => {
+    let cancelled = false;
+    let timer;
+    const poll = async () => {
       try {
-        const next = await fetchJSON(`/accounts/login/qr/${loginSession.session_id}`);
+        const next = loginSession.login_mode === 'official_qr'
+          ? await postJSON(`/accounts/login/qr/${loginSession.session_id}/poll`, {})
+          : await fetchJSON(`/accounts/login/qr/${loginSession.session_id}`);
+        if (cancelled) return;
         setLoginSession(next);
         if (next.status === 'confirmed') await load();
       } catch (err) {
+        if (cancelled) return;
         setError(err.message);
+        setLoginSession(current => (
+          current?.session_id === loginSession.session_id
+            ? { ...current, status: 'failed', error_message: err.message }
+            : current
+        ));
+        return;
       }
-    }, 2500);
-    return () => clearInterval(timer);
+      if (!cancelled) timer = window.setTimeout(poll, 2500);
+    };
+    timer = window.setTimeout(poll, 2500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [loginSession?.session_id, loginSession?.status]);
+
+  useEffect(() => {
+    let active = true;
+    if (loginSession?.login_mode !== 'official_qr' || !loginSession.qr_content) {
+      setQrDataUrl('');
+      return undefined;
+    }
+    QRCode.toDataURL(loginSession.qr_content, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      width: 320,
+      color: { dark: '#101828', light: '#ffffff' },
+    })
+      .then(url => {
+        if (active) setQrDataUrl(url);
+      })
+      .catch(err => {
+        if (active) setError(err.message);
+      });
+    return () => { active = false; };
+  }, [loginSession?.login_mode, loginSession?.qr_content]);
 
   const startQrLogin = async () => {
     setBusy(true);
     setError('');
     setImageReady(false);
+    setQrDataUrl('');
     try {
       const session = await postJSON('/accounts/login/qr', { platform: form.platform });
       setLoginSession(session);
-      notify(`${t('accounts.qrLogin')} ${session.status}`, 'info');
+      notify(`${t('accounts.qrLogin')} ${t(`status.${session.status}`)}`, 'info');
     } catch (err) {
       setError(err.message);
       notify(err.message, 'error');
@@ -285,16 +326,25 @@ export default function Accounts() {
           <div className="qr-frame">
             {loginSession?.session_id ? (
               <>
-                {!imageReady && <div className="qr-empty">{t('accounts.qrOpening')}</div>}
-                <img
-                  alt="QR login screen"
-                  src={apiPath(`/accounts/login/qr/${loginSession.session_id}/image?ts=${Date.now()}`)}
-                  style={{ display: imageReady ? 'block' : 'none' }}
-                  onLoad={() => setImageReady(true)}
-                  onError={() => setImageReady(false)}
-                />
+                {loginSession.login_mode === 'official_qr' ? (
+                  qrDataUrl
+                    ? <img className="official-qr" alt={t('accounts.qrOfficialAlt')} src={qrDataUrl} />
+                    : <div className="qr-empty">{t('accounts.qrOpening')}</div>
+                ) : (
+                  <>
+                    {!imageReady && <div className="qr-empty">{t('accounts.qrOpening')}</div>}
+                    <img
+                      alt="QR login screen"
+                      src={apiPath(`/accounts/login/qr/${loginSession.session_id}/image?ts=${loginSession.updated_at || Date.now()}`)}
+                      style={{ display: imageReady ? 'block' : 'none' }}
+                      onLoad={() => setImageReady(true)}
+                      onError={() => setImageReady(false)}
+                    />
+                  </>
+                )}
                 <div className="qr-status">
                   <StatusBadge status={loginSession.status} />
+                  {loginSession.login_mode === 'official_qr' && <span>{t('accounts.qrOfficialHint')}</span>}
                   {loginSession.account_id && <span>{t('accounts.accountCreated')} A{loginSession.account_id}</span>}
                   {loginSession.error_message && <span>{loginSession.error_message}</span>}
                 </div>

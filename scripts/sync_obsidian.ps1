@@ -40,6 +40,7 @@ $mappings = @(
     @{ Source = "docs\DPMS_BilibiliSafetyGate_实施记录_20260608.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliSafetyGate_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_BilibiliSafeWorkflow_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliSafeWorkflow_实施记录_20260609.md" },
     @{ Source = "docs\DPMS_BilibiliTargetValidation_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliTargetValidation_实施记录_20260609.md" },
+    @{ Source = "docs\DPMS_BilibiliOfficialQrLogin_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliOfficialQrLogin_实施记录_20260609.md" },
     @{ Source = "docs\DPMS_FrontendTheme_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_FrontendTheme_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_NotificationSecretBundle_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_NotificationSecretBundle_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_最终搭建审阅与漏洞清单_20260602.md"; Destination = "06_审查与风险\DPMS_最终搭建审阅与漏洞清单_20260602.md" },

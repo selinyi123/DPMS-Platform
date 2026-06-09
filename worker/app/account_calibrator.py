@@ -85,11 +85,13 @@ async def handle_calibration(pool, task: dict):
             await mark_account_login_required(account_id, f"missing cookies after calibration: {', '.join(missing)}")
             raise ValueError(f"Missing required cookies after calibration: {', '.join(missing)}")
 
+        identity = await verify_platform_identity(ctx, platform)
         result = {
             "check_url": check_url,
             "final_url": page.url,
             "title": await safe_title(page),
             "required_present": required_present,
+            "identity": identity,
         }
         await page.screenshot(path=screenshot_path, full_page=True)
         await database.execute(
@@ -190,6 +192,28 @@ async def mark_account_login_required(account_id: int, reason: str):
         event_type="RiskDetected",
         payload={"account_id": account_id, "event_type": "login_required", "reason": reason},
     )
+
+
+async def verify_platform_identity(ctx, platform: str) -> dict:
+    if platform != "bilibili":
+        return {"verified": True, "method": "required_cookies"}
+    response = await ctx.request.get(
+        "https://api.bilibili.com/x/web-interface/nav",
+        headers={"Referer": "https://www.bilibili.com/"},
+        timeout=15000,
+    )
+    if not response.ok:
+        raise ValueError(f"Bilibili identity check failed with HTTP {response.status}")
+    payload = await response.json()
+    data = payload.get("data") or {}
+    if payload.get("code") != 0 or not data.get("isLogin") or not data.get("mid"):
+        raise ValueError("Bilibili credential is not authenticated")
+    return {
+        "verified": True,
+        "method": "bilibili_nav",
+        "mid": str(data["mid"]),
+        "level": int(data.get("level_info", {}).get("current_level") or 0),
+    }
 
 
 async def emit_calibration_notification(account_id: int, calibration_id: str, status: str, content: str, severity: str):

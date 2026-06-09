@@ -19,6 +19,7 @@ const map = {
   queued: 'badge-warn',
   opening: 'badge-info',
   waiting_scan: 'badge-warn',
+  scanned: 'badge-info',
   confirmed: 'badge-ready',
   expired: 'badge-muted',
 };

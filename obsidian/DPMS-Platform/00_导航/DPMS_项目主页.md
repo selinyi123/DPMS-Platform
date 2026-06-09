@@ -52,6 +52,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_KnowledgeRuntime_实施记录_20260606]]
 - [[DPMS_StrategyQueue_实施记录_20260606]]
 - [[DPMS_BilibiliTargetValidation_实施记录_20260609]]
+- [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 
 ## 文档分区
@@ -70,8 +71,9 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 
 ## 当前下一步
 
-1. 录入真实 Bilibili 视频或动态抽奖链接。
-2. 使用已校准账号完成四阶段低风险探针。
-3. 根据真实页面证据生成并复核选择器配置。
-4. 完成 Shadow-run，验证页面、登录态与风险门禁。
-5. 仅在证据完整、无近期风险时人工确认 Real-run。
+1. 使用 Bilibili 官方 App 扫码，验证新账号完整登录与校准闭环。
+2. 录入真实 Bilibili 视频或动态抽奖链接。
+3. 使用已校准账号完成四阶段低风险探针。
+4. 根据真实页面证据生成并复核选择器配置。
+5. 完成 Shadow-run，验证页面、登录态与风险门禁。
+6. 仅在证据完整、无近期风险时人工确认 Real-run。
