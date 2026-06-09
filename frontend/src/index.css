@@ -475,6 +475,83 @@ select {
   object-fit: contain;
 }
 
+.table-primary {
+  max-width: 28rem;
+  margin-bottom: 3px;
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rule-plan-editor {
+  min-width: 190px;
+}
+
+.rule-plan-editor summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.rule-plan-editor summary::-webkit-details-marker {
+  display: none;
+}
+
+.rule-plan-body {
+  display: grid;
+  min-width: 300px;
+  gap: 10px;
+  padding-top: 10px;
+}
+
+.rule-plan-body .textarea {
+  min-height: 90px;
+}
+
+.rule-action-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 12px;
+}
+
+.rule-action-grid label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+
+.activity-pool-table {
+  min-width: 1280px;
+}
+
+.activity-pool-table th:nth-child(3),
+.activity-pool-table td:nth-child(3) {
+  width: 320px;
+}
+
+.activity-pool-table th:nth-child(4),
+.activity-pool-table td:nth-child(4) {
+  width: 220px;
+}
+
+.activity-pool-table th:nth-child(7),
+.activity-pool-table td:nth-child(7) {
+  width: 270px;
+}
+
+.activity-pool-table th:nth-child(9),
+.activity-pool-table td:nth-child(9) {
+  width: 230px;
+}
+
+.activity-pool-table .badge {
+  white-space: nowrap;
+}
+
 .qr-empty {
   max-width: 260px;
   color: var(--text-muted);

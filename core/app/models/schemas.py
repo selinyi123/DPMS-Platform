@@ -128,6 +128,14 @@ class LotteryResponse(BaseModel):
 
     canonical_url: str
 
+    title: Optional[str] = None
+
+    rule_text: Optional[str] = None
+
+    action_plan: Optional[dict] = None
+
+    published_at: Optional[datetime] = None
+
     status: str
 
     value_score: int
@@ -178,6 +186,15 @@ class LotteryCreate(BaseModel):
     value_score: int = 0
 
     expires_at: Optional[datetime] = None
+
+
+class LotteryActionPlanUpdate(BaseModel):
+
+    required_actions: list[str]
+
+    rule_text: Optional[str] = None
+
+    reviewed: bool = True
 
 
 class LotteryTargetImport(BaseModel):

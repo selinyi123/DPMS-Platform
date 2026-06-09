@@ -123,6 +123,14 @@ CREATE TABLE IF NOT EXISTS `lotteries` (
 
   `url_hash` CHAR(64) GENERATED ALWAYS AS (SHA2(`canonical_url`, 256)) STORED,
 
+  `title` VARCHAR(256) NULL,
+
+  `rule_text` TEXT NULL,
+
+  `action_plan` JSON NULL,
+
+  `published_at` TIMESTAMP NULL,
+
   `status` ENUM('pending','claimed','running','participated','won','lost','expired') DEFAULT 'pending',
 
   `value_score` TINYINT UNSIGNED DEFAULT 0,

@@ -177,6 +177,22 @@ export default function Lotteries() {
     }
   };
 
+  const saveActionPlan = async (lottery, requiredActions, ruleText) => {
+    setError('');
+    try {
+      await putJSON(`/lotteries/${lottery.id}/action-plan`, {
+        required_actions: requiredActions,
+        rule_text: ruleText,
+        reviewed: true,
+      });
+      notify(t('lotteries.ruleSaved'), 'success');
+      await load();
+    } catch (err) {
+      setError(err.message);
+      notify(err.message, 'error');
+    }
+  };
+
   const dispatch = async (id, modeOverride = dispatchMode) => {
     setError('');
     try {
@@ -448,7 +464,12 @@ export default function Lotteries() {
           </label>
           <label className="url-field">
             <span>{t('lotteries.sourceValue')}</span>
-            <textarea className="input textarea" value={sourceForm.source_value} onChange={e => setSourceForm({ ...sourceForm, source_value: e.target.value })} />
+            <textarea
+              className="input textarea"
+              value={sourceForm.source_value}
+              onChange={e => setSourceForm({ ...sourceForm, source_value: e.target.value })}
+              placeholder={sourceForm.source_type === 'up' ? t('lotteries.upUidPlaceholder') : t('lotteries.sourceValuePlaceholder')}
+            />
           </label>
           <div className="toolbar form-actions">
             <button className="btn-primary" type="submit">{t('lotteries.saveSource')}</button>
@@ -481,9 +502,9 @@ export default function Lotteries() {
       <div className="panel">
         <div className="panel-title">{t('lotteries.activityPool')}</div>
         <div className="table-wrap">
-          <table className="data-table">
+          <table className="data-table activity-pool-table">
             <thead>
-              <tr><th>ID</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.url')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.score')}</th><th>{t('lotteries.realGate')}</th><th>{t('lotteries.expires')}</th><th>{t('lotteries.action')}</th></tr>
+              <tr><th>ID</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.url')}</th><th>{t('lotteries.rulePlan')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.score')}</th><th>{t('lotteries.realGate')}</th><th>{t('lotteries.expires')}</th><th>{t('lotteries.action')}</th></tr>
             </thead>
             <tbody>
               {lotteries.map(lottery => {
@@ -494,7 +515,11 @@ export default function Lotteries() {
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
                   <td>{lottery.platform}</td>
-                  <td className="truncate-cell" title={lottery.raw_url}>{lottery.raw_url}</td>
+                  <td className="truncate-cell" title={lottery.rule_text || lottery.raw_url}>
+                    {lottery.title && <div className="table-primary">{lottery.title}</div>}
+                    <div className="small-text">{lottery.raw_url}</div>
+                  </td>
+                  <td><RulePlanEditor lottery={lottery} onSave={saveActionPlan} t={t} /></td>
                   <td><StatusBadge status={lottery.status} /></td>
                   <td>{lottery.value_score}</td>
                   <td>
@@ -521,7 +546,7 @@ export default function Lotteries() {
                   </tr>
                 );
               })}
-              {!lotteries.length && <tr><td className="empty-cell" colSpan="8">{t('lotteries.noActivities')}</td></tr>}
+              {!lotteries.length && <tr><td className="empty-cell" colSpan="9">{t('lotteries.noActivities')}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -660,6 +685,55 @@ function RealGateCell({ gate, t }) {
         {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
       </div>
     </div>
+  );
+}
+
+function RulePlanEditor({ lottery, onSave, t }) {
+  const plan = lottery.action_plan || {};
+  const initialActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+  const planSignature = JSON.stringify(initialActions);
+  const [actions, setActions] = useState(initialActions);
+  const [ruleText, setRuleText] = useState(lottery.rule_text || '');
+
+  useEffect(() => {
+    setActions(Array.isArray(plan.required_actions) ? plan.required_actions : []);
+    setRuleText(lottery.rule_text || '');
+  }, [lottery.id, lottery.rule_text, planSignature]);
+
+  const toggle = action => {
+    setActions(current => current.includes(action)
+      ? current.filter(item => item !== action)
+      : [...current, action]);
+  };
+
+  return (
+    <details className="rule-plan-editor">
+      <summary>
+        <span className={`badge ${plan.review_required || !initialActions.length ? 'badge-warn' : 'badge-ready'}`}>
+          {plan.review_required || !initialActions.length ? t('lotteries.ruleNeedsReview') : t('lotteries.ruleReady')}
+        </span>
+        {!!initialActions.length && <span className="small-text">{initialActions.map(action => t(`lotteries.actions.${action}`)).join(' / ')}</span>}
+      </summary>
+      <div className="rule-plan-body">
+        <textarea
+          className="input textarea"
+          value={ruleText}
+          onChange={event => setRuleText(event.target.value)}
+          placeholder={t('lotteries.ruleTextPlaceholder')}
+        />
+        <div className="rule-action-grid">
+          {['followed', 'liked', 'commented', 'reposted'].map(action => (
+            <label key={action}>
+              <input type="checkbox" checked={actions.includes(action)} onChange={() => toggle(action)} />
+              <span>{t(`lotteries.actions.${action}`)}</span>
+            </label>
+          ))}
+        </div>
+        <button className="btn-primary" type="button" disabled={!actions.length} onClick={() => onSave(lottery, actions, ruleText)}>
+          {t('lotteries.confirmRule')}
+        </button>
+      </div>
+    </details>
   );
 }
 

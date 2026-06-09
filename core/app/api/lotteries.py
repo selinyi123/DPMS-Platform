@@ -14,6 +14,7 @@ from app.models.schemas import (
     AdapterSelectorConfigUpdate,
     AdapterProbeRequest,
     DispatchTaskRequest,
+    LotteryActionPlanUpdate,
     LotteryCreate,
     LotteryResultUpdate,
     LotteryTargetImport,
@@ -161,7 +162,7 @@ async def list_lotteries(status: str = None, limit: int = 50):
         values["status"] = status
     query += " ORDER BY id DESC LIMIT :limit"
     rows = await database.fetch_all(query, values)
-    return [dict(r) for r in rows]
+    return [serialize_lottery(r) for r in rows]
 
 
 @router.get("/real-run/evidence")
@@ -716,6 +717,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "dry_run": "1" if dry_run else "0",
             "mode": task_mode,
             "selector_config": json.dumps(platform_selectors, ensure_ascii=False) if isinstance(platform_selectors, dict) else "{}",
+            "action_plan": json.dumps(parse_json_field(lottery["action_plan"]) or {}, ensure_ascii=False),
         },
     )
     if task_mode == "real_run":
@@ -749,6 +751,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "dry_run": dry_run,
             "mode": task_mode,
             "raw_url": lottery["raw_url"],
+            "action_plan": parse_json_field(lottery["action_plan"]) or {},
         },
         correlation_id=task_id,
         actor_type="operator",
@@ -764,6 +767,60 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         actor_id=actor["actor_id"],
     )
     return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "mode": task_mode}
+
+
+@router.put("/{lottery_id}/action-plan")
+async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpdate, request: Request):
+    actor = require_min_role(request, "operator")
+    lottery = await database.fetch_one("SELECT id, platform, rule_text FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+
+    required_actions = list(dict.fromkeys(str(action).strip() for action in data.required_actions if str(action).strip()))
+    invalid = [action for action in required_actions if action not in PHASES]
+    if invalid:
+        raise HTTPException(400, detail={"message": "Unsupported lottery actions", "actions": invalid})
+    if not required_actions:
+        raise HTTPException(400, detail="At least one required action must be selected")
+
+    plan = {
+        "version": 1,
+        "is_lottery": True,
+        "required_actions": required_actions,
+        "review_required": not data.reviewed,
+        "confidence": 1.0 if data.reviewed else 0.5,
+        "source": "operator_review",
+        "reviewed_by": actor["actor_id"] if data.reviewed else None,
+    }
+    rule_text = data.rule_text if data.rule_text is not None else lottery["rule_text"]
+    await database.execute(
+        """UPDATE lotteries
+           SET rule_text = :rule_text, action_plan = :action_plan
+           WHERE id = :id""",
+        {
+            "id": lottery_id,
+            "rule_text": rule_text,
+            "action_plan": json.dumps(plan, ensure_ascii=False),
+        },
+    )
+    await audit_event(
+        request,
+        action="lottery.action_plan.update",
+        resource_type="lottery",
+        resource_id=lottery_id,
+        result="saved",
+        risk_level="high",
+        detail={"platform": lottery["platform"], "required_actions": required_actions, "reviewed": data.reviewed},
+    )
+    await record_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type="LotteryActionPlanReviewed" if data.reviewed else "LotteryActionPlanUpdated",
+        payload={"required_actions": required_actions, "reviewed": data.reviewed, "rule_text": rule_text},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "saved", "lottery_id": lottery_id, "action_plan": plan}
 
 
 @router.get("/tasks/runs")
@@ -1319,6 +1376,12 @@ def parse_json_field(value):
         return value
 
 
+def serialize_lottery(row) -> dict:
+    item = dict(row)
+    item["action_plan"] = parse_json_field(item.get("action_plan"))
+    return item
+
+
 async def save_platform_selector_config(platform: str, config: dict):
     row = await database.fetch_one(
         "SELECT id FROM adapter_selector_configs WHERE platform = :platform",
@@ -1369,6 +1432,15 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
     if not target.valid:
         blockers.append("invalid_lottery_target")
+    lottery_data = dict(lottery)
+    action_plan = parse_json_field(lottery_data.get("action_plan"))
+    required_actions = action_plan.get("required_actions", []) if isinstance(action_plan, dict) else []
+    if not action_plan:
+        blockers.append("lottery_action_plan_required")
+    elif action_plan.get("review_required"):
+        blockers.append("lottery_rule_review_required")
+    elif not required_actions:
+        blockers.append("lottery_required_actions_missing")
     probe_values = {"platform": lottery["platform"], "lottery_id": lottery["id"]}
     task_values = {"lottery_id": lottery["id"]}
     account_filter = ""
@@ -1427,6 +1499,7 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         "blockers": blockers,
         "probe_ready": bool(probe_summary and probe_summary.get("ready_for_real_actions")),
         "shadow_ready": bool(shadow),
+        "action_plan_ready": bool(action_plan and required_actions and not action_plan.get("review_required")),
     }
 
 
@@ -1484,6 +1557,11 @@ def extract_real_run_blockers(reason) -> list[str]:
 def next_action_for_blockers(blockers: list[str]) -> str:
     if "invalid_lottery_target" in blockers:
         return "add_target"
+    if any(
+        blocker in blockers
+        for blocker in ("lottery_action_plan_required", "lottery_rule_review_required", "lottery_required_actions_missing")
+    ):
+        return "review_rule"
     if "no_calibrated_ready_account" in blockers:
         return "add_account"
     if "recent_account_risk_event" in blockers:
@@ -1543,6 +1621,11 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
     next_action = "real_run"
     if "invalid_lottery_target" in blockers:
         next_action = "add_target"
+    elif any(
+        blocker in blockers
+        for blocker in ("lottery_action_plan_required", "lottery_rule_review_required", "lottery_required_actions_missing")
+    ):
+        next_action = "review_rule"
     elif "no_calibrated_ready_account" in blockers:
         next_action = "add_account"
     elif "recent_account_risk_event" in blockers:
@@ -1573,6 +1656,8 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
         "safe_accounts": int(safe_accounts["cnt"] or 0),
         "probe_ready": evidence["probe_ready"],
         "shadow_ready": evidence["shadow_ready"],
+        "action_plan_ready": evidence["action_plan_ready"],
+        "action_plan": parse_json_field(dict(lottery).get("action_plan")),
     }
 
 

@@ -83,6 +83,10 @@ async def ensure_runtime_schema():
     for statement in [
         "ALTER TABLE tracked_sources MODIFY source_type VARCHAR(32) NOT NULL",
         "ALTER TABLE lotteries MODIFY source_type VARCHAR(32) NOT NULL",
+        "ALTER TABLE lotteries ADD COLUMN title VARCHAR(256) NULL",
+        "ALTER TABLE lotteries ADD COLUMN rule_text TEXT NULL",
+        "ALTER TABLE lotteries ADD COLUMN action_plan JSON NULL",
+        "ALTER TABLE lotteries ADD COLUMN published_at TIMESTAMP NULL",
     ]:
         try:
             await database.execute(statement)

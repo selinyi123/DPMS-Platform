@@ -151,8 +151,8 @@ async def mark_task_finished(
     )
 
 
-async def execute_dry_run(task_id: str, account_id: int, lottery_id: int):
-    for phase_name in PHASE_ORDER:
+async def execute_dry_run(task_id: str, account_id: int, lottery_id: int, phases: list[str]):
+    for phase_name in phases:
         await asyncio.sleep(0.2)
         await save_phase(task_id, account_id, lottery_id, phase_name)
     await save_phase(task_id, account_id, lottery_id, "completed")
@@ -167,6 +167,7 @@ async def execute_shadow_run(task: dict, adapter, pool):
     platform = task.get("platform", "bilibili")
     profile_dir = task.get("profile_dir", f"/profiles/{platform}/account_{account_id}")
     proxy = task.get("proxy")
+    phases = requested_phases(task, require_plan=False)
     ctx = await pool.get_account_context(account_id, profile_dir, proxy)
     await prepare_account_login(ctx, account_id, platform)
     page = await ctx.new_page()
@@ -177,7 +178,7 @@ async def execute_shadow_run(task: dict, adapter, pool):
 
         visible_phases = {}
         selector_probes = getattr(adapter, "SELECTOR_PROBES", {}) or {}
-        for phase_name in PHASE_ORDER:
+        for phase_name in phases:
             visible_phases[phase_name] = await first_visible_selector(page, selector_probes.get(phase_name, []))
 
         screenshot_path = await capture_shadow_screenshot(page, task_id, account_id, lottery_id, visible_phases)
@@ -227,6 +228,7 @@ async def execute_real_task(task: dict, adapter, pool):
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
     lottery_url = task.get("raw_url") or task.get("canonical_url")
+    phases = requested_phases(task, require_plan=True)
 
     current_phase = await get_latest_phase(task_id) or "init"
     if current_phase not in PHASE_ORDER and current_phase != "init":
@@ -250,8 +252,12 @@ async def execute_real_task(task: dict, adapter, pool):
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id)
 
-        start_index = 0 if current_phase == "init" else PHASE_ORDER.index(current_phase) + 1
-        for phase_name in PHASE_ORDER[start_index:]:
+        if current_phase == "init":
+            remaining_phases = phases
+        else:
+            completed_index = PHASE_ORDER.index(current_phase)
+            remaining_phases = [phase for phase in phases if PHASE_ORDER.index(phase) > completed_index]
+        for phase_name in remaining_phases:
             await detect_page_risk(page, account_id)
             await phase_fn[phase_name](page)
             await detect_page_risk(page, account_id)
@@ -382,7 +388,7 @@ async def execute_task_with_phases(task: dict, adapter, pool):
         await ensure_account_can_run(account_id)
         await mark_task_started(task_id, account_id, lottery_id, task_mode)
         if task_mode == "dry_run":
-            await execute_dry_run(task_id, account_id, lottery_id)
+            await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))
         elif task_mode == "shadow_run":
             await execute_shadow_run(task, adapter, pool)
         else:
@@ -458,3 +464,17 @@ def normalize_task_mode(task: dict) -> str:
         return raw_mode
     dry_run = str(task.get("dry_run", "1")).lower() in {"1", "true", "yes"}
     return "dry_run" if dry_run else "real_run"
+
+
+def requested_phases(task: dict, require_plan: bool) -> list[str]:
+    plan = parse_json_field(task.get("action_plan"))
+    if not isinstance(plan, dict):
+        plan = {}
+    actions = plan.get("required_actions")
+    phases = [phase for phase in PHASE_ORDER if isinstance(actions, list) and phase in actions]
+    if require_plan:
+        if plan.get("review_required"):
+            raise RuntimeError("Lottery rule requires review before real-run")
+        if not phases:
+            raise RuntimeError("Lottery action plan is missing required actions")
+    return phases or list(PHASE_ORDER)

@@ -1,8 +1,12 @@
 import re
+import json
 from datetime import datetime, timedelta
 from urllib.parse import unquote
 
 from app.db import database
+from app.services.bilibili_discovery import fetch_bilibili_space_dynamics
+from app.utils.cookies import parse_cookie_payload
+from app.utils.crypto import cookie_vault
 from app.utils.canonicalizer import BilibiliCanonicalizer, GenericCanonicalizer
 from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
@@ -37,16 +41,29 @@ async def run_discovery():
 
         stats["scanned"] += 1
         structured_log("info", "discovery_scan", source_id=source["id"], source_type=source["source_type"])
-        urls = await fetch_urls_for_source(source)
-        stats["found"] += len(urls)
+        try:
+            candidates = await fetch_candidates_for_source(source)
+        except Exception as e:
+            stats["failed"] += 1
+            structured_log("error", "discovery_source_failed", source_id=source["id"], exception=e)
+            await database.execute("UPDATE tracked_sources SET last_scan_at = NOW() WHERE id = :id", {"id": source["id"]})
+            continue
+        stats["found"] += len(candidates)
 
-        for raw_url in urls:
+        for candidate in candidates:
+            raw_url = candidate["raw_url"]
             try:
                 target = validate_lottery_target(source["platform"], raw_url)
                 if not target.valid:
                     raise ValueError(target.reason)
                 canonical = await canonicalize_url(source["platform"], raw_url)
-                inserted = await insert_lottery_if_new(source, raw_url, canonical, score_lottery(source, raw_url))
+                inserted = await insert_lottery_if_new(
+                    source,
+                    raw_url,
+                    canonical,
+                    score_lottery(source, raw_url, candidate),
+                    candidate,
+                )
                 if inserted:
                     stats["inserted"] += 1
             except Exception as e:
@@ -65,17 +82,44 @@ def should_scan(source) -> bool:
     return datetime.now() - source["last_scan_at"] > interval
 
 
-async def fetch_urls_for_source(source) -> list[str]:
+async def fetch_candidates_for_source(source) -> list[dict]:
     if source["source_type"] == "url_list":
-        return extract_urls(source["source_value"])
+        return [{"raw_url": url} for url in extract_urls(source["source_value"])]
     if source["platform"] == "bilibili" and source["source_type"] == "up":
         return await fetch_up_dynamics(source["source_value"])
     return []
 
 
 async def fetch_up_dynamics(up_uid: str):
-    structured_log("warning", "bilibili_up_discovery_not_configured", source_id=up_uid)
-    return []
+    cookie_header = await load_bilibili_discovery_cookie_header()
+    items = await fetch_bilibili_space_dynamics(up_uid, cookie_header=cookie_header)
+    return [
+        {
+            "raw_url": item.url,
+            "title": item.title,
+            "rule_text": item.rule_text,
+            "published_at": item.published_at,
+            "action_plan": item.action_plan,
+        }
+        for item in items
+    ]
+
+
+async def load_bilibili_discovery_cookie_header() -> str:
+    row = await database.fetch_one(
+        """SELECT encrypted_credential
+           FROM accounts
+           WHERE platform = 'bilibili'
+             AND status = 'ready'
+             AND OCTET_LENGTH(encrypted_credential) > 0
+           ORDER BY last_active_at DESC, id ASC
+           LIMIT 1"""
+    )
+    if not row:
+        raise RuntimeError("Bilibili UP discovery requires a calibrated ready account")
+    credential = cookie_vault.decrypt(row["encrypted_credential"])
+    cookies = parse_cookie_payload("bilibili", credential)
+    return "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
 
 
 def extract_urls(value: str) -> list[str]:
@@ -89,8 +133,9 @@ async def canonicalize_url(platform: str, raw_url: str) -> str:
     return await GenericCanonicalizer.canonicalize(platform, raw_url)
 
 
-def score_lottery(source, raw_url: str) -> int:
-    text = unquote(f"{source['source_value']} {raw_url}").lower()
+def score_lottery(source, raw_url: str, candidate: dict | None = None) -> int:
+    candidate = candidate or {}
+    text = unquote(f"{source['source_value']} {raw_url} {candidate.get('rule_text', '')}").lower()
     score = 20
     if source["source_type"] == "url_list":
         score += 10
@@ -100,6 +145,11 @@ def score_lottery(source, raw_url: str) -> int:
         score += 5
     if source["platform"] == "bilibili":
         score += 5
+    action_plan = candidate.get("action_plan") or {}
+    if action_plan.get("is_lottery"):
+        score += 10
+    if action_plan.get("review_required"):
+        score -= 15
     return min(score, 100)
 
 
@@ -114,7 +164,14 @@ async def expire_old_lotteries() -> int:
     return int(result or 0)
 
 
-async def insert_lottery_if_new(source, raw_url: str, canonical_url: str, value_score: int) -> bool:
+async def insert_lottery_if_new(
+    source,
+    raw_url: str,
+    canonical_url: str,
+    value_score: int,
+    candidate: dict | None = None,
+) -> bool:
+    candidate = candidate or {}
     try:
         existing = await database.fetch_one(
             "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
@@ -125,15 +182,23 @@ async def insert_lottery_if_new(source, raw_url: str, canonical_url: str, value_
 
         await database.execute(
             """INSERT INTO lotteries
-               (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
+               (platform, source_type, source_id, raw_url, canonical_url, title, rule_text, action_plan,
+                published_at, value_score, expires_at, status)
                VALUES
-               (:platform, :source_type, :source_id, :raw_url, :canonical_url, :value_score, :expires_at, 'pending')""",
+               (:platform, :source_type, :source_id, :raw_url, :canonical_url, :title, :rule_text, :action_plan,
+                :published_at, :value_score, :expires_at, 'pending')""",
             {
                 "platform": source["platform"],
                 "source_type": source["source_type"],
                 "source_id": source["source_value"],
                 "raw_url": raw_url,
                 "canonical_url": canonical_url,
+                "title": candidate.get("title"),
+                "rule_text": candidate.get("rule_text"),
+                "action_plan": json.dumps(candidate.get("action_plan"), ensure_ascii=False)
+                if candidate.get("action_plan")
+                else None,
+                "published_at": candidate.get("published_at"),
                 "value_score": value_score,
                 "expires_at": datetime.now() + timedelta(days=DEFAULT_EXPIRES_DAYS),
             },
