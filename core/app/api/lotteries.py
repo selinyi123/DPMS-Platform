@@ -28,7 +28,8 @@ from app.security import (
     require_confirmation,
     require_min_role,
 )
-from app.utils.canonicalizer import GenericCanonicalizer
+from app.utils.canonicalizer import BilibiliCanonicalizer, GenericCanonicalizer
+from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
 
 
@@ -266,18 +267,24 @@ async def strategy_queue(limit: int = 20):
         adapter_ready = bool(cfg.get("action_adapter")) or platform_selectors_complete(selector_config, platform)
         probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
         breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
+        target = validate_lottery_target(platform, item["raw_url"])
 
-        recommended_mode, reason_codes, blockers = choose_strategy_mode(
-            safe_accounts=safe_accounts,
-            active_runs=active_runs,
-            dry_success=dry_success,
-            shadow_success=shadow_success,
-            adapter_ready=adapter_ready,
-            probe_ready=probe_ready,
-            real_run_enabled=real_run_enabled,
-            breaker_allowed=breaker_allowed,
-            breaker_reason=breaker_reason,
-        )
+        if target.valid:
+            recommended_mode, reason_codes, blockers = choose_strategy_mode(
+                safe_accounts=safe_accounts,
+                active_runs=active_runs,
+                dry_success=dry_success,
+                shadow_success=shadow_success,
+                adapter_ready=adapter_ready,
+                probe_ready=probe_ready,
+                real_run_enabled=real_run_enabled,
+                breaker_allowed=breaker_allowed,
+                breaker_reason=breaker_reason,
+            )
+        else:
+            recommended_mode = "blocked"
+            reason_codes = ["invalid_lottery_target"]
+            blockers = [target.reason or "invalid lottery target"]
         if recent_risk:
             reason_codes.append("recent_platform_risk")
         if failed_runs:
@@ -347,6 +354,8 @@ async def strategy_queue(limit: int = 20):
                 "probe_ready": probe_ready,
                 "real_run_enabled": real_run_enabled,
                 "breaker_allowed": breaker_allowed,
+                "target_valid": target.valid,
+                "target_kind": target.kind,
             }
         )
 
@@ -418,7 +427,14 @@ async def create_lottery(data: LotteryCreate, request: Request):
     if not get_platform(data.platform):
         raise HTTPException(400, detail=f"Unsupported platform: {data.platform}")
 
-    canonical_url = data.canonical_url or data.raw_url.strip()
+    raw_url = data.raw_url.strip()
+    target = validate_lottery_target(data.platform, raw_url)
+    if not target.valid:
+        raise HTTPException(400, detail=target.reason)
+    try:
+        canonical_url = await canonicalize_lottery_url(data.platform, raw_url)
+    except Exception as exc:
+        raise HTTPException(400, detail="lottery_target_canonicalization_failed") from exc
     try:
         lottery_id = await database.execute(
             """INSERT INTO lotteries (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
@@ -427,7 +443,7 @@ async def create_lottery(data: LotteryCreate, request: Request):
                 "platform": data.platform,
                 "source_type": data.source_type,
                 "source_id": data.source_id,
-                "raw_url": data.raw_url.strip(),
+                "raw_url": raw_url,
                 "canonical_url": canonical_url,
                 "value_score": data.value_score,
                 "expires_at": data.expires_at,
@@ -441,7 +457,7 @@ async def create_lottery(data: LotteryCreate, request: Request):
                 "platform": data.platform,
                 "source_type": data.source_type,
                 "source_id": data.source_id,
-                "raw_url": data.raw_url.strip(),
+                "raw_url": raw_url,
                 "canonical_url": canonical_url,
                 "value_score": data.value_score,
                 "manual": True,
@@ -481,7 +497,11 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
             invalid.append(row)
             continue
         try:
-            canonical_url = await GenericCanonicalizer.canonicalize(row["platform"], row["raw_url"])
+            target = validate_lottery_target(row["platform"], row["raw_url"])
+            if not target.valid:
+                invalid.append({"line": row["line"], "raw": row["raw"], "error": target.reason})
+                continue
+            canonical_url = await canonicalize_lottery_url(row["platform"], row["raw_url"])
             lottery_id = await database.execute(
                 """INSERT INTO lotteries (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
                    VALUES (:platform, :source_type, :source_id, :raw_url, :canonical_url, :value_score, :expires_at, 'pending')""",
@@ -514,15 +534,19 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
                 actor_type="operator",
                 actor_id=actor["actor_id"],
             )
-        except Exception:
-            existing = await database.fetch_one(
-                "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
-                {"canonical_url": await GenericCanonicalizer.canonicalize(row["platform"], row["raw_url"])},
-            )
+        except Exception as exc:
+            try:
+                canonical_url = await canonicalize_lottery_url(row["platform"], row["raw_url"])
+                existing = await database.fetch_one(
+                    "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
+                    {"canonical_url": canonical_url},
+                )
+            except Exception:
+                existing = None
             if existing:
                 duplicates.append({"line": row["line"], "id": existing["id"], "url": row["raw_url"], "platform": row["platform"]})
             else:
-                invalid.append({"line": row["line"], "raw": row["raw"], "error": "insert failed"})
+                invalid.append({"line": row["line"], "raw": row["raw"], "error": str(exc) or "insert failed"})
 
     result = {
         "status": "imported",
@@ -569,6 +593,9 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, lottery["platform"])
     task_mode = resolve_task_mode(data)
     dry_run = task_mode != "real_run"
+    target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
+    if task_mode in {"shadow_run", "real_run"} and not target.valid:
+        raise HTTPException(400, detail=target.reason)
 
     if task_mode == "real_run":
         require_min_role(request, "admin")
@@ -776,6 +803,9 @@ async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, requ
         raise HTTPException(404, detail="Lottery not found")
     if not get_platform(lottery["platform"]):
         raise HTTPException(400, detail=f"Unsupported platform: {lottery['platform']}")
+    target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
+    if not target.valid:
+        raise HTTPException(400, detail=target.reason)
 
     account = await pick_account(data.account_id, lottery["platform"])
     if not account:
@@ -978,6 +1008,8 @@ def strategy_score(
     account_reputation_score: int,
     expected_value: float,
 ) -> float:
+    if recommended_mode == "blocked":
+        return 0.0
     mode_multiplier = {
         "real_run": 1.0,
         "shadow_run": 0.78,
@@ -1334,6 +1366,9 @@ def selector_values(value) -> list[str]:
 
 async def validate_real_run_evidence(lottery, account_id: int | None = None) -> dict:
     blockers = []
+    target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
+    if not target.valid:
+        blockers.append("invalid_lottery_target")
     probe_values = {"platform": lottery["platform"], "lottery_id": lottery["id"]}
     task_values = {"lottery_id": lottery["id"]}
     account_filter = ""
@@ -1447,6 +1482,8 @@ def extract_real_run_blockers(reason) -> list[str]:
 
 
 def next_action_for_blockers(blockers: list[str]) -> str:
+    if "invalid_lottery_target" in blockers:
+        return "add_target"
     if "no_calibrated_ready_account" in blockers:
         return "add_account"
     if "recent_account_risk_event" in blockers:
@@ -1477,6 +1514,7 @@ def format_real_run_reason(reason) -> str:
 async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabled: bool, account_id: int | None = None) -> dict:
     platform = lottery["platform"]
     cfg = get_platform(platform) or {}
+    target = validate_lottery_target(platform, lottery["raw_url"])
     safe_accounts = await database.fetch_one(
         """SELECT COUNT(*) AS cnt
            FROM accounts a
@@ -1503,7 +1541,9 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
         blockers.insert(0, "global_real_run_disabled")
 
     next_action = "real_run"
-    if "no_calibrated_ready_account" in blockers:
+    if "invalid_lottery_target" in blockers:
+        next_action = "add_target"
+    elif "no_calibrated_ready_account" in blockers:
         next_action = "add_account"
     elif "recent_account_risk_event" in blockers:
         next_action = "review_risk"
@@ -1519,6 +1559,11 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
     return {
         "lottery_id": lottery["id"],
         "platform": platform,
+        "status": lottery["status"],
+        "raw_url": lottery["raw_url"],
+        "target_valid": target.valid,
+        "target_kind": target.kind,
+        "target_error": target.reason,
         "allowed": not blockers,
         "blockers": blockers,
         "next_action": next_action,
@@ -1579,6 +1624,12 @@ def parse_target_lines(content: str, default_platform: str, default_score: int):
 def looks_like_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+async def canonicalize_lottery_url(platform: str, raw_url: str) -> str:
+    if platform == "bilibili":
+        return (await BilibiliCanonicalizer.canonicalize(raw_url)).to_uri()
+    return await GenericCanonicalizer.canonicalize(platform, raw_url)
 
 
 def parse_int(value: str, default: int) -> int:

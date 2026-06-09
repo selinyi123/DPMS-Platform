@@ -20,13 +20,13 @@ export default function Lotteries() {
   const [discoveryMessage, setDiscoveryMessage] = useState('');
   const [dispatchMode, setDispatchMode] = useState('dry_run');
   const [selectedAccount, setSelectedAccount] = useState('');
-  const [form, setForm] = useState({ platform: 'bilibili', raw_url: 'https://www.bilibili.com/', value_score: 50 });
+  const [form, setForm] = useState({ platform: 'bilibili', raw_url: '', value_score: 50 });
   const [targetImport, setTargetImport] = useState({ platform: 'bilibili', content: '', value_score: 50 });
   const [targetImportResult, setTargetImportResult] = useState(null);
   const [sourceForm, setSourceForm] = useState({
     platform: 'bilibili',
     source_type: 'url_list',
-    source_value: 'https://www.bilibili.com/',
+    source_value: '',
     scan_interval_minutes: 30,
   });
 

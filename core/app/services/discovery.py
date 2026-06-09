@@ -4,6 +4,7 @@ from urllib.parse import unquote
 
 from app.db import database
 from app.utils.canonicalizer import BilibiliCanonicalizer, GenericCanonicalizer
+from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
 
 
@@ -41,6 +42,9 @@ async def run_discovery():
 
         for raw_url in urls:
             try:
+                target = validate_lottery_target(source["platform"], raw_url)
+                if not target.valid:
+                    raise ValueError(target.reason)
                 canonical = await canonicalize_url(source["platform"], raw_url)
                 inserted = await insert_lottery_if_new(source, raw_url, canonical, score_lottery(source, raw_url))
                 if inserted:
@@ -81,10 +85,7 @@ def extract_urls(value: str) -> list[str]:
 
 async def canonicalize_url(platform: str, raw_url: str) -> str:
     if platform == "bilibili":
-        try:
-            return (await BilibiliCanonicalizer.canonicalize(raw_url)).to_uri()
-        except Exception:
-            pass
+        return (await BilibiliCanonicalizer.canonicalize(raw_url)).to_uri()
     return await GenericCanonicalizer.canonicalize(platform, raw_url)
 
 

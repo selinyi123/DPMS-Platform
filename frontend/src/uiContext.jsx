@@ -226,7 +226,7 @@ const dictionaries = {
       defaultScore: '默认评分',
       uploadTargets: '上传目标',
       targetList: '目标列表',
-      targetPlaceholder: '每行一个 URL，或使用 platform,url,score,expires_at\nhttps://www.bilibili.com/\nbilibili,https://t.bilibili.com/123,80,2026-06-30 23:59:59',
+      targetPlaceholder: '每行一个 URL，或使用 platform,url,score,expires_at\nhttps://www.bilibili.com/video/BV...\nbilibili,https://t.bilibili.com/123456789,80,2026-06-30 23:59:59',
       importTargets: '导入目标',
       targetsImported: '目标导入完成：新增 {created_count}，重复 {duplicate_count}，无效 {invalid_count}',
       targetFileLoaded: '已读取目标文件：{name}',
@@ -273,6 +273,7 @@ const dictionaries = {
       gateBlocked: '证据不足',
       gateUnknown: '未计算',
       nextActions: {
+        add_target: '先添加真实活动',
         add_account: '先添加账号',
         configure_adapter: '先配置适配器',
         probe: '先跑探针',
@@ -283,6 +284,7 @@ const dictionaries = {
         real_run: '派发真实任务',
       },
       nextActionHints: {
+        add_target: '请先添加 Bilibili 视频或动态活动链接，首页和测试 URL 不能用于探针或执行。',
         add_account: '请先到账号登录页添加并校准 Bilibili 账号。',
         configure_adapter: '请先到运维通知页，根据完整探针保存适配器选择器。',
         review_risk: '请先到安全风控页复查账号近期风险。',
@@ -290,6 +292,7 @@ const dictionaries = {
         blocked: 'Real-run 门禁尚未满足。',
       },
       realGateBlockers: {
+        invalid_lottery_target: '活动 URL 不可执行',
         no_calibrated_ready_account: '无校准账号',
         real_adapter_not_enabled: '适配器未启用',
         global_real_run_disabled: '总开关关闭',
@@ -506,6 +509,7 @@ const dictionaries = {
       workflowState: '执行状态',
       workflowIdle: '等待操作',
       noBilibiliTarget: '暂无 Bilibili 活动',
+      invalidBilibiliTargetsIgnored: '已忽略首页或测试 URL，请到任务编排添加真实视频或动态链接。',
       noProbeDraft: '没有可用的完整探针草稿',
       probeInProgress: '探针 {id} 执行中',
       shadowInProgress: 'Shadow {id} 执行中',
@@ -520,6 +524,8 @@ const dictionaries = {
       realRunReadyNotice: '真实执行门禁已就绪，请前往抽奖任务页选择活动和账号后确认执行。',
       workflowManualReview: '当前步骤需要人工复核，请按门禁提示处理。',
       bilibiliSteps: {
+        targetTitle: '有效活动',
+        targetDetail: '必须是可解析的 Bilibili 视频或动态抽奖链接，首页不能作为执行目标。',
         accountTitle: '安全账号',
         accountDetail: '至少需要一个已校准且有有效凭据的 Bilibili 账号。',
         probeTitle: '完整探针',
@@ -779,7 +785,7 @@ const dictionaries = {
       defaultScore: 'Default score',
       uploadTargets: 'Upload targets',
       targetList: 'Target list',
-      targetPlaceholder: 'One URL per line, or platform,url,score,expires_at\nhttps://www.bilibili.com/\nbilibili,https://t.bilibili.com/123,80,2026-06-30 23:59:59',
+      targetPlaceholder: 'One URL per line, or platform,url,score,expires_at\nhttps://www.bilibili.com/video/BV...\nbilibili,https://t.bilibili.com/123456789,80,2026-06-30 23:59:59',
       importTargets: 'Import targets',
       targetsImported: 'Targets imported: {created_count} created, {duplicate_count} duplicates, {invalid_count} invalid',
       targetFileLoaded: 'Target file loaded: {name}',
@@ -826,6 +832,7 @@ const dictionaries = {
       gateBlocked: 'Evidence missing',
       gateUnknown: 'Unknown',
       nextActions: {
+        add_target: 'Add a real target',
         add_account: 'Add account first',
         configure_adapter: 'Configure adapter',
         probe: 'Run probe first',
@@ -836,6 +843,7 @@ const dictionaries = {
         real_run: 'Dispatch real',
       },
       nextActionHints: {
+        add_target: 'Add a Bilibili video or dynamic activity URL first. Homepages and test URLs cannot be probed or executed.',
         add_account: 'Add and calibrate a Bilibili account on the Accounts page first.',
         configure_adapter: 'Save adapter selectors from a complete probe on the Ops page first.',
         review_risk: 'Review recent account risk on the Safety page first.',
@@ -843,6 +851,7 @@ const dictionaries = {
         blocked: 'The real-run gate is not satisfied yet.',
       },
       realGateBlockers: {
+        invalid_lottery_target: 'Target URL is not actionable',
         no_calibrated_ready_account: 'No calibrated account',
         real_adapter_not_enabled: 'Adapter disabled',
         global_real_run_disabled: 'Global switch off',
@@ -1059,6 +1068,7 @@ const dictionaries = {
       workflowState: 'Execution state',
       workflowIdle: 'Waiting',
       noBilibiliTarget: 'No Bilibili target',
+      invalidBilibiliTargetsIgnored: 'Homepage or test URLs were ignored. Add a real video or dynamic URL in Lottery Tasks.',
       noProbeDraft: 'No complete probe draft is available',
       probeInProgress: 'Probe {id} in progress',
       shadowInProgress: 'Shadow {id} in progress',
@@ -1073,6 +1083,8 @@ const dictionaries = {
       realRunReadyNotice: 'The real-run gate is ready. Open Lottery Tasks to choose the target and account, then confirm execution.',
       workflowManualReview: 'This step requires manual review. Follow the gate guidance before continuing.',
       bilibiliSteps: {
+        targetTitle: 'Actionable target',
+        targetDetail: 'Use a resolvable Bilibili video or dynamic giveaway URL. The homepage is not an execution target.',
         accountTitle: 'Safe account',
         accountDetail: 'At least one calibrated Bilibili account with valid credentials is required.',
         probeTitle: 'Complete probe',
