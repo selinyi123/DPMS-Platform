@@ -50,7 +50,7 @@ updated: 2026-06-09
 | --- | --- | --- |
 | `90c344d` | 增加 Bilibili 安全工作流动作 | [[DPMS_BilibiliSafeWorkflow_实施记录_20260609]] |
 | `89e7aa0` | 拒绝无效 Bilibili 抽奖目标 | [[DPMS_BilibiliTargetValidation_实施记录_20260609]] |
-| 本轮 | 建立 Obsidian 项目知识库与同步机制 | [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]] |
+| `90f6236` | 建立 Obsidian 项目知识库与同步机制 | [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]] |
 
 ## 记录原则
 
