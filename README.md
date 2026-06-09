@@ -60,3 +60,21 @@ npm run build
 - `docs/DPMS_能力演化路线图_v4-v9_20260605.md`
 - `docs/DPMS_EventStore_V4_实施记录_20260605.md`
 - `docs/DPMS_最终搭建审阅与漏洞清单_20260602.md`
+
+## Obsidian 活动记录
+
+项目活动记录同步到当前 Obsidian Vault 的 `DPMS-Platform` 目录。
+
+同步仓库文档、导航和历史恢复资料：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync_obsidian.ps1
+```
+
+仅执行 SHA-256 和 Wiki 链接完整性校验：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync_obsidian.ps1 -VerifyOnly
+```
+
+每个关键里程碑需要同时更新 `docs/` 实施记录、Obsidian 活动时间线和 GitHub 提交。
