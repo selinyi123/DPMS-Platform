@@ -1,5 +1,5 @@
 
-import sys, asyncio
+import sys, asyncio, warnings
 
 from pathlib import Path
 
@@ -36,7 +36,9 @@ async def lifespan(app: FastAPI):
 
     await database.connect()
     await redis.initialize()
-    await ensure_runtime_schema()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
+        await ensure_runtime_schema()
 
     # 启动时健康检查
 
@@ -83,15 +85,15 @@ async def ensure_runtime_schema():
     for statement in [
         "ALTER TABLE tracked_sources MODIFY source_type VARCHAR(32) NOT NULL",
         "ALTER TABLE lotteries MODIFY source_type VARCHAR(32) NOT NULL",
-        "ALTER TABLE lotteries ADD COLUMN title VARCHAR(256) NULL",
-        "ALTER TABLE lotteries ADD COLUMN rule_text TEXT NULL",
-        "ALTER TABLE lotteries ADD COLUMN action_plan JSON NULL",
-        "ALTER TABLE lotteries ADD COLUMN published_at TIMESTAMP NULL",
     ]:
         try:
             await database.execute(statement)
         except Exception as exc:
             structured_log("warning", "runtime_schema_alter_skipped", statement=statement, error=str(exc))
+    await ensure_column("lotteries", "title", "VARCHAR(256) NULL")
+    await ensure_column("lotteries", "rule_text", "TEXT NULL")
+    await ensure_column("lotteries", "action_plan", "JSON NULL")
+    await ensure_column("lotteries", "published_at", "TIMESTAMP NULL")
     await database.execute(
         """CREATE TABLE IF NOT EXISTS operators (
           id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -245,10 +247,7 @@ async def ensure_runtime_schema():
           INDEX idx_login_status (status, created_at)
         ) ENGINE=InnoDB"""
     )
-    try:
-        await database.execute("ALTER TABLE login_sessions ADD COLUMN provider_key VARCHAR(128) NULL AFTER login_url")
-    except Exception as exc:
-        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions ADD COLUMN provider_key", error=str(exc))
+    await ensure_column("login_sessions", "provider_key", "VARCHAR(128) NULL", after="login_url")
     try:
         await database.execute(
             """ALTER TABLE login_sessions
@@ -257,14 +256,8 @@ async def ensure_runtime_schema():
         )
     except Exception as exc:
         structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions MODIFY status", error=str(exc))
-    try:
-        await database.execute("ALTER TABLE task_runs ADD COLUMN screenshot_path VARCHAR(512) NULL")
-    except Exception as exc:
-        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE task_runs ADD COLUMN screenshot_path", error=str(exc))
-    try:
-        await database.execute("ALTER TABLE task_runs ADD COLUMN task_mode VARCHAR(32) NOT NULL DEFAULT 'dry_run' AFTER dry_run")
-    except Exception as exc:
-        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE task_runs ADD COLUMN task_mode", error=str(exc))
+    await ensure_column("task_runs", "screenshot_path", "VARCHAR(512) NULL")
+    await ensure_column("task_runs", "task_mode", "VARCHAR(32) NOT NULL DEFAULT 'dry_run'", after="dry_run")
     try:
         await database.execute("UPDATE task_runs SET task_mode = IF(dry_run = 1, 'dry_run', 'real_run') WHERE task_mode IS NULL OR task_mode = ''")
     except Exception as exc:
@@ -308,6 +301,22 @@ async def ensure_runtime_schema():
           INDEX idx_account_calibration_status (status, created_at)
         ) ENGINE=InnoDB"""
     )
+
+
+async def ensure_column(table: str, column: str, definition: str, after: str | None = None) -> None:
+    existing = await database.fetch_one(
+        """SELECT 1
+           FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = :table
+             AND COLUMN_NAME = :column
+           LIMIT 1""",
+        {"table": table, "column": column},
+    )
+    if existing:
+        return
+    after_clause = f" AFTER `{after}`" if after else ""
+    await database.execute(f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}{after_clause}")
 
 
 

@@ -68,6 +68,7 @@
 - Worker 容器验证：`liked`、`reposted` 计划只返回对应两个阶段。
 - 已校准账号只读访问 Bilibili 动态接口成功，候选数量为 0，未触发任何互动动作。
 - Docker 五个容器均为 `healthy`。
+- Core 启动迁移改为先检查字段是否存在，并抑制 `CREATE TABLE IF NOT EXISTS` 的预期驱动告警；重启日志中无 warning、error、Traceback 或 Exception。
 - 桌面与移动端浏览器验证通过，控制台 0 错误、0 警告。
 
 ## 安全边界
