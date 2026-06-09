@@ -40,6 +40,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`
 - 最近功能提交：`89e7aa0 Reject invalid Bilibili lottery targets`
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
+- Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - 当前生产策略：Real-run 默认关闭，证据不完整时禁止真实执行
 
 ## 快速导航
