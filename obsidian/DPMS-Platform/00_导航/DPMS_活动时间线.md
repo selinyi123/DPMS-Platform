@@ -52,7 +52,7 @@ updated: 2026-06-09
 | `89e7aa0` | 拒绝无效 Bilibili 抽奖目标 | [[DPMS_BilibiliTargetValidation_实施记录_20260609]] |
 | `90f6236` | 建立 Obsidian 项目知识库与同步机制 | [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]] |
 | `761051d` | 接入 Bilibili 官方二维码登录与身份校准 | [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]] |
-| 待提交 | 增加 Bilibili UP 动态发现与规则动作计划 | [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]] |
+| `04e4c1d` | 增加 Bilibili UP 动态发现与规则动作计划 | [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]] |
 
 ## 记录原则
 
