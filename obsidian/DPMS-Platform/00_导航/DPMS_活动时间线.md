@@ -60,6 +60,7 @@ updated: 2026-06-11
 | 提交 | 活动 | 关联记录 |
 | --- | --- | --- |
 | `443ae0f` | 清理 Bilibili 门禁审查发现问题 | [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]] |
+| `6a0a929` | 微博与小红书接入选择器驱动抽奖模块 | [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]] |
 
 ## 记录原则
 

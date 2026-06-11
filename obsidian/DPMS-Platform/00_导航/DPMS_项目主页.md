@@ -36,9 +36,10 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 
 - 当前运行版本：`v3.0.2-local`
 - 当前优先平台：Bilibili
+- 平台状态：微博、小红书已接入选择器驱动执行链路，处于 `calibration_required` 阶段；抖音保持 `planned`
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`
-- 最近功能提交：`443ae0f Clean up Bilibili gate review follow-ups`
+- 最近功能提交：`6a0a929 Add Weibo and Xiaohongshu lottery adapters`
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -58,6 +59,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
+- [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]
 
 ## 文档分区
 
