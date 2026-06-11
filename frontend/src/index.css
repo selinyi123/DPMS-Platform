@@ -771,6 +771,10 @@ button:disabled {
   color: #b91c1c;
 }
 
+.platform-tabs {
+  margin-top: 12px;
+}
+
 .table-wrap {
   width: 100%;
   overflow: auto;

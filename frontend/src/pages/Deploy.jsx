@@ -27,9 +27,11 @@ export default function Deploy() {
   const [selectorJson, setSelectorJson] = useState(defaultSelectorJson);
   const [selectorB64, setSelectorB64] = useState('');
   const [notify, setNotify] = useState({ channel: 'serverchan', title: 'DPMS test', content: 'Notification channel test' });
+  const [platforms, setPlatforms] = useState([]);
+  const [readinessPlatform, setReadinessPlatform] = useState('bilibili');
 
   const loadNotify = async () => {
-    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, taskRows, runtimeRows, evidenceRows] = await Promise.all([
+    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, taskRows, runtimeRows, evidenceRows, platformRows] = await Promise.all([
       fetchJSON('/notify/channels'),
       fetchJSON('/notify/status'),
       fetchJSON('/notify/config-guide'),
@@ -39,6 +41,7 @@ export default function Deploy() {
       fetchJSON('/lotteries/tasks/runs'),
       fetchJSON('/metrics/runtime/settings'),
       fetchJSON('/lotteries/real-run/evidence'),
+      fetchJSON('/accounts/platforms'),
     ]);
     setChannels(channelRows);
     setNotifyStatus(statusRows);
@@ -49,6 +52,7 @@ export default function Deploy() {
     setTaskRuns(taskRows);
     setRuntimeSettings(runtimeRows);
     setRealRunEvidence(evidenceRows.items || []);
+    setPlatforms(platformRows);
   };
 
   useEffect(() => {
@@ -213,47 +217,50 @@ export default function Deploy() {
     .map(probe => ({ probe, draft: buildDraftFromProbe(probe) }))
     .filter(item => item.draft && validTargetIds.has(item.probe.lottery_id));
 
-  const bilibiliEvidence = realRunEvidence.find(item => (
-    item.platform === 'bilibili'
-    && item.target_valid
-    && ['pending', 'claimed'].includes(item.status)
-  ));
-  const bilibiliPlatformEvidence = realRunEvidence.find(item => item.platform === 'bilibili');
-  const invalidBilibiliTarget = realRunEvidence.find(item => item.platform === 'bilibili' && !item.target_valid);
-  const bilibiliAdapter = adapterConfig?.platforms?.find(item => item.platform === 'bilibili');
-  const bilibiliProbeCandidate = probeCandidates.find(item => (
-    item.probe.platform === 'bilibili'
-    && item.probe.lottery_id === bilibiliEvidence?.lottery_id
-  ));
-  const bilibiliSelectorDraftReady = hasBilibiliSelectorDraft(selectorJson);
-  const bilibiliNextAction = bilibiliEvidence?.next_action || 'add_target';
-  const bilibiliActiveProbe = probes.find(item => (
-    item.platform === 'bilibili'
-    && item.lottery_id === bilibiliEvidence?.lottery_id
-    && ['queued', 'running'].includes(item.status)
-  ));
-  const bilibiliActiveShadow = taskRuns.find(item => (
-    item.platform === 'bilibili'
-    && item.lottery_id === bilibiliEvidence?.lottery_id
-    && item.task_mode === 'shadow_run'
-    && ['queued', 'running'].includes(item.status)
-  ));
-  const bilibiliWorkflowActive = Boolean(bilibiliActiveProbe || bilibiliActiveShadow);
-  const bilibiliReadiness = buildBilibiliReadiness({
-    evidence: bilibiliEvidence,
-    platformEvidence: bilibiliPlatformEvidence,
-    adapter: bilibiliAdapter,
-    runtimeSettings,
-    probeCandidate: bilibiliProbeCandidate,
-  });
+  const buildPlatformWorkflow = (platform) => {
+    const evidence = realRunEvidence.find(item => (
+      item.platform === platform
+      && item.target_valid
+      && ['pending', 'claimed'].includes(item.status)
+    ));
+    const platformEvidence = realRunEvidence.find(item => item.platform === platform);
+    const invalidTarget = realRunEvidence.find(item => item.platform === platform && !item.target_valid);
+    const adapter = adapterConfig?.platforms?.find(item => item.platform === platform);
+    const probeCandidate = probeCandidates.find(item => (
+      item.probe.platform === platform
+      && item.probe.lottery_id === evidence?.lottery_id
+    ));
+    const selectorDraftReady = hasSelectorDraft(selectorJson, platform);
+    const nextAction = evidence?.next_action || 'add_target';
+    const activeProbe = probes.find(item => (
+      item.platform === platform
+      && item.lottery_id === evidence?.lottery_id
+      && ['queued', 'running'].includes(item.status)
+    ));
+    const activeShadow = taskRuns.find(item => (
+      item.platform === platform
+      && item.lottery_id === evidence?.lottery_id
+      && item.task_mode === 'shadow_run'
+      && ['queued', 'running'].includes(item.status)
+    ));
+    const workflowActive = Boolean(activeProbe || activeShadow);
+    const readiness = buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate });
+    return {
+      evidence, platformEvidence, invalidTarget, adapter, probeCandidate,
+      selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive, readiness,
+    };
+  };
+
+  const workflow = buildPlatformWorkflow(readinessPlatform);
+  const readinessPlatformLabel = platforms.find(item => item.id === readinessPlatform)?.label || readinessPlatform;
 
   useEffect(() => {
-    if (!bilibiliWorkflowActive) return undefined;
+    if (!workflow.workflowActive) return undefined;
     const timer = window.setInterval(() => {
       loadNotify().catch(err => setMessage(err.message));
     }, 4000);
     return () => window.clearInterval(timer);
-  }, [bilibiliWorkflowActive]);
+  }, [workflow.workflowActive]);
 
   const useProbeDraft = (item) => {
     setSelectorJson(JSON.stringify(item.draft, null, 2));
@@ -263,24 +270,25 @@ export default function Deploy() {
     toast(text, 'success');
   };
 
-  const advanceBilibiliWorkflow = async () => {
-    if (!bilibiliEvidence) {
-      const text = t('deploy.noBilibiliTarget');
+  const advanceWorkflow = async () => {
+    const { evidence, probeCandidate } = workflow;
+    if (!evidence) {
+      const text = formatText(t('deploy.noTargetForPlatform'), { platform: readinessPlatformLabel });
       setMessage(text);
       toast(text, 'error');
       return;
     }
 
-    const action = bilibiliEvidence.next_action;
-    const lotteryId = bilibiliEvidence.lottery_id;
+    const action = evidence.next_action;
+    const lotteryId = evidence.lottery_id;
     setWorkflowBusy(true);
     try {
       let result;
       if (action === 'probe') {
         result = await postJSON(`/lotteries/${lotteryId}/probe`, { account_id: null });
       } else if (action === 'configure_adapter') {
-        if (!bilibiliProbeCandidate) throw new Error(t('deploy.noProbeDraft'));
-        useProbeDraft(bilibiliProbeCandidate);
+        if (!probeCandidate) throw new Error(t('deploy.noProbeDraft'));
+        useProbeDraft(probeCandidate);
         document.querySelector('.probe-candidate-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         return;
       } else if (action === 'shadow_run') {
@@ -298,9 +306,9 @@ export default function Deploy() {
         window.scrollTo({ top: 0, behavior: 'smooth' });
         return;
       } else {
-        const text = bilibiliEvidence.allowed ? t('deploy.realRunReadyNotice') : t('deploy.workflowManualReview');
+        const text = evidence.allowed ? t('deploy.realRunReadyNotice') : t('deploy.workflowManualReview');
         setMessage(text);
-        toast(text, bilibiliEvidence.allowed ? 'success' : 'warning');
+        toast(text, evidence.allowed ? 'success' : 'warning');
         return;
       }
 
@@ -470,47 +478,59 @@ export default function Deploy() {
       <div className="panel">
         <div className="notify-guide-head">
           <div>
-            <div className="panel-title">{t('deploy.bilibiliReadiness')}</div>
-            <p className="muted-text tight-text">{t('deploy.bilibiliReadinessHint')}</p>
+            <div className="panel-title">{formatText(t('deploy.realRunReadiness'), { platform: readinessPlatformLabel })}</div>
+            <p className="muted-text tight-text">{t('deploy.realRunReadinessHint')}</p>
           </div>
-          <span className={`badge ${bilibiliEvidence?.allowed ? 'badge-ready' : 'badge-warn'}`}>
-            {bilibiliEvidence?.allowed ? t('deploy.readyForReal') : t(`lotteries.nextActions.${bilibiliNextAction}`)}
+          <span className={`badge ${workflow.evidence?.allowed ? 'badge-ready' : 'badge-warn'}`}>
+            {workflow.evidence?.allowed ? t('deploy.readyForReal') : t(`lotteries.nextActions.${workflow.nextAction}`)}
           </span>
+        </div>
+        <div className="segmented platform-tabs">
+          {platforms.map(platform => (
+            <button
+              key={platform.id}
+              type="button"
+              className={readinessPlatform === platform.id ? 'active' : ''}
+              onClick={() => setReadinessPlatform(platform.id)}
+            >
+              {platform.label}
+            </button>
+          ))}
         </div>
         <div className="bilibili-workflow-bar">
           <div>
             <div className="panel-kicker">{t('deploy.workflowTarget')}</div>
             <div className="mono">
-              {bilibiliEvidence ? `L${bilibiliEvidence.lottery_id} / bilibili` : t('deploy.noBilibiliTarget')}
+              {workflow.evidence ? `L${workflow.evidence.lottery_id} / ${readinessPlatform}` : formatText(t('deploy.noTargetForPlatform'), { platform: readinessPlatformLabel })}
             </div>
-            {!bilibiliEvidence && invalidBilibiliTarget && (
-              <div className="small-text notify-error">{t('deploy.invalidBilibiliTargetsIgnored')}</div>
+            {!workflow.evidence && workflow.invalidTarget && (
+              <div className="small-text notify-error">{t('deploy.invalidTargetsIgnored')}</div>
             )}
           </div>
           <div>
             <div className="panel-kicker">{t('deploy.currentSafeAction')}</div>
-            <div>{t(`lotteries.nextActions.${bilibiliNextAction}`)}</div>
+            <div>{t(`lotteries.nextActions.${workflow.nextAction}`)}</div>
           </div>
           <div>
             <div className="panel-kicker">{t('deploy.workflowState')}</div>
             <div>
-              {bilibiliActiveProbe
-                ? formatText(t('deploy.probeInProgress'), { id: bilibiliActiveProbe.probe_id?.slice(0, 8) })
-                : bilibiliActiveShadow
-                  ? formatText(t('deploy.shadowInProgress'), { id: bilibiliActiveShadow.task_id?.slice(0, 8) })
+              {workflow.activeProbe
+                ? formatText(t('deploy.probeInProgress'), { id: workflow.activeProbe.probe_id?.slice(0, 8) })
+                : workflow.activeShadow
+                  ? formatText(t('deploy.shadowInProgress'), { id: workflow.activeShadow.task_id?.slice(0, 8) })
                   : t('deploy.workflowIdle')}
             </div>
           </div>
         </div>
         <div className="bilibili-readiness-grid">
-          {bilibiliReadiness.map(step => (
+          {workflow.readiness.map(step => (
             <div className="bilibili-readiness-step" key={step.code}>
               <div>
                 <span className={`badge ${step.ready ? 'badge-ready' : step.severity === 'danger' ? 'badge-danger' : 'badge-warn'}`}>
                   {step.ready ? t('deploy.ready') : t('deploy.needsAction')}
                 </span>
-                <div className="action-title">{t(`deploy.bilibiliSteps.${step.code}Title`)}</div>
-                <p className="muted-text tight-text">{t(`deploy.bilibiliSteps.${step.code}Detail`)}</p>
+                <div className="action-title">{t(`deploy.readinessSteps.${step.code}Title`)}</div>
+                <p className="muted-text tight-text">{formatText(t(`deploy.readinessSteps.${step.code}Detail`), { platform: readinessPlatformLabel })}</p>
               </div>
               <div className="small-text mono">{step.meta}</div>
             </div>
@@ -522,36 +542,36 @@ export default function Deploy() {
             type="button"
             disabled={
               workflowBusy
-              || Boolean(bilibiliActiveProbe)
-              || Boolean(bilibiliActiveShadow)
-              || !bilibiliEvidence
-              || ['add_account', 'review_risk', 'blocked'].includes(bilibiliEvidence?.next_action)
+              || Boolean(workflow.activeProbe)
+              || Boolean(workflow.activeShadow)
+              || !workflow.evidence
+              || ['add_account', 'review_risk', 'blocked'].includes(workflow.evidence?.next_action)
             }
-            onClick={advanceBilibiliWorkflow}
+            onClick={advanceWorkflow}
           >
             {workflowBusy
               ? t('deploy.workflowSubmitting')
-              : bilibiliActiveProbe
+              : workflow.activeProbe
                 ? t('deploy.probeRunning')
-                : bilibiliActiveShadow
+                : workflow.activeShadow
                   ? t('deploy.shadowRunning')
-                  : bilibiliEvidence?.next_action === 'real_run'
+                  : workflow.evidence?.next_action === 'real_run'
                     ? t('deploy.reviewRealRunTask')
-                    : bilibiliEvidence?.next_action === 'enable_real_run'
+                    : workflow.evidence?.next_action === 'enable_real_run'
                       ? t('deploy.reviewRealRunSwitchButton')
                       : formatText(t('deploy.runSafeNextStep'), {
-                          action: t(`lotteries.nextActions.${bilibiliNextAction}`),
+                          action: t(`lotteries.nextActions.${workflow.nextAction}`),
                         })}
           </button>
           <button
             className="btn-ghost"
             type="button"
-            disabled={!bilibiliProbeCandidate}
-            onClick={() => useProbeDraft(bilibiliProbeCandidate)}
+            disabled={!workflow.probeCandidate}
+            onClick={() => useProbeDraft(workflow.probeCandidate)}
           >
-            {t('deploy.loadBilibiliProbeDraft')}
+            {t('deploy.loadProbeDraft')}
           </button>
-          <button className="btn-ghost" type="button" disabled={!bilibiliSelectorDraftReady} onClick={saveSelectorConfig}>
+          <button className="btn-ghost" type="button" disabled={!workflow.selectorDraftReady} onClick={saveSelectorConfig}>
             {t('deploy.saveRuntimeSelectors')}
           </button>
           <button className="btn-ghost" type="button" onClick={loadNotify}>
@@ -827,7 +847,7 @@ function probeReadyPhaseCount(probe) {
   return result?._summary?.ready_phase_count ?? Object.keys(buildDraftFromProbe(probe)?.[probe.platform] || {}).length;
 }
 
-function buildBilibiliReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
+function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
   const blockers = new Set(evidence?.blockers || []);
   const phaseCount = probeCandidate ? probeReadyPhaseCount(probeCandidate.probe) : 0;
   return [
@@ -878,9 +898,9 @@ function safeJson(value) {
   }
 }
 
-function hasBilibiliSelectorDraft(value) {
+function hasSelectorDraft(value, platform) {
   const parsed = safeJson(value);
-  return Boolean(parsed?.bilibili && Object.keys(parsed.bilibili).length);
+  return Boolean(parsed?.[platform] && Object.keys(parsed[platform]).length);
 }
 
 function formatText(template, values) {
