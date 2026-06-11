@@ -7,8 +7,10 @@ import Accounts from './pages/Accounts';
 import Dashboard from './pages/Dashboard';
 import Deploy from './pages/Deploy';
 import EventTimeline from './pages/EventTimeline';
+import Knowledge from './pages/Knowledge';
 import Lotteries from './pages/Lotteries';
 import RiskCenter from './pages/RiskCenter';
+import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
 import { useUi } from './uiContext';
 
@@ -16,6 +18,8 @@ const pages = {
   dashboard: { Component: Dashboard },
   accounts: { Component: Accounts },
   lotteries: { Component: Lotteries },
+  strategy: { Component: Strategy },
+  knowledge: { Component: Knowledge },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },
