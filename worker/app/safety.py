@@ -20,7 +20,13 @@ RISK_TEXTS = [
     "\u64cd\u4f5c\u9891\u7e41",
     "\u8d26\u53f7\u5f02\u5e38",
 ]
-LOGIN_URL_MARKERS = ("passport.bilibili.com/login", "/passport/web/login", "/signin/login")
+LOGIN_URL_MARKERS = (
+    "passport.bilibili.com/login",
+    "/passport/web/login",
+    "/signin/login",
+    "passport.weibo.com",
+    "xiaohongshu.com/login",
+)
 
 
 async def ensure_account_can_run(account_id: int) -> None:

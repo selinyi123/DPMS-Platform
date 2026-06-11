@@ -25,8 +25,66 @@ class LotteryTargetValidationTests(unittest.TestCase):
                 self.assertFalse(result.valid)
                 self.assertEqual("bilibili_actionable_url_required", result.reason)
 
+    def test_accepts_weibo_status_urls(self):
+        for url in (
+            "https://weibo.com/3937348351/PCAGRFqKj",
+            "https://weibo.com/detail/4890123456789012",
+            "https://m.weibo.cn/status/4890123456789012",
+            "https://m.weibo.cn/detail/PCAGRFqKj",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("weibo", url)
+                self.assertTrue(result.valid)
+                self.assertEqual("status", result.kind)
+
+    def test_accepts_weibo_short_link(self):
+        result = validate_lottery_target("weibo", "https://t.cn/A6abcdef")
+        self.assertTrue(result.valid)
+        self.assertEqual("short_link", result.kind)
+
+    def test_rejects_weibo_homepage_and_profiles(self):
+        for url in (
+            "https://weibo.com/",
+            "https://weibo.com/u/3937348351",
+            "https://weibo.com/n/somebody",
+            "https://weibo.com/hot/weibo",
+            "https://weibo.com/3937348351",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("weibo", url)
+                self.assertFalse(result.valid)
+                self.assertEqual("weibo_actionable_url_required", result.reason)
+
+    def test_accepts_xiaohongshu_note_urls(self):
+        for url in (
+            "https://www.xiaohongshu.com/explore/64f1a2b3c4d5e6f7a8b9c0d1",
+            "https://www.xiaohongshu.com/explore/64f1a2b3c4d5e6f7a8b9c0d1?xsec_token=AB1234",
+            "https://www.xiaohongshu.com/discovery/item/64f1a2b3c4d5e6f7a8b9c0d1",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("xiaohongshu", url)
+                self.assertTrue(result.valid)
+                self.assertEqual("note", result.kind)
+
+    def test_accepts_xiaohongshu_short_link(self):
+        result = validate_lottery_target("xiaohongshu", "http://xhslink.com/a/AbC123def")
+        self.assertTrue(result.valid)
+        self.assertEqual("short_link", result.kind)
+
+    def test_rejects_xiaohongshu_homepage_and_profiles(self):
+        for url in (
+            "https://www.xiaohongshu.com/",
+            "https://www.xiaohongshu.com/explore",
+            "https://www.xiaohongshu.com/user/profile/5ff0e6410000000001008400",
+            "https://www.xiaohongshu.com/explore/not-a-note-id",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("xiaohongshu", url)
+                self.assertFalse(result.valid)
+                self.assertEqual("xiaohongshu_actionable_url_required", result.reason)
+
     def test_keeps_other_platform_urls_generic(self):
-        result = validate_lottery_target("weibo", "https://weibo.com/123")
+        result = validate_lottery_target("douyin", "https://www.douyin.com/video/7300000000000000000")
         self.assertTrue(result.valid)
         self.assertEqual("generic", result.kind)
 

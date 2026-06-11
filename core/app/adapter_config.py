@@ -6,6 +6,7 @@ from app.db import database
 
 
 PHASES = ("followed", "liked", "commented", "reposted")
+STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu")
 SELECTOR_ENV = "DPMS_ADAPTER_SELECTORS"
 SELECTOR_B64_ENV = "DPMS_ADAPTER_SELECTORS_B64"
 
@@ -56,12 +57,10 @@ async def platform_has_real_adapter_async(platform: str) -> bool:
 def selector_config_complete(platform: str, configured: dict) -> bool:
     if not isinstance(configured, dict):
         return False
-    if platform == "bilibili" and not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
+    if platform not in STRUCTURED_SELECTOR_PLATFORMS:
+        return all(bool(configured.get(phase)) for phase in PHASES)
+    if not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
         return False
-    if platform != "bilibili" and not all(bool(configured.get(phase)) for phase in PHASES):
-        return False
-    if platform != "bilibili":
-        return True
     comment = configured.get("commented")
     if not isinstance(comment, dict):
         return False

@@ -7,7 +7,7 @@ from app.db import database
 from app.services.bilibili_discovery import fetch_bilibili_space_dynamics
 from app.utils.cookies import parse_cookie_payload
 from app.utils.crypto import cookie_vault
-from app.utils.canonicalizer import BilibiliCanonicalizer, GenericCanonicalizer
+from app.utils.canonicalizer import canonicalize_platform_url
 from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
 
@@ -128,9 +128,7 @@ def extract_urls(value: str) -> list[str]:
 
 
 async def canonicalize_url(platform: str, raw_url: str) -> str:
-    if platform == "bilibili":
-        return (await BilibiliCanonicalizer.canonicalize(raw_url)).to_uri()
-    return await GenericCanonicalizer.canonicalize(platform, raw_url)
+    return await canonicalize_platform_url(platform, raw_url)
 
 
 def score_lottery(source, raw_url: str, candidate: dict | None = None) -> int:

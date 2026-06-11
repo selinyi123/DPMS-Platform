@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 
+from app.adapter_config import STRUCTURED_SELECTOR_PLATFORMS
 from app.adapters.registry import get_adapter
 from app.db import database, redis
 from app.event_store.service import record_event
@@ -164,10 +165,10 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
         candidates = result.get(phase) if isinstance(result.get(phase), list) else []
         visible = [item for item in candidates if item.get("visible") and item.get("selector")]
         ready = bool(visible)
-        if platform == "bilibili" and phase == "commented":
+        if platform in STRUCTURED_SELECTOR_PLATFORMS and phase == "commented":
             ready = bool(
                 first_selector_matching(visible, ["textarea", "contenteditable", "placeholder", "textbox"])
-                and first_selector_matching(visible, ["button", "\u53d1\u5e03", "\u8bc4\u8bba", "submit", "publish"])
+                and first_selector_matching(visible, ["button", "\u53d1\u5e03", "\u8bc4\u8bba", "\u53d1\u9001", "submit", "publish"])
             )
         phase_status[phase] = {
             "candidate_count": len(candidates),
@@ -197,7 +198,7 @@ def build_recommended_config(platform: str, result: dict) -> dict:
 
     comment_candidates = [item for item in result.get("commented", []) if item.get("visible") and item.get("selector")]
     input_selector = first_selector_matching(comment_candidates, ["textarea", "contenteditable", "placeholder"])
-    submit_selector = first_selector_matching(comment_candidates, ["button", "发布", "评论", "submit", "publish"])
+    submit_selector = first_selector_matching(comment_candidates, ["button", "发布", "评论", "发送", "submit", "publish"])
     if input_selector and submit_selector and input_selector != submit_selector:
         phases["commented"] = {"input": [input_selector], "submit": [submit_selector], "text": "\u53c2\u4e0e\u62bd\u5956"}
 

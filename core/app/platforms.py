@@ -22,7 +22,7 @@ PLATFORMS = {
         "qr_login": True,
         "cookie_login": True,
         "action_adapter": False,
-        "adapter_status": "planned",
+        "adapter_status": "calibration_required",
     },
     "douyin": {
         "label": "Douyin",
@@ -44,7 +44,7 @@ PLATFORMS = {
         "qr_login": True,
         "cookie_login": True,
         "action_adapter": False,
-        "adapter_status": "planned",
+        "adapter_status": "calibration_required",
     },
 }
 

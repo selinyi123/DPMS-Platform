@@ -2,32 +2,34 @@ from app.adapters.selector_flow import SelectorFlowAdapter
 
 
 FOLLOW_TEXT = "关注"
-LIKE_TEXT = "点赞"
-PUBLISH_TEXT = "发布"
+LIKE_TEXT = "赞"
+COMMENT_TEXT = "评论"
 FORWARD_TEXT = "转发"
+PUBLISH_TEXT = "发布"
 
 
-class BilibiliAdapter(SelectorFlowAdapter):
-    PLATFORM = "bilibili"
+class WeiboAdapter(SelectorFlowAdapter):
+    PLATFORM = "weibo"
     DEFAULT_SELECTOR_PROBES = {
         "followed": [
             f"button:has-text('{FOLLOW_TEXT}')",
-            f"[class*='follow-btn']:has-text('{FOLLOW_TEXT}')",
-            f"[class*='follow-button']:has-text('{FOLLOW_TEXT}')",
+            f"[class*='follow']:has-text('{FOLLOW_TEXT}')",
+            f"[title*='{FOLLOW_TEXT}']",
         ],
         "liked": [
-            f"[aria-label*='{LIKE_TEXT}']",
+            f"[title*='{LIKE_TEXT}']",
             "button[class*='like']",
-            "[class*='like-button']",
+            "[class*='woo-like']",
         ],
         "commented": [
+            f"textarea[placeholder*='{COMMENT_TEXT}']",
             "textarea",
-            "[contenteditable='true'][role='textbox']",
+            f"button:has-text('{COMMENT_TEXT}')",
             f"button:has-text('{PUBLISH_TEXT}')",
         ],
         "reposted": [
             f"button:has-text('{FORWARD_TEXT}')",
-            "button[class*='share']",
-            "[class*='share-button']",
+            f"[title*='{FORWARD_TEXT}']",
+            "[class*='retweet']",
         ],
     }

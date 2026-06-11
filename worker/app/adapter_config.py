@@ -4,6 +4,7 @@ from base64 import b64decode
 
 
 PHASES = ("followed", "liked", "commented", "reposted")
+STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu")
 SELECTOR_ENV = "DPMS_ADAPTER_SELECTORS"
 SELECTOR_B64_ENV = "DPMS_ADAPTER_SELECTORS_B64"
 
@@ -35,12 +36,10 @@ def selectors_for(platform: str) -> dict:
 
 def has_complete_selectors(platform: str) -> bool:
     configured = selectors_for(platform)
-    if platform == "bilibili" and not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
+    if platform not in STRUCTURED_SELECTOR_PLATFORMS:
+        return all(bool(configured.get(phase)) for phase in PHASES)
+    if not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
         return False
-    if platform != "bilibili" and not all(bool(configured.get(phase)) for phase in PHASES):
-        return False
-    if platform != "bilibili":
-        return True
     comment = configured.get("commented")
     if not isinstance(comment, dict):
         return False

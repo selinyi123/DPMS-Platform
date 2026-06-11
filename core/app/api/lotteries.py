@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 
 from app.adapter_config import (
     PHASES as ADAPTER_PHASES,
+    STRUCTURED_SELECTOR_PLATFORMS,
     click_selectors,
     load_runtime_selector_config,
     selector_config_complete,
@@ -35,7 +36,7 @@ from app.security import (
     require_confirmation,
     require_min_role,
 )
-from app.utils.canonicalizer import BilibiliCanonicalizer, GenericCanonicalizer
+from app.utils.canonicalizer import canonicalize_platform_url
 from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
 
@@ -1413,7 +1414,7 @@ def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
 
 def phase_configured(platform: str, config: dict, phase: str) -> bool:
     value = config.get(phase) if isinstance(config, dict) else None
-    if platform != "bilibili":
+    if platform not in STRUCTURED_SELECTOR_PLATFORMS:
         return bool(value)
     if phase == "commented":
         return isinstance(value, dict) and bool(
@@ -1500,13 +1501,15 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
 
 
 async def emit_real_run_gate_notification(lottery, reason, *, actor_id: str | None = None):
-    if lottery["platform"] != "bilibili":
+    platform = lottery["platform"]
+    if platform not in STRUCTURED_SELECTOR_PLATFORMS:
         return
+    platform_label = (get_platform(platform) or {}).get("label", platform)
 
     blockers = extract_real_run_blockers(reason)
     next_action = next_action_for_blockers(blockers)
     content_lines = [
-        f"Platform: {lottery['platform']}",
+        f"Platform: {platform}",
         f"Lottery: L{lottery['id']}",
         f"URL: {lottery['canonical_url'] or lottery['raw_url']}",
         f"Next action: {next_action}",
@@ -1522,9 +1525,9 @@ async def emit_real_run_gate_notification(lottery, reason, *, actor_id: str | No
         await redis.xadd(
             "notify_events",
             {
-                "event_type": "bilibili.real_run_gate.blocked",
+                "event_type": f"{platform}.real_run_gate.blocked",
                 "severity": "warning",
-                "title": f"Bilibili real-run gate blocked: L{lottery['id']}",
+                "title": f"{platform_label} real-run gate blocked: L{lottery['id']}",
                 "content": "\n".join(content_lines),
                 "channels": "all",
             },
@@ -1708,9 +1711,7 @@ def looks_like_url(value: str) -> bool:
 
 
 async def canonicalize_lottery_url(platform: str, raw_url: str) -> str:
-    if platform == "bilibili":
-        return (await BilibiliCanonicalizer.canonicalize(raw_url)).to_uri()
-    return await GenericCanonicalizer.canonicalize(platform, raw_url)
+    return await canonicalize_platform_url(platform, raw_url)
 
 
 def parse_int(value: str, default: int) -> int:

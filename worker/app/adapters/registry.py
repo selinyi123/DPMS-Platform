@@ -1,6 +1,8 @@
 from app.adapters.base import BaseAdapter
 from app.adapters.bilibili import BilibiliAdapter
-from app.adapters.planned import DouyinAdapter, WeiboAdapter, XiaohongshuAdapter
+from app.adapters.planned import DouyinAdapter
+from app.adapters.weibo import WeiboAdapter
+from app.adapters.xiaohongshu import XiaohongshuAdapter
 
 
 class UnsupportedAdapter(BaseAdapter):

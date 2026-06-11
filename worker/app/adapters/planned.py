@@ -2,7 +2,7 @@ from playwright.async_api import Page
 
 from app.adapter_config import has_complete_selectors, selectors_for
 from app.adapters.base import BaseAdapter, UnsupportedPlatformAction
-from app.adapters.bilibili import click_first_visible
+from app.adapters.selector_flow import click_first_visible
 from app.behavior_engine import BehaviorEngine
 from app.utils.log import structured_log
 
@@ -81,31 +81,11 @@ def complete_selectors(configured: dict) -> bool:
     return all(bool(configured.get(phase)) for phase in ("followed", "liked", "commented", "reposted"))
 
 
-class WeiboAdapter(ConfigurableSelectorAdapter):
-    PLATFORM = "weibo"
-    DEFAULT_SELECTOR_PROBES = {
-        "followed": ["text=\u5173\u6ce8", "button:has-text('\u5173\u6ce8')", "[class*='follow']"],
-        "liked": ["text=\u8d5e", "[class*='like']", "[aria-label*='\u8d5e']"],
-        "commented": ["textarea", "[contenteditable='true']", "button:has-text('\u8bc4\u8bba')"],
-        "reposted": ["text=\u8f6c\u53d1", "button:has-text('\u8f6c\u53d1')", "[class*='forward']"],
-    }
-
-
 class DouyinAdapter(ConfigurableSelectorAdapter):
     PLATFORM = "douyin"
     DEFAULT_SELECTOR_PROBES = {
-        "followed": ["text=\u5173\u6ce8", "button:has-text('\u5173\u6ce8')", "[class*='follow']"],
-        "liked": ["[class*='like']", "[aria-label*='\u70b9\u8d5e']", "text=\u70b9\u8d5e"],
-        "commented": ["textarea", "[contenteditable='true']", "[placeholder*='\u8bc4\u8bba']"],
-        "reposted": ["text=\u5206\u4eab", "button:has-text('\u5206\u4eab')", "[class*='share']"],
-    }
-
-
-class XiaohongshuAdapter(ConfigurableSelectorAdapter):
-    PLATFORM = "xiaohongshu"
-    DEFAULT_SELECTOR_PROBES = {
-        "followed": ["text=\u5173\u6ce8", "button:has-text('\u5173\u6ce8')", "[class*='follow']"],
-        "liked": ["[class*='like']", "[aria-label*='\u70b9\u8d5e']", "text=\u70b9\u8d5e"],
-        "commented": ["textarea", "[contenteditable='true']", "[placeholder*='\u8bc4\u8bba']"],
-        "reposted": ["text=\u5206\u4eab", "button:has-text('\u5206\u4eab')", "[class*='share']"],
+        "followed": ["text=关注", "button:has-text('关注')", "[class*='follow']"],
+        "liked": ["[class*='like']", "[aria-label*='点赞']", "text=点赞"],
+        "commented": ["textarea", "[contenteditable='true']", "[placeholder*='评论']"],
+        "reposted": ["text=分享", "button:has-text('分享')", "[class*='share']"],
     }

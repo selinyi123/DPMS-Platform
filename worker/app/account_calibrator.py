@@ -195,8 +195,16 @@ async def mark_account_login_required(account_id: int, reason: str):
 
 
 async def verify_platform_identity(ctx, platform: str) -> dict:
-    if platform != "bilibili":
-        return {"verified": True, "method": "required_cookies"}
+    if platform == "bilibili":
+        return await verify_bilibili_identity(ctx)
+    if platform == "weibo":
+        return await verify_weibo_identity(ctx)
+    if platform == "xiaohongshu":
+        return await verify_xiaohongshu_identity(ctx)
+    return {"verified": True, "method": "required_cookies"}
+
+
+async def verify_bilibili_identity(ctx) -> dict:
     response = await ctx.request.get(
         "https://api.bilibili.com/x/web-interface/nav",
         headers={"Referer": "https://www.bilibili.com/"},
@@ -214,6 +222,45 @@ async def verify_platform_identity(ctx, platform: str) -> dict:
         "mid": str(data["mid"]),
         "level": int(data.get("level_info", {}).get("current_level") or 0),
     }
+
+
+async def verify_weibo_identity(ctx) -> dict:
+    response = await ctx.request.get(
+        "https://m.weibo.cn/api/config",
+        headers={"Referer": "https://m.weibo.cn/"},
+        timeout=15000,
+    )
+    if not response.ok:
+        raise ValueError(f"Weibo identity check failed with HTTP {response.status}")
+    payload = await response.json()
+    data = payload.get("data") or {}
+    if not data.get("login") or not data.get("uid"):
+        raise ValueError("Weibo credential is not authenticated")
+    return {"verified": True, "method": "weibo_config", "uid": str(data["uid"])}
+
+
+async def verify_xiaohongshu_identity(ctx) -> dict:
+    # The me endpoint may require extra signed headers depending on platform
+    # rollout; degrade to required-cookie verification instead of failing the
+    # calibration when the API shape is unavailable.
+    try:
+        response = await ctx.request.get(
+            "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
+            headers={"Referer": "https://www.xiaohongshu.com/"},
+            timeout=15000,
+        )
+        if not response.ok:
+            return {"verified": True, "method": "required_cookies", "note": f"identity_api_http_{response.status}"}
+        payload = await response.json()
+    except Exception:
+        return {"verified": True, "method": "required_cookies", "note": "identity_api_unavailable"}
+    data = payload.get("data") or {}
+    if data.get("guest"):
+        raise ValueError("Xiaohongshu credential is not authenticated")
+    user_id = data.get("user_id") or data.get("userId")
+    if payload.get("success") and user_id:
+        return {"verified": True, "method": "xiaohongshu_me", "user_id": str(user_id)}
+    return {"verified": True, "method": "required_cookies", "note": "identity_api_unverified"}
 
 
 async def emit_calibration_notification(account_id: int, calibration_id: str, status: str, content: str, severity: str):
