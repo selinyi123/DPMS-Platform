@@ -28,6 +28,17 @@ from app.models.schemas import (
     TrackedSourceCreate,
 )
 from app.platforms import get_platform, get_platforms
+from app.strategy.engine import (
+    account_tier,
+    choose_strategy_mode,
+    empty_platform_knowledge,
+    estimate_trust_score,
+    estimate_win_probability,
+    first_or_none,
+    priority_tier,
+    strategy_knowledge_confidence,
+    strategy_score,
+)
 from app.services.discovery import run_discovery
 from app.services.lottery_rules import parse_lottery_rule
 from app.security import (
@@ -345,6 +356,7 @@ async def strategy_queue(limit: int = 20):
                 "status": item["status"],
                 "value_score": item["value_score"],
                 "strategy_score": score,
+                "priority_tier": priority_tier(score) if recommended_mode != "blocked" else "hold",
                 "expected_value": expected_value,
                 "estimated_win_probability": estimated_win_probability,
                 "trust_score": trust_score,
@@ -1037,83 +1049,6 @@ def resolve_task_mode(data: DispatchTaskRequest) -> str:
     return "dry_run" if data.dry_run else "real_run"
 
 
-def choose_strategy_mode(
-    *,
-    safe_accounts: int,
-    active_runs: int,
-    dry_success: int,
-    shadow_success: int,
-    adapter_ready: bool,
-    probe_ready: bool,
-    real_run_enabled: bool,
-    breaker_allowed: bool,
-    breaker_reason: str | None,
-) -> tuple[str, list[str], list[str]]:
-    reasons = []
-    blockers = []
-    if active_runs > 0:
-        return "blocked", ["active_run_in_progress"], ["target already has an active run"]
-    if safe_accounts <= 0:
-        return "blocked", ["no_safe_account"], ["no calibrated ready account"]
-    if not breaker_allowed:
-        return "blocked", ["circuit_breaker_open"], [breaker_reason or "circuit breaker open"]
-    if dry_success <= 0:
-        return "dry_run", ["dry_validation_needed"], blockers
-    if shadow_success <= 0:
-        return "shadow_run", ["shadow_validation_needed"], blockers
-    if adapter_ready and probe_ready and real_run_enabled:
-        return "real_run", ["real_gate_ready"], blockers
-    if not adapter_ready:
-        reasons.append("adapter_not_ready")
-    if not probe_ready:
-        reasons.append("probe_not_ready")
-    if not real_run_enabled:
-        reasons.append("real_run_disabled")
-    return "shadow_run", reasons or ["real_gate_not_ready"], blockers
-
-
-def strategy_score(
-    *,
-    value_score: int,
-    recommended_mode: str,
-    dry_success: int,
-    shadow_success: int,
-    failed_runs: int,
-    recent_risk: int,
-    knowledge_confidence: int,
-    estimated_win_probability: float,
-    account_reputation_score: int,
-    expected_value: float,
-) -> float:
-    if recommended_mode == "blocked":
-        return 0.0
-    mode_multiplier = {
-        "real_run": 1.0,
-        "shadow_run": 0.78,
-        "dry_run": 0.52,
-        "blocked": 0.0,
-    }.get(recommended_mode, 0.0)
-    validation_bonus = min(dry_success, 3) * 3 + min(shadow_success, 3) * 6
-    risk_penalty = min(recent_risk * 8 + failed_runs * 7, 45)
-    knowledge_bonus = min(knowledge_confidence * 0.08, 8)
-    account_bonus = min(max(account_reputation_score - 50, 0) * 0.16, 8)
-    expected_value_bonus = min(expected_value * 10, 12)
-    probability_bonus = min(estimated_win_probability * 20, 10)
-    return round(
-        max(
-            0,
-            value_score * mode_multiplier
-            + validation_bonus
-            + knowledge_bonus
-            + account_bonus
-            + expected_value_bonus
-            + probability_bonus
-            - risk_penalty,
-        ),
-        2,
-    )
-
-
 async def load_strategy_platform_knowledge(window_days: int = 30) -> dict[str, dict]:
     rows = await database.fetch_all(
         """SELECT platform,
@@ -1279,6 +1214,7 @@ async def load_strategy_account_recommendations(platform: str | None = None, win
             "account_id": item["id"],
             "platform": item["platform"],
             "reputation_score": reputation,
+            "account_tier": account_tier(reputation),
             "risk_score": as_int(item["risk_score"]),
             "risk_events": as_int(item["risk_events"]),
             "daily_task_count": as_int(item["daily_task_count"]),
@@ -1308,59 +1244,6 @@ async def load_strategy_account_recommendations(platform: str | None = None, win
     return grouped
 
 
-def empty_platform_knowledge(platform: str) -> dict:
-    return {
-        "platform": platform,
-        "total_lotteries": 0,
-        "pending_lotteries": 0,
-        "won_lotteries": 0,
-        "lost_lotteries": 0,
-        "high_value_lotteries": 0,
-        "avg_value_score": 0,
-        "win_rate": None,
-        "total_runs": 0,
-        "succeeded_runs": 0,
-        "failed_runs": 0,
-        "task_success_rate": None,
-        "shadow_success": 0,
-        "real_success": 0,
-        "risk_events": 0,
-        "knowledge_confidence": 0,
-    }
-
-
-def strategy_knowledge_confidence(item: dict) -> int:
-    result_labels = as_int(item.get("won_lotteries")) + as_int(item.get("lost_lotteries"))
-    return clamp(
-        min(as_int(item.get("total_lotteries")) * 4, 28)
-        + min(result_labels * 8, 24)
-        + min(as_int(item.get("total_runs")) * 5, 22)
-        + min(as_int(item.get("shadow_success")) * 8, 16)
-        + min(as_int(item.get("real_success")) * 8, 10),
-        0,
-        100,
-    )
-
-
-def estimate_win_probability(win_rate: float | None, knowledge_confidence: int) -> float:
-    baseline = 0.05
-    if win_rate is None:
-        return baseline
-    confidence_weight = min(max(knowledge_confidence, 0) / 100, 0.75)
-    return round(baseline * (1 - confidence_weight) + float(win_rate) * confidence_weight, 4)
-
-
-def estimate_trust_score(*, account_reputation_score: int, recent_platform_risk: int, knowledge_confidence: int) -> float:
-    account_trust = max(0.25, min(account_reputation_score, 100) / 100) if account_reputation_score else 0.35
-    risk_penalty = min(recent_platform_risk * 0.08, 0.48)
-    confidence_bonus = min(max(knowledge_confidence, 0) / 100 * 0.12, 0.12)
-    return round(max(0.05, min(account_trust + confidence_bonus - risk_penalty, 1.0)), 4)
-
-
-def first_or_none(items):
-    return items[0] if items else None
-
-
 def safe_ratio(numerator: int, denominator: int) -> float | None:
     if not denominator:
         return None
@@ -1379,10 +1262,6 @@ def as_float(value) -> float:
         return float(value or 0)
     except Exception:
         return 0.0
-
-
-def clamp(value: int | float, low: int, high: int) -> int:
-    return int(max(low, min(high, round(value))))
 
 
 def parse_json_field(value):
