@@ -687,21 +687,39 @@ function RealGateCell({ gate, t }) {
 }
 
 function RulePlanEditor({ lottery, onSave, t }) {
+  const { notify } = useUi();
   const plan = lottery.action_plan || {};
   const initialActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
   const planSignature = JSON.stringify(initialActions);
   const [actions, setActions] = useState(initialActions);
   const [ruleText, setRuleText] = useState(lottery.rule_text || '');
+  const [suggestion, setSuggestion] = useState(null);
+  const [suggesting, setSuggesting] = useState(false);
 
   useEffect(() => {
     setActions(Array.isArray(plan.required_actions) ? plan.required_actions : []);
     setRuleText(lottery.rule_text || '');
+    setSuggestion(null);
   }, [lottery.id, lottery.rule_text, planSignature]);
 
   const toggle = action => {
     setActions(current => current.includes(action)
       ? current.filter(item => item !== action)
       : [...current, action]);
+  };
+
+  const requestSuggestion = async () => {
+    setSuggesting(true);
+    try {
+      const response = await fetchJSON(`/lotteries/${lottery.id}/action-plan/suggest?rule_text=${encodeURIComponent(ruleText)}`);
+      const suggested = response.suggested_action_plan || {};
+      setActions(Array.isArray(suggested.required_actions) ? suggested.required_actions : []);
+      setSuggestion(suggested);
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setSuggesting(false);
+    }
   };
 
   return (
@@ -719,6 +737,22 @@ function RulePlanEditor({ lottery, onSave, t }) {
           onChange={event => setRuleText(event.target.value)}
           placeholder={t('lotteries.ruleTextPlaceholder')}
         />
+        <button className="btn-ghost" type="button" disabled={!ruleText.trim() || suggesting} onClick={requestSuggestion}>
+          {suggesting ? t('lotteries.suggesting') : t('lotteries.suggestRule')}
+        </button>
+        {suggestion && (
+          <div className="rule-suggestion small-text">
+            <div>{formatText(t('lotteries.suggestionConfidence'), { value: Math.round((suggestion.confidence || 0) * 100) })}</div>
+            {!!suggestion.ambiguity_patterns?.length && (
+              <div className="badge badge-warn">{t('lotteries.suggestionAmbiguous')}</div>
+            )}
+            {suggestion.unsupported_actions?.map(action => (
+              <div className="badge badge-warn" key={action}>
+                {t('lotteries.suggestionUnsupportedPrefix')}{t(`lotteries.unsupportedActions.${action}`)}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="rule-action-grid">
           {['followed', 'liked', 'commented', 'reposted'].map(action => (
             <label key={action}>

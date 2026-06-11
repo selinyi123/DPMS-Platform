@@ -25,6 +25,8 @@ def validate_lottery_target(platform: str, raw_url: str) -> LotteryTargetValidat
         return validate_weibo_target(parsed)
     if platform == "xiaohongshu":
         return validate_xiaohongshu_target(parsed)
+    if platform == "douyin":
+        return validate_douyin_target(parsed)
     return LotteryTargetValidation(True, kind="generic")
 
 
@@ -97,3 +99,21 @@ def validate_xiaohongshu_target(parsed) -> LotteryTargetValidation:
             return LotteryTargetValidation(True, kind="note")
 
     return LotteryTargetValidation(False, reason="xiaohongshu_actionable_url_required")
+
+
+def validate_douyin_target(parsed) -> LotteryTargetValidation:
+    host = parsed.netloc.lower().split(":", 1)[0]
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if host == "v.douyin.com" and path_parts:
+        return LotteryTargetValidation(True, kind="short_link")
+
+    if host in {"douyin.com", "www.douyin.com"}:
+        if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
+            return LotteryTargetValidation(True, kind="video")
+
+    if host == "www.iesdouyin.com":
+        if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():
+            return LotteryTargetValidation(True, kind="video")
+
+    return LotteryTargetValidation(False, reason="douyin_actionable_url_required")

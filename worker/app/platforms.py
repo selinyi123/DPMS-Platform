@@ -30,7 +30,7 @@ PLATFORMS = {
         "qr_login": True,
         "cookie_login": True,
         "action_adapter": False,
-        "adapter_status": "planned",
+        "adapter_status": "calibration_required",
     },
     "xiaohongshu": {
         "label": "Xiaohongshu",

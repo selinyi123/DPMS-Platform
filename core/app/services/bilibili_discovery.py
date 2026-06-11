@@ -1,7 +1,8 @@
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from app.services.lottery_rules import parse_lottery_rule
 
 
 BILIBILI_SPACE_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
@@ -12,20 +13,6 @@ REQUEST_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
     ),
 }
-ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|UP主|up主|主播)?",),
-    "liked": (r"点赞", r"点个赞"),
-    "commented": (r"评论", r"留言"),
-    "reposted": (r"转发", r"分享动态"),
-}
-LOTTERY_PATTERNS = (r"抽奖", r"抽送", r"开奖", r"福利", r"奖品")
-AMBIGUOUS_PATTERNS = (
-    r"无需(?:关注|点赞|评论|留言|转发)",
-    r"不用(?:关注|点赞|评论|留言|转发)",
-    r"禁止(?:关注|点赞|评论|留言|转发)",
-    r"可选",
-    r"任选",
-)
 
 
 @dataclass(frozen=True)
@@ -87,7 +74,7 @@ def parse_dynamic_item(item: dict[str, Any]) -> BilibiliDynamicCandidate | None:
     if not rule_text:
         return None
 
-    action_plan = parse_lottery_rule(rule_text)
+    action_plan = parse_lottery_rule(rule_text, "bilibili")
     title = first_nonempty_line(rule_text)[:160]
     published_at = timestamp_to_datetime(author.get("pub_ts"))
     return BilibiliDynamicCandidate(
@@ -120,43 +107,6 @@ def extract_dynamic_text(dynamic: dict[str, Any]) -> str:
             append_text(chunks, block.get("desc_second"))
 
     return "\n".join(dict.fromkeys(chunk for chunk in chunks if chunk)).strip()
-
-
-def parse_lottery_rule(text: str) -> dict[str, Any]:
-    normalized = normalize_text(text)
-    matched_rules = []
-    required_actions = []
-    for action, patterns in ACTION_PATTERNS.items():
-        matched = [pattern for pattern in patterns if re.search(pattern, normalized, re.IGNORECASE)]
-        if matched:
-            required_actions.append(action)
-            matched_rules.append({"action": action, "patterns": matched})
-
-    lottery_matches = [pattern for pattern in LOTTERY_PATTERNS if re.search(pattern, normalized, re.IGNORECASE)]
-    ambiguity = [pattern for pattern in AMBIGUOUS_PATTERNS if re.search(pattern, normalized, re.IGNORECASE)]
-    is_lottery = bool(lottery_matches)
-    review_required = not is_lottery or not required_actions or bool(ambiguity)
-    confidence = 0.15
-    if is_lottery:
-        confidence += 0.45
-    confidence += min(len(required_actions) * 0.1, 0.3)
-    if ambiguity:
-        confidence -= 0.25
-
-    return {
-        "version": 1,
-        "is_lottery": is_lottery,
-        "required_actions": required_actions,
-        "review_required": review_required,
-        "confidence": round(max(0.0, min(confidence, 1.0)), 2),
-        "lottery_patterns": lottery_matches,
-        "matched_rules": matched_rules,
-        "ambiguity_patterns": ambiguity,
-    }
-
-
-def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def append_text(chunks: list[str], value: Any) -> None:

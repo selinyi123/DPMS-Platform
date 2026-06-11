@@ -7,6 +7,14 @@ from app.utils.log import structured_log
 WINDOW_SECONDS = 10 * 60
 WINDOW_MAX_ACTIONS = 2
 DAILY_MAX_TASKS = 8
+# Xiaohongshu's risk control is known to be stricter than the other
+# platforms, so its accounts get tighter compliance limits by default.
+PLATFORM_WINDOW_MAX_ACTIONS = {
+    "xiaohongshu": 1,
+}
+PLATFORM_DAILY_MAX_TASKS = {
+    "xiaohongshu": 5,
+}
 RISK_TEXTS = [
     "captcha",
     "geetest",
@@ -20,6 +28,29 @@ RISK_TEXTS = [
     "\u64cd\u4f5c\u9891\u7e41",
     "\u8d26\u53f7\u5f02\u5e38",
 ]
+# Platform-specific risk phrases. These are matched in addition to
+# RISK_TEXTS and only ever trigger the existing stop+notify "cooling" path
+# (account_calibrator/safety never bypass or hide these signals).
+PLATFORM_RISK_TEXTS = {
+    "xiaohongshu": [
+        "\u8bbe\u5907\u73af\u5883\u5f02\u5e38",
+        "\u5f53\u524d\u8d26\u53f7\u5b58\u5728\u5f02\u5e38\u884c\u4e3a",
+        "\u8bbf\u95ee\u9891\u7387\u8fc7\u9ad8",
+        "\u8bbf\u95ee\u592a\u9891\u7e41\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5",
+        "\u7b14\u8bb0\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u5220\u9664",
+        "\u8d26\u53f7\u5df2\u88ab\u9650\u5236",
+    ],
+    "weibo": [
+        "\u8bf7\u6c42\u9891\u7e41\uff0c\u7a0d\u540e\u518d\u8bd5",
+        "\u7cfb\u7edf\u68c0\u6d4b\u5230\u5f02\u5e38\u8bbf\u95ee",
+        "\u8be5\u5fae\u535a\u5df2\u88ab\u5220\u9664",
+    ],
+    "douyin": [
+        "\u8bf7\u8fdb\u884c\u5b89\u5168\u9a8c\u8bc1\u540e\u7ee7\u7eed\u64cd\u4f5c",
+        "\u5f53\u524d\u8bbe\u5907\u73af\u5883\u5f02\u5e38",
+        "\u89c6\u9891\u4e0d\u5b58\u5728\u6216\u5df2\u88ab\u4f5c\u8005\u5220\u9664",
+    ],
+}
 LOGIN_URL_MARKERS = (
     "passport.bilibili.com/login",
     "/passport/web/login",
@@ -29,7 +60,7 @@ LOGIN_URL_MARKERS = (
 )
 
 
-async def ensure_account_can_run(account_id: int) -> None:
+async def ensure_account_can_run(account_id: int, platform: str | None = None) -> None:
     row = await database.fetch_one(
         "SELECT status, daily_task_count, encrypted_credential FROM accounts WHERE id = :id",
         {"id": account_id},
@@ -40,7 +71,8 @@ async def ensure_account_can_run(account_id: int) -> None:
         raise ValueError(f"Account {account_id} is not ready")
     if not row["encrypted_credential"]:
         raise ValueError(f"Account {account_id} has no credential")
-    if int(row["daily_task_count"] or 0) >= DAILY_MAX_TASKS:
+    daily_max_tasks = PLATFORM_DAILY_MAX_TASKS.get(platform or "", DAILY_MAX_TASKS)
+    if int(row["daily_task_count"] or 0) >= daily_max_tasks:
         await set_account_status(account_id, "cooling", "daily_limit")
         raise ValueError(f"Account {account_id} reached daily limit")
 
@@ -52,12 +84,13 @@ async def ensure_account_can_run(account_id: int) -> None:
     pipe.zcard(key)
     pipe.expire(key, WINDOW_SECONDS * 2)
     _, _, count, _ = await pipe.execute()
-    if count > WINDOW_MAX_ACTIONS:
+    window_max_actions = PLATFORM_WINDOW_MAX_ACTIONS.get(platform or "", WINDOW_MAX_ACTIONS)
+    if count > window_max_actions:
         await set_account_status(account_id, "cooling", "action_window")
         raise ValueError(f"Account {account_id} exceeded action window")
 
 
-async def detect_page_risk(page, account_id: int) -> None:
+async def detect_page_risk(page, account_id: int, platform: str | None = None) -> None:
     current_url = str(getattr(page, "url", "") or "").lower()
     if any(marker in current_url for marker in LOGIN_URL_MARKERS):
         await set_account_status(account_id, "login_required", "redirected_to_login")
@@ -68,7 +101,8 @@ async def detect_page_risk(page, account_id: int) -> None:
         return
     body = body or ""
     lower = body.lower()
-    if any(text.lower() in lower for text in RISK_TEXTS):
+    risk_texts = RISK_TEXTS + PLATFORM_RISK_TEXTS.get(platform or "", [])
+    if any(text.lower() in lower for text in risk_texts):
         await set_account_status(account_id, "cooling", "page_risk_signal")
         raise ValueError(f"Risk signal detected on page for account {account_id}")
 

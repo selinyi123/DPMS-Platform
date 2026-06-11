@@ -116,6 +116,23 @@ class XiaohongshuCanonicalizer:
         raise ValueError(f"Cannot canonicalize: {raw_url}")
 
 
+class DouyinCanonicalizer:
+    @staticmethod
+    async def canonicalize(raw_url: str) -> CanonicalURL:
+        raw_url = await resolve_short_link(raw_url, "v.douyin.com")
+        parsed = urlparse(raw_url)
+        host = parsed.netloc.lower().split(":", 1)[0]
+        path_parts = [part for part in parsed.path.split("/") if part]
+
+        if host in {"douyin.com", "www.douyin.com"}:
+            if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
+                return CanonicalURL("douyin", "video", path_parts[1])
+        if host == "www.iesdouyin.com":
+            if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():
+                return CanonicalURL("douyin", "video", path_parts[2])
+        raise ValueError(f"Cannot canonicalize: {raw_url}")
+
+
 async def resolve_short_link(raw_url: str, short_host: str) -> str:
     host = urlparse(raw_url).netloc.lower().split(":", 1)[0]
     if host != short_host:
@@ -141,6 +158,7 @@ PLATFORM_CANONICALIZERS = {
     "bilibili": BilibiliCanonicalizer,
     "weibo": WeiboCanonicalizer,
     "xiaohongshu": XiaohongshuCanonicalizer,
+    "douyin": DouyinCanonicalizer,
 }
 
 

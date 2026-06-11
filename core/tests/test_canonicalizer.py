@@ -2,6 +2,7 @@ import unittest
 
 from app.utils.canonicalizer import (
     BilibiliCanonicalizer,
+    DouyinCanonicalizer,
     WeiboCanonicalizer,
     XiaohongshuCanonicalizer,
     canonicalize_platform_url,
@@ -45,6 +46,21 @@ class XiaohongshuCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
             await XiaohongshuCanonicalizer.canonicalize("https://www.xiaohongshu.com/explore")
 
 
+class DouyinCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_canonicalizes_video_url(self):
+        result = await DouyinCanonicalizer.canonicalize("https://www.douyin.com/video/7300000000000000000")
+        self.assertEqual("canonical://douyin/video/7300000000000000000", result.to_uri())
+
+    async def test_canonicalizes_iesdouyin_share_url_to_same_video(self):
+        web = await DouyinCanonicalizer.canonicalize("https://www.douyin.com/video/7300000000000000000")
+        share = await DouyinCanonicalizer.canonicalize("https://www.iesdouyin.com/share/video/7300000000000000000/")
+        self.assertEqual(web.to_uri(), share.to_uri())
+
+    async def test_rejects_profile_url(self):
+        with self.assertRaises(ValueError):
+            await DouyinCanonicalizer.canonicalize("https://www.douyin.com/user/MS4wLjABAAAA")
+
+
 class PlatformDispatchTests(unittest.IsolatedAsyncioTestCase):
     async def test_bilibili_video_regression(self):
         result = await BilibiliCanonicalizer.canonicalize("https://www.bilibili.com/video/BV1xx411c7mD")
@@ -58,9 +74,13 @@ class PlatformDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("canonical://weibo/status/4890123456789012", weibo)
         self.assertEqual("canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0d1", xhs)
 
-    async def test_unmapped_platform_uses_generic_hash(self):
+    async def test_dispatches_douyin(self):
         result = await canonicalize_platform_url("douyin", "https://www.douyin.com/video/7300000000000000000")
-        self.assertTrue(result.startswith("canonical://douyin/url/"))
+        self.assertEqual("canonical://douyin/video/7300000000000000000", result)
+
+    async def test_unmapped_platform_uses_generic_hash(self):
+        result = await canonicalize_platform_url("kuaishou", "https://www.kuaishou.com/short-video/abcdef")
+        self.assertTrue(result.startswith("canonical://kuaishou/url/"))
 
 
 if __name__ == "__main__":

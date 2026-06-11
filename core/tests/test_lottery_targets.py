@@ -83,8 +83,34 @@ class LotteryTargetValidationTests(unittest.TestCase):
                 self.assertFalse(result.valid)
                 self.assertEqual("xiaohongshu_actionable_url_required", result.reason)
 
+    def test_accepts_douyin_video_urls(self):
+        for url in (
+            "https://www.douyin.com/video/7300000000000000000",
+            "https://www.iesdouyin.com/share/video/7300000000000000000/",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("douyin", url)
+                self.assertTrue(result.valid)
+                self.assertEqual("video", result.kind)
+
+    def test_accepts_douyin_short_link(self):
+        result = validate_lottery_target("douyin", "https://v.douyin.com/abc123/")
+        self.assertTrue(result.valid)
+        self.assertEqual("short_link", result.kind)
+
+    def test_rejects_douyin_homepage_and_profiles(self):
+        for url in (
+            "https://www.douyin.com/",
+            "https://www.douyin.com/user/MS4wLjABAAAA",
+            "https://www.douyin.com/video/not-a-video-id",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("douyin", url)
+                self.assertFalse(result.valid)
+                self.assertEqual("douyin_actionable_url_required", result.reason)
+
     def test_keeps_other_platform_urls_generic(self):
-        result = validate_lottery_target("douyin", "https://www.douyin.com/video/7300000000000000000")
+        result = validate_lottery_target("kuaishou", "https://www.kuaishou.com/short-video/abcdef")
         self.assertTrue(result.valid)
         self.assertEqual("generic", result.kind)
 

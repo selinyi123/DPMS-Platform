@@ -174,7 +174,7 @@ async def execute_shadow_run(task: dict, adapter, pool):
     try:
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
-        await detect_page_risk(page, account_id)
+        await detect_page_risk(page, account_id, platform)
 
         visible_phases = {}
         selector_probes = getattr(adapter, "SELECTOR_PROBES", {}) or {}
@@ -250,7 +250,7 @@ async def execute_real_task(task: dict, adapter, pool):
     try:
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
-        await detect_page_risk(page, account_id)
+        await detect_page_risk(page, account_id, platform)
 
         if current_phase == "init":
             remaining_phases = phases
@@ -258,9 +258,9 @@ async def execute_real_task(task: dict, adapter, pool):
             completed_index = PHASE_ORDER.index(current_phase)
             remaining_phases = [phase for phase in phases if PHASE_ORDER.index(phase) > completed_index]
         for phase_name in remaining_phases:
-            await detect_page_risk(page, account_id)
+            await detect_page_risk(page, account_id, platform)
             await phase_fn[phase_name](page)
-            await detect_page_risk(page, account_id)
+            await detect_page_risk(page, account_id, platform)
             await save_phase(task_id, account_id, lottery_id, phase_name)
 
         await save_phase(task_id, account_id, lottery_id, "completed")
@@ -385,7 +385,7 @@ async def execute_task_with_phases(task: dict, adapter, pool):
     try:
         if task_mode == "real_run" and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
-        await ensure_account_can_run(account_id)
+        await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         await mark_task_started(task_id, account_id, lottery_id, task_mode)
         if task_mode == "dry_run":
             await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))

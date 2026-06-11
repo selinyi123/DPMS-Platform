@@ -6,7 +6,7 @@ from app.db import database
 
 
 PHASES = ("followed", "liked", "commented", "reposted")
-STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu")
+STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu", "douyin")
 SELECTOR_ENV = "DPMS_ADAPTER_SELECTORS"
 SELECTOR_B64_ENV = "DPMS_ADAPTER_SELECTORS_B64"
 

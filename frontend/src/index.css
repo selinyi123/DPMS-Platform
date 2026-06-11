@@ -524,6 +524,16 @@ select {
   gap: 7px;
 }
 
+.rule-suggestion {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.rule-suggestion .badge {
+  align-self: flex-start;
+}
+
 .activity-pool-table {
   min-width: 1280px;
 }

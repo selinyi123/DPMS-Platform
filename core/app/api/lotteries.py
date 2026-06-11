@@ -29,6 +29,7 @@ from app.models.schemas import (
 )
 from app.platforms import get_platform, get_platforms
 from app.services.discovery import run_discovery
+from app.services.lottery_rules import parse_lottery_rule
 from app.security import (
     audit_event,
     circuit_breaker_allows,
@@ -774,6 +775,18 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         actor_id=actor["actor_id"],
     )
     return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "mode": task_mode}
+
+
+@router.get("/{lottery_id}/action-plan/suggest")
+async def suggest_lottery_action_plan(lottery_id: int, request: Request, rule_text: str | None = None):
+    require_min_role(request, "viewer")
+    lottery = await database.fetch_one("SELECT id, platform, rule_text FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+
+    text = rule_text if rule_text is not None else (lottery["rule_text"] or "")
+    plan = parse_lottery_rule(text, lottery["platform"])
+    return {"lottery_id": lottery_id, "platform": lottery["platform"], "rule_text": text, "suggested_action_plan": plan}
 
 
 @router.put("/{lottery_id}/action-plan")
