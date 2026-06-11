@@ -32,12 +32,13 @@ from app.strategy.engine import (
     account_tier,
     choose_strategy_mode,
     empty_platform_knowledge,
-    estimate_trust_score,
-    estimate_win_probability,
+    estimate_trust_score_breakdown,
+    estimate_win_probability_breakdown,
     first_or_none,
     priority_tier,
     strategy_knowledge_confidence,
-    strategy_score,
+    strategy_knowledge_confidence_breakdown,
+    strategy_score_breakdown,
 )
 from app.services.discovery import run_discovery
 from app.services.lottery_rules import parse_lottery_rule
@@ -58,6 +59,60 @@ PHASES = ["followed", "liked", "commented", "reposted"]
 TASK_FAILURE_DIR = Path("/profiles/task-failures")
 TASK_SHADOW_DIR = Path("/profiles/shadow-runs")
 ADAPTER_PROBE_DIR = Path("/profiles/adapter-probes")
+
+STRATEGY_TARGET_METRICS_SQL = """(
+                    SELECT COUNT(*)
+                    FROM accounts a
+                    WHERE a.platform = l.platform
+                      AND a.status = 'ready'
+                      AND OCTET_LENGTH(a.encrypted_credential) > 0
+                      AND (
+                        SELECT c.status FROM account_calibrations c
+                        WHERE c.account_id = a.id
+                        ORDER BY c.created_at DESC
+                        LIMIT 1
+                      ) = 'succeeded'
+                  ) AS safe_accounts,
+                  (
+                    SELECT COUNT(*)
+                    FROM risk_events r
+                    JOIN accounts a ON a.id = r.account_id
+                    WHERE a.platform = l.platform
+                      AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                  ) AS recent_platform_risk,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.status IN ('queued','running')
+                  ) AS active_runs,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND COALESCE(tr.task_mode, IF(tr.dry_run = 1, 'dry_run', 'real_run')) = 'dry_run'
+                      AND tr.status = 'succeeded'
+                  ) AS dry_success,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.task_mode = 'shadow_run'
+                      AND tr.status = 'succeeded'
+                  ) AS shadow_success,
+                  (
+                    SELECT COUNT(*)
+                    FROM task_runs tr
+                    WHERE tr.lottery_id = l.id
+                      AND tr.status = 'failed'
+                  ) AS failed_runs,
+                  (
+                    SELECT ac.result
+                    FROM adapter_calibrations ac
+                    WHERE ac.platform = l.platform
+                    ORDER BY ac.id DESC
+                    LIMIT 1
+                  ) AS latest_probe_result"""
 
 
 @router.get("/adapters")
@@ -210,60 +265,8 @@ async def strategy_queue(limit: int = 20):
     platform_knowledge = await load_strategy_platform_knowledge()
     account_recommendations = await load_strategy_account_recommendations()
     rows = await database.fetch_all(
-        """SELECT l.*,
-                  (
-                    SELECT COUNT(*)
-                    FROM accounts a
-                    WHERE a.platform = l.platform
-                      AND a.status = 'ready'
-                      AND OCTET_LENGTH(a.encrypted_credential) > 0
-                      AND (
-                        SELECT c.status FROM account_calibrations c
-                        WHERE c.account_id = a.id
-                        ORDER BY c.created_at DESC
-                        LIMIT 1
-                      ) = 'succeeded'
-                  ) AS safe_accounts,
-                  (
-                    SELECT COUNT(*)
-                    FROM risk_events r
-                    JOIN accounts a ON a.id = r.account_id
-                    WHERE a.platform = l.platform
-                      AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                  ) AS recent_platform_risk,
-                  (
-                    SELECT COUNT(*)
-                    FROM task_runs tr
-                    WHERE tr.lottery_id = l.id
-                      AND tr.status IN ('queued','running')
-                  ) AS active_runs,
-                  (
-                    SELECT COUNT(*)
-                    FROM task_runs tr
-                    WHERE tr.lottery_id = l.id
-                      AND COALESCE(tr.task_mode, IF(tr.dry_run = 1, 'dry_run', 'real_run')) = 'dry_run'
-                      AND tr.status = 'succeeded'
-                  ) AS dry_success,
-                  (
-                    SELECT COUNT(*)
-                    FROM task_runs tr
-                    WHERE tr.lottery_id = l.id
-                      AND tr.task_mode = 'shadow_run'
-                      AND tr.status = 'succeeded'
-                  ) AS shadow_success,
-                  (
-                    SELECT COUNT(*)
-                    FROM task_runs tr
-                    WHERE tr.lottery_id = l.id
-                      AND tr.status = 'failed'
-                  ) AS failed_runs,
-                  (
-                    SELECT ac.result
-                    FROM adapter_calibrations ac
-                    WHERE ac.platform = l.platform
-                    ORDER BY ac.id DESC
-                    LIMIT 1
-                  ) AS latest_probe_result
+        f"""SELECT l.*,
+                  {STRATEGY_TARGET_METRICS_SQL}
            FROM lotteries l
            WHERE l.status IN ('pending','claimed')
            ORDER BY l.value_score DESC, l.id ASC
@@ -273,117 +276,46 @@ async def strategy_queue(limit: int = 20):
 
     items = []
     for row in rows:
-        item = dict(row)
-        platform = item["platform"]
-        cfg = get_platform(platform) or {}
-        safe_accounts = int(item.get("safe_accounts") or 0)
-        active_runs = int(item.get("active_runs") or 0)
-        dry_success = int(item.get("dry_success") or 0)
-        shadow_success = int(item.get("shadow_success") or 0)
-        failed_runs = int(item.get("failed_runs") or 0)
-        recent_risk = int(item.get("recent_platform_risk") or 0)
-        probe_result = parse_json_field(item.get("latest_probe_result"))
-        probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
-        adapter_ready = bool(cfg.get("action_adapter")) or platform_selectors_complete(selector_config, platform)
-        probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
-        breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
-        target = validate_lottery_target(platform, item["raw_url"])
-
-        if target.valid:
-            recommended_mode, reason_codes, blockers = choose_strategy_mode(
-                safe_accounts=safe_accounts,
-                active_runs=active_runs,
-                dry_success=dry_success,
-                shadow_success=shadow_success,
-                adapter_ready=adapter_ready,
-                probe_ready=probe_ready,
-                real_run_enabled=real_run_enabled,
-                breaker_allowed=breaker_allowed,
-                breaker_reason=breaker_reason,
-            )
-        else:
-            recommended_mode = "blocked"
-            reason_codes = ["invalid_lottery_target"]
-            blockers = [target.reason or "invalid lottery target"]
-        if recent_risk:
-            reason_codes.append("recent_platform_risk")
-        if failed_runs:
-            reason_codes.append("recent_failures")
-        if item["value_score"] >= 70:
-            reason_codes.append("high_value")
-
-        knowledge = platform_knowledge.get(platform) or empty_platform_knowledge(platform)
-        recommended_account = first_or_none(account_recommendations.get(platform, []))
-        account_reputation_score = recommended_account["reputation_score"] if recommended_account else 0
-        estimated_win_probability = estimate_win_probability(
-            knowledge.get("win_rate"),
-            knowledge.get("knowledge_confidence", 0),
+        item = await compute_strategy_item(
+            dict(row),
+            selector_config=selector_config,
+            real_run_enabled=real_run_enabled,
+            platform_knowledge=platform_knowledge,
+            account_recommendations=account_recommendations,
         )
-        trust_score = estimate_trust_score(
-            account_reputation_score=account_reputation_score,
-            recent_platform_risk=recent_risk,
-            knowledge_confidence=knowledge.get("knowledge_confidence", 0),
-        )
-        expected_value = round(int(item["value_score"] or 0) * estimated_win_probability * trust_score, 4)
-        if knowledge.get("knowledge_confidence", 0) >= 40:
-            reason_codes.append("platform_knowledge_used")
-        elif knowledge.get("total_lotteries", 0) or knowledge.get("total_runs", 0):
-            reason_codes.append("low_knowledge_confidence")
-        if knowledge.get("win_rate") is not None:
-            reason_codes.append("historical_win_rate_used")
-        if recommended_account:
-            reason_codes.append("account_reputation_used")
-            if account_reputation_score < 60:
-                reason_codes.append("account_reputation_low")
-
-        score = strategy_score(
-            value_score=int(item["value_score"] or 0),
-            recommended_mode=recommended_mode,
-            dry_success=dry_success,
-            shadow_success=shadow_success,
-            failed_runs=failed_runs,
-            recent_risk=recent_risk,
-            knowledge_confidence=knowledge.get("knowledge_confidence", 0),
-            estimated_win_probability=estimated_win_probability,
-            account_reputation_score=account_reputation_score,
-            expected_value=expected_value,
-        )
-        items.append(
-            {
-                "lottery_id": item["id"],
-                "platform": platform,
-                "raw_url": item["raw_url"],
-                "status": item["status"],
-                "value_score": item["value_score"],
-                "strategy_score": score,
-                "priority_tier": priority_tier(score) if recommended_mode != "blocked" else "hold",
-                "expected_value": expected_value,
-                "estimated_win_probability": estimated_win_probability,
-                "trust_score": trust_score,
-                "recommended_mode": recommended_mode,
-                "reason_codes": reason_codes,
-                "blockers": blockers,
-                "platform_knowledge": knowledge,
-                "recommended_account": recommended_account,
-                "safe_accounts": safe_accounts,
-                "active_runs": active_runs,
-                "dry_success": dry_success,
-                "shadow_success": shadow_success,
-                "failed_runs": failed_runs,
-                "recent_platform_risk": recent_risk,
-                "adapter_ready": adapter_ready,
-                "probe_ready": probe_ready,
-                "real_run_enabled": real_run_enabled,
-                "breaker_allowed": breaker_allowed,
-                "target_valid": target.valid,
-                "target_kind": target.kind,
-            }
-        )
+        items.append(item)
 
     items.sort(key=lambda row: row["strategy_score"], reverse=True)
     for rank, item in enumerate(items, start=1):
         item["rank"] = rank
     return {"items": items, "count": len(items)}
+
+
+@router.get("/{lottery_id}/strategy/explain")
+async def explain_lottery_strategy(lottery_id: int):
+    selector_config = await load_runtime_selector_config()
+    real_run_enabled = await is_real_run_enabled()
+    row = await database.fetch_one(
+        f"""SELECT l.*,
+                  {STRATEGY_TARGET_METRICS_SQL}
+           FROM lotteries l
+           WHERE l.id = :lottery_id""",
+        {"lottery_id": lottery_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Lottery not found")
+
+    item = dict(row)
+    platform_knowledge = await load_strategy_platform_knowledge()
+    account_recommendations = await load_strategy_account_recommendations(item["platform"])
+    return await compute_strategy_item(
+        item,
+        selector_config=selector_config,
+        real_run_enabled=real_run_enabled,
+        platform_knowledge=platform_knowledge,
+        account_recommendations=account_recommendations,
+        include_breakdown=True,
+    )
 
 
 @router.get("/sources")
@@ -1047,6 +979,148 @@ def resolve_task_mode(data: DispatchTaskRequest) -> str:
     if data.mode:
         return data.mode.value if hasattr(data.mode, "value") else str(data.mode)
     return "dry_run" if data.dry_run else "real_run"
+
+
+async def compute_strategy_item(
+    item: dict,
+    *,
+    selector_config: dict,
+    real_run_enabled: bool,
+    platform_knowledge: dict[str, dict],
+    account_recommendations: dict[str, list[dict]],
+    include_breakdown: bool = False,
+) -> dict:
+    """Score a single lottery row against the strategy gate and ranking model.
+
+    Shared by ``/strategy/queue`` (ranking many targets) and
+    ``/{lottery_id}/strategy/explain`` (explaining one target), so both
+    surfaces stay consistent. ``include_breakdown`` adds the named score
+    components used by the explain endpoint.
+    """
+    platform = item["platform"]
+    cfg = get_platform(platform) or {}
+    safe_accounts = int(item.get("safe_accounts") or 0)
+    active_runs = int(item.get("active_runs") or 0)
+    dry_success = int(item.get("dry_success") or 0)
+    shadow_success = int(item.get("shadow_success") or 0)
+    failed_runs = int(item.get("failed_runs") or 0)
+    recent_risk = int(item.get("recent_platform_risk") or 0)
+    probe_result = parse_json_field(item.get("latest_probe_result"))
+    probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
+    adapter_ready = bool(cfg.get("action_adapter")) or platform_selectors_complete(selector_config, platform)
+    probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+    breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
+    target = validate_lottery_target(platform, item["raw_url"])
+
+    if target.valid:
+        recommended_mode, reason_codes, blockers = choose_strategy_mode(
+            safe_accounts=safe_accounts,
+            active_runs=active_runs,
+            dry_success=dry_success,
+            shadow_success=shadow_success,
+            adapter_ready=adapter_ready,
+            probe_ready=probe_ready,
+            real_run_enabled=real_run_enabled,
+            breaker_allowed=breaker_allowed,
+            breaker_reason=breaker_reason,
+        )
+    else:
+        recommended_mode = "blocked"
+        reason_codes = ["invalid_lottery_target"]
+        blockers = [target.reason or "invalid lottery target"]
+    if recent_risk:
+        reason_codes.append("recent_platform_risk")
+    if failed_runs:
+        reason_codes.append("recent_failures")
+    if item["value_score"] >= 70:
+        reason_codes.append("high_value")
+
+    knowledge = platform_knowledge.get(platform) or empty_platform_knowledge(platform)
+    recommended_account = first_or_none(account_recommendations.get(platform, []))
+    account_reputation_score = recommended_account["reputation_score"] if recommended_account else 0
+    win_probability_breakdown = estimate_win_probability_breakdown(
+        knowledge.get("win_rate"),
+        knowledge.get("knowledge_confidence", 0),
+    )
+    estimated_win_probability = win_probability_breakdown["blended"]
+    trust_score_breakdown = estimate_trust_score_breakdown(
+        account_reputation_score=account_reputation_score,
+        recent_platform_risk=recent_risk,
+        knowledge_confidence=knowledge.get("knowledge_confidence", 0),
+    )
+    trust_score = trust_score_breakdown["trust_score"]
+    expected_value = round(int(item["value_score"] or 0) * estimated_win_probability * trust_score, 4)
+    if knowledge.get("knowledge_confidence", 0) >= 40:
+        reason_codes.append("platform_knowledge_used")
+    elif knowledge.get("total_lotteries", 0) or knowledge.get("total_runs", 0):
+        reason_codes.append("low_knowledge_confidence")
+    if knowledge.get("win_rate") is not None:
+        reason_codes.append("historical_win_rate_used")
+    if recommended_account:
+        reason_codes.append("account_reputation_used")
+        if account_reputation_score < 60:
+            reason_codes.append("account_reputation_low")
+
+    score_breakdown = strategy_score_breakdown(
+        value_score=int(item["value_score"] or 0),
+        recommended_mode=recommended_mode,
+        dry_success=dry_success,
+        shadow_success=shadow_success,
+        failed_runs=failed_runs,
+        recent_risk=recent_risk,
+        knowledge_confidence=knowledge.get("knowledge_confidence", 0),
+        estimated_win_probability=estimated_win_probability,
+        account_reputation_score=account_reputation_score,
+        expected_value=expected_value,
+    )
+
+    result = {
+        "lottery_id": item["id"],
+        "platform": platform,
+        "raw_url": item["raw_url"],
+        "status": item["status"],
+        "value_score": item["value_score"],
+        "strategy_score": score_breakdown["total"],
+        "priority_tier": priority_tier(score_breakdown["total"]) if recommended_mode != "blocked" else "hold",
+        "expected_value": expected_value,
+        "estimated_win_probability": estimated_win_probability,
+        "trust_score": trust_score,
+        "recommended_mode": recommended_mode,
+        "reason_codes": reason_codes,
+        "blockers": blockers,
+        "platform_knowledge": knowledge,
+        "recommended_account": recommended_account,
+        "safe_accounts": safe_accounts,
+        "active_runs": active_runs,
+        "dry_success": dry_success,
+        "shadow_success": shadow_success,
+        "failed_runs": failed_runs,
+        "recent_platform_risk": recent_risk,
+        "adapter_ready": adapter_ready,
+        "probe_ready": probe_ready,
+        "real_run_enabled": real_run_enabled,
+        "breaker_allowed": breaker_allowed,
+        "target_valid": target.valid,
+        "target_kind": target.kind,
+    }
+    if include_breakdown:
+        result["explain"] = {
+            "mode": {
+                "recommended_mode": recommended_mode,
+                "reason_codes": reason_codes,
+                "blockers": blockers,
+                "breaker_allowed": breaker_allowed,
+                "breaker_reason": breaker_reason,
+                "target_valid": target.valid,
+                "target_kind": target.kind,
+                "target_error": target.reason,
+            },
+            "score": score_breakdown,
+            "win_probability": win_probability_breakdown,
+            "trust_score": trust_score_breakdown,
+            "knowledge_confidence": strategy_knowledge_confidence_breakdown(knowledge),
+        }
+    return result
 
 
 async def load_strategy_platform_knowledge(window_days: int = 30) -> dict[str, dict]:
