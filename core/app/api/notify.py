@@ -401,6 +401,7 @@ def looks_like_placeholder_secret(value: str) -> bool:
         or "<bot-token>" in lowered
         or "<chat-id>" in lowered
         or "<serverchan-send-key>" in lowered
+        or "example.com" in lowered
     )
 
 

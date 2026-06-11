@@ -6,7 +6,13 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app.adapter_config import PHASES as ADAPTER_PHASES, load_runtime_selector_config, selector_config_complete
+from app.adapter_config import (
+    PHASES as ADAPTER_PHASES,
+    click_selectors,
+    load_runtime_selector_config,
+    selector_config_complete,
+    selector_values,
+)
 from app.db import database, redis
 from app.event_store.service import record_event
 from app.knowledge.service import account_reputation
@@ -1414,17 +1420,7 @@ def phase_configured(platform: str, config: dict, phase: str) -> bool:
             selector_values(value.get("input") or value.get("inputs"))
             and selector_values(value.get("submit") or value.get("submits"))
         )
-    if isinstance(value, dict):
-        value = value.get("click") or value.get("selectors") or value.get("buttons")
-    return bool(selector_values(value))
-
-
-def selector_values(value) -> list[str]:
-    if isinstance(value, str):
-        return [value] if value.strip() else []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    return []
+    return bool(click_selectors(value))
 
 
 async def validate_real_run_evidence(lottery, account_id: int | None = None) -> dict:

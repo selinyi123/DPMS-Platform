@@ -45,6 +45,7 @@ $mappings = @(
     @{ Source = "docs\DPMS_FrontendTheme_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_FrontendTheme_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_NotificationSecretBundle_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_NotificationSecretBundle_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_最终搭建审阅与漏洞清单_20260602.md"; Destination = "06_审查与风险\DPMS_最终搭建审阅与漏洞清单_20260602.md" },
+    @{ Source = "docs\DPMS_BilibiliGateReviewCleanup_实施记录_20260611.md"; Destination = "06_审查与风险\DPMS_BilibiliGateReviewCleanup_实施记录_20260611.md" },
     @{ Source = "docs\DPMS_ObsidianKnowledgeBase_实施记录_20260609.md"; Destination = "07_文档与治理\DPMS_ObsidianKnowledgeBase_实施记录_20260609.md" },
     @{ Source = "docs\legacy_selectors_fragment.txt"; Destination = "99_附件\legacy_selectors_fragment.txt" },
     @{ Source = "obsidian\DPMS-Platform\00_导航\DPMS_项目主页.md"; Destination = "00_导航\DPMS_项目主页.md" },

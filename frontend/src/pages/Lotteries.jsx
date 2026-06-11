@@ -236,8 +236,6 @@ export default function Lotteries() {
     notify(message === `lotteries.nextActionHints.${action}` ? gateTitle(gate, t) : message, 'warning');
   };
 
-  const realActionReady = lottery => Boolean(gateByLotteryId[lottery.id]?.allowed);
-
   const probeSummary = (probe) => {
     const result = typeof probe.result === 'string' ? safeJson(probe.result) : probe.result;
     return result?._summary || null;

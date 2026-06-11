@@ -557,7 +557,8 @@ const dictionaries = {
         shadowDetail: '真实执行前先在无副作用模式下验证页面和登录态。',
         globalTitle: '全局开关',
         globalDetail: 'real-run 总开关默认关闭，只应在证据齐全后由管理员确认开启。',
-      },    },
+      },
+    },
     status: {
       ready: '可用',
       gray: '灰度',
@@ -1138,7 +1139,8 @@ const dictionaries = {
         shadowDetail: 'Validate the page and login state in no-side-effect mode before real execution.',
         globalTitle: 'Global switch',
         globalDetail: 'The real-run switch stays off by default and requires admin confirmation after evidence is ready.',
-      },    },
+      },
+    },
     status: {
       ready: 'Ready',
       gray: 'Gray',
