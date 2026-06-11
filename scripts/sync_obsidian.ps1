@@ -35,6 +35,7 @@ $mappings = @(
     @{ Source = "docs\DPMS_RuntimeRollback_实施记录_20260606.md"; Destination = "03_工作流与运行时\DPMS_RuntimeRollback_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md"; Destination = "03_工作流与运行时\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md" },
     @{ Source = "docs\DPMS_AllPlatformLotteryRules_实施记录_20260611.md"; Destination = "03_工作流与运行时\DPMS_AllPlatformLotteryRules_实施记录_20260611.md" },
+    @{ Source = "docs\DPMS_DeployReadinessGeneralization_实施记录_20260611.md"; Destination = "05_运维安全与前端\DPMS_DeployReadinessGeneralization_实施记录_20260611.md" },
     @{ Source = "docs\DPMS_BilibiliGateNextAction_实施记录_20260608.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliGateNextAction_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_BilibiliGateNotification_实施记录_20260608.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliGateNotification_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_BilibiliGateUI_实施记录_20260608.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliGateUI_实施记录_20260608.md" },

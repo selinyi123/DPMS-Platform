@@ -39,7 +39,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 平台状态：微博、小红书、抖音均已接入选择器驱动执行链路，处于 `calibration_required` 阶段
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`
-- 最近功能提交：`ca7f702 Add Douyin lottery module and platform-aware rule parsing`
+- 最近功能提交：`d7ad892 Generalize Deploy readiness wizard to all platforms`
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -61,6 +61,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]
 - [[DPMS_AllPlatformLotteryRules_实施记录_20260611]]
+- [[DPMS_DeployReadinessGeneralization_实施记录_20260611]]
 
 ## 文档分区
 
