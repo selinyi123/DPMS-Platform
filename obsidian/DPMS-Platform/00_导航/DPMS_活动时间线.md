@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-09
+updated: 2026-06-11
 ---
 
 # DPMS 活动时间线
@@ -54,6 +54,12 @@ updated: 2026-06-09
 | `761051d` | 接入 Bilibili 官方二维码登录与身份校准 | [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]] |
 | `04e4c1d` | 增加 Bilibili UP 动态发现与规则动作计划 | [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]] |
 | `5c70f1e` | 清理运行时 Schema 重启假告警 | [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]] |
+
+## 2026-06-11
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `443ae0f` | 清理 Bilibili 门禁审查发现问题 | [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]] |
 
 ## 记录原则
 

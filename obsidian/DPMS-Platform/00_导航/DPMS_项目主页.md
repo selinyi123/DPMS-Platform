@@ -7,7 +7,7 @@ tags:
   - 项目管理
   - 自动化
 status: active
-updated: 2026-06-09
+updated: 2026-06-11
 ---
 
 # DPMS-Platform
@@ -38,7 +38,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 当前优先平台：Bilibili
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`
-- 最近功能提交：`89e7aa0 Reject invalid Bilibili lottery targets`
+- 最近功能提交：`443ae0f Clean up Bilibili gate review follow-ups`
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -57,6 +57,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]]
 - [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
+- [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 
 ## 文档分区
 
