@@ -63,6 +63,8 @@ updated: 2026-06-11
 | `6a0a929` | 微博与小红书接入选择器驱动抽奖模块 | [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]] |
 | `ca7f702` | 抖音模块补齐与全平台规则解析 | [[DPMS_AllPlatformLotteryRules_实施记录_20260611]] |
 | `d7ad892` | Deploy 真实执行准备度向导泛化为四平台 | [[DPMS_DeployReadinessGeneralization_实施记录_20260611]] |
+| `1a56aec` | 抽取策略引擎并建立测试基线 | [[DPMS_StrategyEngineExtraction_实施记录_20260611]] |
+| `（本次文档）` | 制定后续开发总设计方案 v1 | [[DPMS_总设计方案_v1_20260611]] |
 
 ## 记录原则
 

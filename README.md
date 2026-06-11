@@ -57,9 +57,19 @@ npm run build
 
 ## 关键文档
 
+- `docs/DPMS_总设计方案_v1_20260611.md`（后续开发总设计方案，分阶段计划与验收标准）
 - `docs/DPMS_能力演化路线图_v4-v9_20260605.md`
 - `docs/DPMS_EventStore_V4_实施记录_20260605.md`
 - `docs/DPMS_最终搭建审阅与漏洞清单_20260602.md`
+
+## 测试
+
+无需数据库即可运行纯逻辑单元测试：
+
+```powershell
+cd core; python -m unittest discover -s tests
+cd ../worker; python -m unittest discover -s tests
+```
 
 ## Obsidian 活动记录
 

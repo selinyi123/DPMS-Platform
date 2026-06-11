@@ -39,7 +39,9 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 平台状态：微博、小红书、抖音均已接入选择器驱动执行链路，处于 `calibration_required` 阶段
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`
-- 最近功能提交：`d7ad892 Generalize Deploy readiness wizard to all platforms`
+- 最近功能提交：`1a56aec Extract Strategy Runtime engine and add test baseline`
+- 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]
+- 测试基线：core 94 项 + worker 21 项单元测试通过
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -49,6 +51,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 
 - [[DPMS_活动时间线]]
 - [[DPMS_记录规范]]
+- [[DPMS_总设计方案_v1_20260611]]
 - [[DPMS_能力演化路线图_v4-v9_20260605]]
 - [[DPMS_最终搭建审阅与漏洞清单_20260602]]
 - [[DPMS_EventStore_V4_实施记录_20260605]]
@@ -62,6 +65,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]
 - [[DPMS_AllPlatformLotteryRules_实施记录_20260611]]
 - [[DPMS_DeployReadinessGeneralization_实施记录_20260611]]
+- [[DPMS_StrategyEngineExtraction_实施记录_20260611]]
 
 ## 文档分区
 
@@ -79,8 +83,18 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 
 ## 当前下一步
 
-1. 使用 Bilibili 官方 App 扫码，验证新账号完整登录与校准闭环。
-2. 添加 Bilibili UP 主数字 UID 发现源，或录入真实视频/动态抽奖链接。
+后续开发以 [[DPMS_总设计方案_v1_20260611]] 为准。阶段路线：
+
+- S1（已完成）：Strategy Runtime 模块化 + 工程质量基线（策略引擎抽取、core/worker 测试基线、活动/账号分层）。
+- S2（下一步）：决策可解释接口 + 前端 Strategy/Knowledge 页面。
+- S3：Experiment Runtime 最小闭环（仅 dry/shadow）。
+- S4：Risk Intelligence（账号/设备/代理信誉与 24h 风险预测，仅用于收紧派发）。
+- S5+：Learning / Governance / Transition / Semantic（按路线图与安全约束推进）。
+
+运营侧人工关卡（保持不变）：
+
+1. 使用平台官方 App 扫码，验证新账号完整登录与校准闭环。
+2. 录入真实视频/动态/微博/笔记抽奖链接（首页/个人主页不可作为执行目标）。
 3. 核对自动解析的规则动作计划；歧义规则必须人工确认。
 4. 使用已校准账号完成规则所需阶段的低风险探针。
 5. 根据真实页面证据生成并复核选择器配置。

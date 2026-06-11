@@ -26,11 +26,13 @@ $directories = @(
 $mappings = @(
     @{ Source = "README.md"; Destination = "01_项目基线\DPMS_项目说明.md" },
     @{ Source = "docs\DPMS_能力演化路线图_v4-v9_20260605.md"; Destination = "01_项目基线\DPMS_能力演化路线图_v4-v9_20260605.md" },
+    @{ Source = "docs\DPMS_总设计方案_v1_20260611.md"; Destination = "01_项目基线\DPMS_总设计方案_v1_20260611.md" },
     @{ Source = "docs\DPMS_EventStore_V4_实施记录_20260605.md"; Destination = "02_架构演进\DPMS_EventStore_V4_实施记录_20260605.md" },
     @{ Source = "docs\DPMS_KnowledgeRuntime_实施记录_20260606.md"; Destination = "02_架构演进\DPMS_KnowledgeRuntime_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_StrategyAdvice_实施记录_20260606.md"; Destination = "02_架构演进\DPMS_StrategyAdvice_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_StrategyKnowledgeBridge_实施记录_20260606.md"; Destination = "02_架构演进\DPMS_StrategyKnowledgeBridge_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_StrategyQueue_实施记录_20260606.md"; Destination = "02_架构演进\DPMS_StrategyQueue_实施记录_20260606.md" },
+    @{ Source = "docs\DPMS_StrategyEngineExtraction_实施记录_20260611.md"; Destination = "02_架构演进\DPMS_StrategyEngineExtraction_实施记录_20260611.md" },
     @{ Source = "docs\DPMS_ShadowRun_实施记录_20260605.md"; Destination = "03_工作流与运行时\DPMS_ShadowRun_实施记录_20260605.md" },
     @{ Source = "docs\DPMS_RuntimeRollback_实施记录_20260606.md"; Destination = "03_工作流与运行时\DPMS_RuntimeRollback_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md"; Destination = "03_工作流与运行时\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md" },
