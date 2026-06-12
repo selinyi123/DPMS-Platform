@@ -128,4 +128,4 @@
 
 ## 对应 Git 提交
 
-- 详见 [[DPMS_活动时间线]] 2026-06-12 条目（本次提交记录待补充提交哈希）。
+- `02a8d99 Add Experiment, Risk Intelligence, Learning and Governance runtimes (V5.5-V7)`

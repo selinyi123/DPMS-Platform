@@ -64,7 +64,7 @@ updated: 2026-06-11
 | `ca7f702` | 抖音模块补齐与全平台规则解析 | [[DPMS_AllPlatformLotteryRules_实施记录_20260611]] |
 | `d7ad892` | Deploy 真实执行准备度向导泛化为四平台 | [[DPMS_DeployReadinessGeneralization_实施记录_20260611]] |
 | `1a56aec` | 抽取策略引擎并建立测试基线 | [[DPMS_StrategyEngineExtraction_实施记录_20260611]] |
-| `（本次文档）` | 制定后续开发总设计方案 v1 | [[DPMS_总设计方案_v1_20260611]] |
+| `f9fbbef` | 制定后续开发总设计方案 v1 | [[DPMS_总设计方案_v1_20260611]] |
 | `f67ec40` | 新增策略解释端点与共享评分构成函数 | [[DPMS_DecisionExplainability_实施记录_20260611]] |
 | `d11228d` | 新增 Strategy / Knowledge 前端控制台页面（S2 / V5） | [[DPMS_DecisionExplainability_实施记录_20260611]] |
 
@@ -72,8 +72,8 @@ updated: 2026-06-11
 
 | 提交 | 活动 | 关联记录 |
 | --- | --- | --- |
-| `（本次提交）` | 一次性推进 V5.5/V6/V6.5/V7：Experiment / Risk Intelligence / Learning / Governance Runtime | [[DPMS_V5.5-V7_RuntimeExpansion_实施记录_20260612]] |
-| `（本次文档）` | 制定 V8 Transition Runtime 与 V9 Semantic Runtime 后续版本规划 | [[DPMS_V8-V9_后续版本规划_20260612]] |
+| `02a8d99` | 一次性推进 V5.5/V6/V6.5/V7：Experiment / Risk Intelligence / Learning / Governance Runtime | [[DPMS_V5.5-V7_RuntimeExpansion_实施记录_20260612]] |
+| `02a8d99` | 制定 V8 Transition Runtime 与 V9 Semantic Runtime 后续版本规划 | [[DPMS_V8-V9_后续版本规划_20260612]] |
 
 ## 记录原则
 
