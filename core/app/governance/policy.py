@@ -1,0 +1,150 @@
+"""Pure Policy Object logic for the DPMS Governance Runtime (V7 / stage S6).
+
+No database or framework dependency. A *Policy Object* is a versioned,
+declarative list of gates. Evaluating it against a subject's inputs yields a
+deterministic, replayable decision record. This institutionalizes the existing
+real-run gate: instead of gate logic scattered across the API, the gates become
+data that can be versioned, diffed, and replayed.
+
+Safety boundary (non-negotiable):
+
+- The policy is fail-closed: a required gate whose input is missing or false
+  blocks the decision. Evaluation can only ever *deny*; it never invents an
+  allow that the inputs do not support.
+- Decisions are deterministic and replayable: the same inputs against the same
+  policy version always produce the same outcome, so any past decision can be
+  audited by re-running it.
+"""
+
+from __future__ import annotations
+
+REAL_RUN_GATE_POLICY_KEY = "real_run_gate"
+
+# The canonical real-run policy (version 1). Each gate mirrors an existing
+# real-run evidence requirement, now expressed as versioned data. Order is the
+# operator-facing remediation order.
+DEFAULT_REAL_RUN_POLICY = {
+    "policy_key": REAL_RUN_GATE_POLICY_KEY,
+    "version": 1,
+    "description": "Real-run readiness gate as a versioned policy object.",
+    "gates": [
+        {"code": "global_real_run_enabled", "required": True, "remediation": "enable_real_run"},
+        {"code": "circuit_breaker_closed", "required": True, "remediation": "review_breaker"},
+        {"code": "valid_lottery_target", "required": True, "remediation": "add_target"},
+        {"code": "action_plan_reviewed", "required": True, "remediation": "review_rule"},
+        {"code": "calibrated_account_available", "required": True, "remediation": "add_account"},
+        {"code": "real_adapter_enabled", "required": True, "remediation": "configure_adapter"},
+        {"code": "recent_complete_probe", "required": True, "remediation": "probe"},
+        {"code": "recent_shadow_run", "required": True, "remediation": "shadow_run"},
+        {"code": "no_recent_account_risk", "required": True, "remediation": "review_risk"},
+    ],
+}
+
+
+def default_policies() -> dict[str, dict]:
+    """Return the built-in policies keyed by ``policy_key``."""
+    return {REAL_RUN_GATE_POLICY_KEY: DEFAULT_REAL_RUN_POLICY}
+
+
+def validate_policy(policy: dict) -> tuple[bool, list[str]]:
+    """Check a policy definition is well-formed before it is stored."""
+    errors: list[str] = []
+    if not policy.get("policy_key"):
+        errors.append("policy_key_required")
+    if not isinstance(policy.get("version"), int) or policy.get("version", 0) < 1:
+        errors.append("version_must_be_positive_int")
+    gates = policy.get("gates")
+    if not isinstance(gates, list) or not gates:
+        errors.append("at_least_one_gate_required")
+        return (not errors), errors
+    codes = []
+    for index, gate in enumerate(gates):
+        if not isinstance(gate, dict) or not gate.get("code"):
+            errors.append(f"gate_{index}_code_required")
+            continue
+        codes.append(gate["code"])
+    if len(codes) != len(set(codes)):
+        errors.append("gate_codes_must_be_unique")
+    return (not errors), errors
+
+
+def evaluate_policy(*, policy: dict, inputs: dict) -> dict:
+    """Evaluate a policy against subject inputs into a deterministic decision.
+
+    ``inputs`` maps gate codes to truthy/falsy evidence values. Returns the
+    outcome (``allow``/``block``), the satisfied and failed gates, and the
+    operator-facing remediation for the first failed gate.
+    """
+    satisfied: list[str] = []
+    failed: list[dict] = []
+    for gate in policy.get("gates", []):
+        code = gate.get("code")
+        required = bool(gate.get("required", True))
+        present = bool(inputs.get(code))
+        if present:
+            satisfied.append(code)
+        elif required:
+            failed.append({"code": code, "remediation": gate.get("remediation")})
+    outcome = "allow" if not failed else "block"
+    return {
+        "policy_key": policy.get("policy_key"),
+        "policy_version": policy.get("version"),
+        "outcome": outcome,
+        "satisfied": satisfied,
+        "failed": [item["code"] for item in failed],
+        "reasons": failed,
+        "next_action": failed[0]["remediation"] if failed else "real_run",
+    }
+
+
+def build_decision_record(*, policy: dict, inputs: dict, subject_type: str, subject_id: str | None) -> dict:
+    """Build a replayable decision record (the API adds an id and timestamp)."""
+    decision = evaluate_policy(policy=policy, inputs=inputs)
+    return {
+        "policy_key": decision["policy_key"],
+        "policy_version": decision["policy_version"],
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+        "inputs": dict(inputs),
+        "outcome": decision["outcome"],
+        "reasons": decision["reasons"],
+        "next_action": decision["next_action"],
+    }
+
+
+def replay_decision(*, policy: dict, record: dict) -> dict:
+    """Re-evaluate a stored decision's inputs and confirm the outcome matches.
+
+    The heart of decision auditing: feed the recorded inputs back through the
+    (same-version) policy and verify we still reach the recorded outcome.
+    """
+    recomputed = evaluate_policy(policy=policy, inputs=record.get("inputs", {}))
+    expected = record.get("outcome")
+    return {
+        "matches": recomputed["outcome"] == expected,
+        "recomputed_outcome": recomputed["outcome"],
+        "recorded_outcome": expected,
+        "policy_version": policy.get("version"),
+        "recorded_policy_version": record.get("policy_version"),
+        "version_matches": policy.get("version") == record.get("policy_version"),
+    }
+
+
+def diff_policies(old: dict, new: dict) -> dict:
+    """Structurally diff two policy versions for change review."""
+    old_gates = {g["code"]: g for g in old.get("gates", []) if g.get("code")}
+    new_gates = {g["code"]: g for g in new.get("gates", []) if g.get("code")}
+    added = [code for code in new_gates if code not in old_gates]
+    removed = [code for code in old_gates if code not in new_gates]
+    changed_required = [
+        code
+        for code in new_gates
+        if code in old_gates and bool(old_gates[code].get("required", True)) != bool(new_gates[code].get("required", True))
+    ]
+    return {
+        "from_version": old.get("version"),
+        "to_version": new.get("version"),
+        "added_gates": added,
+        "removed_gates": removed,
+        "changed_required": changed_required,
+    }

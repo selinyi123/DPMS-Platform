@@ -7,9 +7,13 @@ import Accounts from './pages/Accounts';
 import Dashboard from './pages/Dashboard';
 import Deploy from './pages/Deploy';
 import EventTimeline from './pages/EventTimeline';
+import Experiments from './pages/Experiments';
+import Governance from './pages/Governance';
 import Knowledge from './pages/Knowledge';
+import Learning from './pages/Learning';
 import Lotteries from './pages/Lotteries';
 import RiskCenter from './pages/RiskCenter';
+import RiskIntelligence from './pages/RiskIntelligence';
 import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
 import { useUi } from './uiContext';
@@ -20,6 +24,10 @@ const pages = {
   lotteries: { Component: Lotteries },
   strategy: { Component: Strategy },
   knowledge: { Component: Knowledge },
+  experiments: { Component: Experiments },
+  riskIntel: { Component: RiskIntelligence },
+  learning: { Component: Learning },
+  governance: { Component: Governance },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },

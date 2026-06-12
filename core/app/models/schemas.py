@@ -257,3 +257,48 @@ class LotteryResultUpdate(BaseModel):
     status: str
 
     note: Optional[str] = None
+
+
+class ExperimentBranchCreate(BaseModel):
+
+    key: str
+
+    label: Optional[str] = None
+
+    weight: float = 1.0
+
+    config: Optional[dict[str, Any]] = None
+
+
+class ExperimentCreate(BaseModel):
+
+    name: str
+
+    platform: str = "bilibili"
+
+    mode: TaskModeEnum = TaskModeEnum.shadow_run
+
+    hypothesis: Optional[str] = None
+
+    branches: list[ExperimentBranchCreate]
+
+    allow_real_run: bool = False
+
+
+class ExperimentAssignRequest(BaseModel):
+
+    lottery_id: int
+
+    task_id: Optional[str] = None
+
+    account_id: Optional[int] = None
+
+
+class ExperimentStopRequest(BaseModel):
+
+    reason: Optional[str] = "manual stop"
+
+
+class ExperimentBranchStopRequest(BaseModel):
+
+    reason: Optional[str] = "manual branch stop"

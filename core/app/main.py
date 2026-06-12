@@ -21,7 +21,7 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance
 
 from app.config import settings
 
@@ -301,6 +301,96 @@ async def ensure_runtime_schema():
           INDEX idx_account_calibration_status (status, created_at)
         ) ENGINE=InnoDB"""
     )
+    await ensure_experiment_schema()
+    await ensure_governance_schema()
+
+
+async def ensure_experiment_schema():
+    # Experiment Runtime (V5.5 / S3): dry/shadow A/B comparison tables.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS experiments (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          experiment_id CHAR(36) NOT NULL,
+          name VARCHAR(256) NOT NULL,
+          platform VARCHAR(32) NOT NULL,
+          mode VARCHAR(32) NOT NULL DEFAULT 'shadow_run',
+          status ENUM('draft','running','stopped','completed') NOT NULL DEFAULT 'running',
+          hypothesis TEXT NULL,
+          allow_real_run TINYINT NOT NULL DEFAULT 0,
+          stopped_reason VARCHAR(255) NULL,
+          created_by VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_experiment_id (experiment_id),
+          INDEX idx_experiment_status (status, created_at),
+          INDEX idx_experiment_platform (platform, created_at)
+        ) ENGINE=InnoDB"""
+    )
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS experiment_branches (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          experiment_id CHAR(36) NOT NULL,
+          branch_key VARCHAR(64) NOT NULL,
+          label VARCHAR(128) NULL,
+          weight FLOAT NOT NULL DEFAULT 1,
+          config_json JSON NULL,
+          status ENUM('active','stopped') NOT NULL DEFAULT 'active',
+          stopped_reason VARCHAR(255) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_experiment_branch (experiment_id, branch_key),
+          INDEX idx_experiment_branch_eid (experiment_id)
+        ) ENGINE=InnoDB"""
+    )
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS experiment_assignments (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          experiment_id CHAR(36) NOT NULL,
+          branch_key VARCHAR(64) NOT NULL,
+          unit_key VARCHAR(128) NOT NULL,
+          lottery_id BIGINT NULL,
+          task_id VARCHAR(64) NULL,
+          account_id BIGINT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_experiment_unit (experiment_id, unit_key),
+          INDEX idx_experiment_assignment_branch (experiment_id, branch_key),
+          INDEX idx_experiment_assignment_task (task_id)
+        ) ENGINE=InnoDB"""
+    )
+
+
+async def ensure_governance_schema():
+    # Governance Runtime (V7 / S6): versioned policy objects + decision log.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS policy_versions (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          policy_key VARCHAR(64) NOT NULL,
+          version INT NOT NULL,
+          definition JSON NOT NULL,
+          note VARCHAR(255) NULL,
+          created_by VARCHAR(128) NULL,
+          active TINYINT NOT NULL DEFAULT 1,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_policy_version (policy_key, version),
+          INDEX idx_policy_active (policy_key, active)
+        ) ENGINE=InnoDB"""
+    )
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS policy_decisions (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          decision_id CHAR(36) NOT NULL,
+          policy_key VARCHAR(64) NOT NULL,
+          policy_version INT NOT NULL,
+          subject_type VARCHAR(64) NOT NULL,
+          subject_id VARCHAR(128) NULL,
+          inputs JSON NULL,
+          outcome VARCHAR(32) NOT NULL,
+          reasons JSON NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uk_policy_decision (decision_id),
+          INDEX idx_policy_decision_subject (subject_type, subject_id, created_at),
+          INDEX idx_policy_decision_policy (policy_key, policy_version, created_at)
+        ) ENGINE=InnoDB"""
+    )
 
 
 async def ensure_column(table: str, column: str, definition: str, after: str | None = None) -> None:
@@ -393,6 +483,14 @@ app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
 app.include_router(events.router, prefix="/api/events", tags=["events"])
 
 app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
+
+app.include_router(experiments.router, prefix="/api/experiments", tags=["experiments"])
+
+app.include_router(risk_intel.router, prefix="/api/risk", tags=["risk-intel"])
+
+app.include_router(learning.router, prefix="/api/learning", tags=["learning"])
+
+app.include_router(governance.router, prefix="/api/governance", tags=["governance"])
 
 
 @app.get("/api/auth/me")
