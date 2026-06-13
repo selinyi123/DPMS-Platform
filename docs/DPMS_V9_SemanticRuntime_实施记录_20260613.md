@@ -103,4 +103,4 @@ V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最
 - `f61aa98 Add Semantic Runtime (V9 / stage S8): read-only Intent->Execution trace`
 - `5e3c90a Link Governance real-run panel and decisions to the Semantic Trace`
 - `15de710 Add a third semantic consistency check: stale lottery status after a succeeded run`
-- `__PENDING__` Generalize the semantic trace to account subjects alongside lotteries
+- `bdb868d Generalize the semantic trace to account subjects alongside lotteries`
