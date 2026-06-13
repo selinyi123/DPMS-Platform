@@ -154,6 +154,29 @@ class NarrativeLinesTests(unittest.TestCase):
         self.assertIn("Subject 123 scored 82 (tier A)", en[0])
         self.assertIn("top driver: win_rate", en[0])
 
+    def test_task_subject_renders_inherited_lottery_intent_and_single_run(self):
+        # A task subject has no strategy/risk record of its own: intent and
+        # policy come from the lottery it ran against, while execution is
+        # that single task_runs row.
+        intent, institution, policy_decision, lineage, _ = full_inputs()
+        task_id = "11111111-1111-1111-1111-111111111111"
+        trace = build_semantic_trace(
+            subject_type="task", subject_id=task_id,
+            intent=intent, institution=institution,
+            policy_decision={**policy_decision, "outcome": "allow"},
+            transition_lineage=lineage,
+            execution={
+                "status": "succeeded",
+                "task_runs": [{"task_id": task_id, "status": "succeeded"}],
+                "count": 1,
+                "latest_run_status": "succeeded",
+            },
+        )
+        self.assertEqual(trace["subject_id"], task_id)
+        en = " ".join(narrative_lines(trace, lang="en"))
+        self.assertIn("Subject 11111111-1111-1111-1111-111111111111 scored 82 (tier A)", en)
+        self.assertIn("Execution status: succeeded, across 1 task run(s)", en)
+
 
 class ConsistencyChecksTests(unittest.TestCase):
     def test_block_but_succeeded_is_flagged(self):
@@ -207,6 +230,41 @@ class ConsistencyChecksTests(unittest.TestCase):
             execution={
                 "status": "won",
                 "task_runs": [{"task_id": "t1", "status": "succeeded"}],
+                "latest_run_status": "succeeded",
+            },
+        )
+        self.assertEqual(consistency_checks(trace), [])
+
+    def test_task_subject_succeeded_despite_inherited_gate_block_is_flagged(self):
+        # The lottery's gate decision is the task's policy layer too: a
+        # block decision alongside this run's own succeeded status should
+        # still surface the same advisory hint as for a lottery subject.
+        trace = build_semantic_trace(
+            subject_type="task", subject_id="t1",
+            policy_decision={"outcome": "block", "policy_version": 2, "reasons": []},
+            institution={"policy_key": "real_run_gate", "active_version": 2},
+            execution={
+                "status": "succeeded",
+                "task_runs": [{"task_id": "t1", "status": "succeeded"}],
+                "count": 1,
+                "latest_run_status": "succeeded",
+            },
+        )
+        hints = consistency_checks(trace)
+        self.assertTrue(any("succeeded" in h for h in hints))
+
+    def test_task_subject_never_triggers_stale_status_hint(self):
+        # For a task, execution.status and latest_run_status are the same
+        # row by construction, so the "stale lottery status" check is
+        # always a no-op for this subject type.
+        trace = build_semantic_trace(
+            subject_type="task", subject_id="t1",
+            policy_decision={"outcome": "allow", "policy_version": 1, "reasons": []},
+            institution={"policy_key": "real_run_gate", "active_version": 1},
+            execution={
+                "status": "succeeded",
+                "task_runs": [{"task_id": "t1", "status": "succeeded"}],
+                "count": 1,
                 "latest_run_status": "succeeded",
             },
         )

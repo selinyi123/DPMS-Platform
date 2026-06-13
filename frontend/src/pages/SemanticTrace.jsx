@@ -54,6 +54,7 @@ export default function SemanticTrace() {
   const lineage = transition.lineage || [];
   const latestHop = lineage.length ? lineage[lineage.length - 1] : null;
   const isAccount = subjectType === 'account';
+  const isTask = subjectType === 'task';
   const hasIntent = intent.strategy_score != null || intent.priority_tier != null
     || intent.reputation_score != null || intent.account_tier != null;
   const failedGates = (policy.reasons || [])
@@ -89,6 +90,7 @@ export default function SemanticTrace() {
             >
               <option value="lottery">{t('semantic.subjectTypes.lottery')}</option>
               <option value="account">{t('semantic.subjectTypes.account')}</option>
+              <option value="task">{t('semantic.subjectTypes.task')}</option>
             </select>
           </label>
           <label>
@@ -98,8 +100,8 @@ export default function SemanticTrace() {
               value={subjectId}
               onChange={e => setSubjectId(e.target.value)}
               onKeyDown={onKeyDown}
-              placeholder={t('semantic.lookupPlaceholder')}
-              inputMode="numeric"
+              placeholder={isTask ? t('semantic.lookupPlaceholderTask') : t('semantic.lookupPlaceholder')}
+              inputMode={isTask ? 'text' : 'numeric'}
             />
           </label>
           <div className="toolbar">
@@ -220,7 +222,8 @@ export default function SemanticTrace() {
                 <>
                   {kv(t('semantic.execution.status'), execution.status)}
                   {kv(t('semantic.execution.runs'), execution.count ?? (execution.task_runs || []).length)}
-                  {execution.latest_run_status && kv(t('semantic.execution.latestRun'), execution.latest_run_status)}
+                  {!isTask && execution.latest_run_status && kv(t('semantic.execution.latestRun'), execution.latest_run_status)}
+                  {isTask && execution.task_runs?.[0]?.task_mode && kv(t('semantic.execution.taskMode'), execution.task_runs[0].task_mode)}
                 </>
               ) : <div className="empty-cell">{t('semantic.execution.none')}</div>}
             </div>

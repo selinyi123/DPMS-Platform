@@ -29,46 +29,54 @@ from app.strategy.engine import account_tier
 
 router = APIRouter()
 
-# Subject types the trace can assemble today. Both share the institution and
-# transition layers (the real-run gate governs lotteries; account-level
-# decisions, when present, are recorded under the same policy object) and
-# differ only in their intent and execution sources.
-SUPPORTED_SUBJECTS = {"lottery", "account"}
+# Subject types the trace can assemble today. Institution and transition are
+# subject-agnostic (the same real-run-gate policy object and its lineage
+# govern every subject); intent and execution differ: a lottery gets its own
+# strategy/learning intent and task history, an account gets its V6
+# risk-intelligence intent and the task runs it performed, and a task is a
+# single task_runs row whose intent and gate decision are inherited from the
+# lottery it ran against.
+SUPPORTED_SUBJECTS = {"lottery", "account", "task"}
 
 
 @router.get("/trace/{subject_type}/{subject_id}")
 async def semantic_trace(subject_type: str, subject_id: str):
-    """Return the five-layer semantic trace for a lottery or an account."""
+    """Return the five-layer semantic trace for a lottery, account or task."""
     if subject_type not in SUPPORTED_SUBJECTS:
         supported = ", ".join(sorted(SUPPORTED_SUBJECTS))
         raise HTTPException(400, detail=f"subject_type must be one of: {supported}")
-    try:
-        numeric_id = int(subject_id)
-    except (TypeError, ValueError):
-        raise HTTPException(400, detail="subject_id must be an integer id")
 
     # Institution and transition are subject-agnostic: the same policy object
     # and its lineage govern every subject under this real-run gate.
     institution = await _build_institution(REAL_RUN_GATE_POLICY_KEY)
     transition_lineage = await policy_lineage(REAL_RUN_GATE_POLICY_KEY)
-    policy_decision = await _latest_decision(subject_type, subject_id)
 
-    if subject_type == "lottery":
-        lottery = await database.fetch_one(
-            "SELECT id, status FROM lotteries WHERE id = :id", {"id": numeric_id}
-        )
-        if not lottery:
-            raise HTTPException(404, detail="Lottery not found")
-        intent = await _build_intent(numeric_id)
-        execution = await _build_execution(numeric_id, lottery["status"])
-    else:  # account
-        account = await database.fetch_one(
-            "SELECT id, status FROM accounts WHERE id = :id", {"id": numeric_id}
-        )
-        if not account:
-            raise HTTPException(404, detail="Account not found")
-        intent = await _build_account_intent(numeric_id)
-        execution = await _build_account_execution(numeric_id, account["status"])
+    if subject_type == "task":
+        # task_id is a UUID string, not an integer id.
+        intent, policy_decision, execution = await _build_task_layers(subject_id)
+    else:
+        try:
+            numeric_id = int(subject_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, detail="subject_id must be an integer id")
+
+        policy_decision = await _latest_decision(subject_type, subject_id)
+        if subject_type == "lottery":
+            lottery = await database.fetch_one(
+                "SELECT id, status FROM lotteries WHERE id = :id", {"id": numeric_id}
+            )
+            if not lottery:
+                raise HTTPException(404, detail="Lottery not found")
+            intent = await _build_intent(numeric_id)
+            execution = await _build_execution(numeric_id, lottery["status"])
+        else:  # account
+            account = await database.fetch_one(
+                "SELECT id, status FROM accounts WHERE id = :id", {"id": numeric_id}
+            )
+            if not account:
+                raise HTTPException(404, detail="Account not found")
+            intent = await _build_account_intent(numeric_id)
+            execution = await _build_account_execution(numeric_id, account["status"])
 
     return build_semantic_trace(
         subject_type=subject_type,
@@ -192,3 +200,31 @@ async def _build_account_execution(account_id: int, account_status) -> dict:
         "count": len(runs),
         "latest_run_status": runs[0]["status"] if runs else None,
     }
+
+
+async def _build_task_layers(task_id: str):
+    """Intent, policy and execution layers for a single task run.
+
+    A task has no strategy/risk record of its own: its intent and gate
+    decision are inherited from the lottery it ran against, while its
+    execution layer is that one ``task_runs`` row.
+    """
+    row = await database.fetch_one(
+        """SELECT task_id, lottery_id, account_id, status,
+                  COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) AS task_mode,
+                  created_at, started_at, finished_at
+           FROM task_runs WHERE task_id = :tid""",
+        {"tid": task_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Task run not found")
+    run = dict(row)
+    intent = await _build_intent(run["lottery_id"])
+    policy_decision = await _latest_decision("lottery", str(run["lottery_id"]))
+    execution = {
+        "status": run["status"],
+        "task_runs": [run],
+        "count": 1,
+        "latest_run_status": run["status"],
+    }
+    return intent, policy_decision, execution
