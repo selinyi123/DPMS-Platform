@@ -237,9 +237,10 @@ def consistency_checks(trace: dict) -> list[str]:
     """Lightweight, advisory-only cross-layer consistency hints.
 
     These never block anything: they surface data that looks internally
-    inconsistent (e.g. the gate blocked but execution still succeeded, or a
-    decision was made under an older policy version than the one now active)
-    so an operator can investigate. A fully consistent trace returns ``[]``.
+    inconsistent (e.g. the gate blocked but execution still succeeded, a
+    decision was made under an older policy version than the one now active,
+    or the lottery record hasn't caught up with its own latest task run) so
+    an operator can investigate. A fully consistent trace returns ``[]``.
     """
     hints: list[str] = []
 
@@ -265,6 +266,17 @@ def consistency_checks(trace: dict) -> list[str]:
             f"Decision was made under policy version v{decision_version}, but the active "
             f"policy is now v{active_version}: replay this decision with its historical "
             "version rather than the current one."
+        )
+
+    latest_run_status = execution.get("latest_run_status")
+    if (
+        latest_run_status in SUCCEEDED_STATUSES
+        and status is not None
+        and status not in SUCCEEDED_STATUSES
+    ):
+        hints.append(
+            f"The latest task run succeeded (status='{latest_run_status}') but the lottery "
+            f"record still shows status='{status}': verify the lottery record was updated."
         )
 
     return hints

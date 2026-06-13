@@ -75,11 +75,20 @@ V9 的重点**不是新增决策能力**，而是新增一个**纯聚合的解�
 
 安全边界不变：跳转只是把同一个只读 `GET /api/semantic/trace/lottery/{id}` 的入口前置到 Governance 操作流里，不新增任何写操作或决策权。`npm run build` 通过（127 modules），core 193 项测试不受影响（本次零后端改动）。
 
+## 后续增强（2026-06-13）：补充第三条跨层一致性检查
+
+回应「下一步」中"为 `consistency_checks` 增补更多跨层不变量"，`core/app/semantic/trace.py` 新增第三条检查（与既有两条并列，仍为**仅提示、不阻断**）：
+
+- **执行层内部一致性**：`execution.latest_run_status`（最近一条 `task_runs` 的状态）落在 `SUCCEEDED_STATUSES` 中，但 `execution.status`（lottery 自身状态）尚未同步到该集合时，提示"最近一次任务运行已成功，但 lottery 记录状态仍为 X，请核对 lottery 记录是否已更新"。该检查只读取 trace 内已聚合的两个字段，不引入新的数据源。
+
+新增 2 项单元测试（`test_stale_lottery_status_after_successful_run_is_flagged`、`test_lottery_status_matching_latest_run_has_no_stale_hint`），均通过；core 单元测试增至 **195 项全部通过**（原 193 + 新增 2）。`narrative_lines` 与既有两条检查均未改动，前端 `SemanticTrace.jsx` 无需改动（已通用渲染 `consistency_checks` 列表）。
+
 ## 下一步
 
-V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：为 `consistency_checks` 增补更多跨层不变量；将 `subject_type` 泛化到 `account`/`task` 等主体。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
+V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：继续为 `consistency_checks` 增补跨层不变量；将 `subject_type` 泛化到 `account`/`task` 等主体。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
 
 ## 对应 Git 提交
 
 - `f61aa98 Add Semantic Runtime (V9 / stage S8): read-only Intent->Execution trace`
 - `5e3c90a Link Governance real-run panel and decisions to the Semantic Trace`
+- `__PENDING__` Add a third semantic consistency check: stale lottery status after a succeeded run

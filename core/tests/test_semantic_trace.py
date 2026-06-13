@@ -155,6 +155,33 @@ class ConsistencyChecksTests(unittest.TestCase):
         )
         self.assertEqual(consistency_checks(trace), [])
 
+    def test_stale_lottery_status_after_successful_run_is_flagged(self):
+        trace = build_semantic_trace(
+            subject_type="lottery", subject_id=1,
+            policy_decision={"outcome": "allow", "policy_version": 1, "reasons": []},
+            institution={"policy_key": "real_run_gate", "active_version": 1},
+            execution={
+                "status": "pending",
+                "task_runs": [{"task_id": "t1", "status": "succeeded"}],
+                "latest_run_status": "succeeded",
+            },
+        )
+        hints = consistency_checks(trace)
+        self.assertTrue(any("succeeded" in h and "pending" in h for h in hints))
+
+    def test_lottery_status_matching_latest_run_has_no_stale_hint(self):
+        trace = build_semantic_trace(
+            subject_type="lottery", subject_id=1,
+            policy_decision={"outcome": "allow", "policy_version": 1, "reasons": []},
+            institution={"policy_key": "real_run_gate", "active_version": 1},
+            execution={
+                "status": "won",
+                "task_runs": [{"task_id": "t1", "status": "succeeded"}],
+                "latest_run_status": "succeeded",
+            },
+        )
+        self.assertEqual(consistency_checks(trace), [])
+
 
 if __name__ == "__main__":
     unittest.main()
