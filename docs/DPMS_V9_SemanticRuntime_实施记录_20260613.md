@@ -82,4 +82,4 @@ V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最
 ## 对应 Git 提交
 
 - `f61aa98 Add Semantic Runtime (V9 / stage S8): read-only Intent->Execution trace`
-- `__PENDING__ Link Governance real-run panel and decisions to the Semantic Trace`
+- `5e3c90a Link Governance real-run panel and decisions to the Semantic Trace`

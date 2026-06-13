@@ -81,7 +81,7 @@ updated: 2026-06-13
 | --- | --- | --- |
 | `3581ccd` | 推进 V8：Transition Runtime（策略迁移图，发布/激活分离，宽松化强制留痕） | [[DPMS_V8_TransitionRuntime_实施记录_20260613]] |
 | `f61aa98` | 推进 V9：Semantic Runtime（Intent→Execution 语义执行链，纯只读聚合，不新增数据表） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
-| `__PENDING__` | V9 增强：Governance 评估面板与决策表交叉链接到语义链（跨页导航下沉至 uiContext） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `5e3c90a` | V9 增强：Governance 评估面板与决策表交叉链接到语义链（跨页导航下沉至 uiContext） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 
 ## 记录原则
 
