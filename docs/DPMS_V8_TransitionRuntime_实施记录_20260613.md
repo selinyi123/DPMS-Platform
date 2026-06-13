@@ -118,4 +118,4 @@ S8 / V9 Semantic Runtime（语义执行链）的展开规划见 [[DPMS_V8-V9_后
 
 ## 对应 Git 提交
 
-（本次提交）
+- `3581ccd Add Transition Runtime (V8 / stage S7): policy version lineage and audit trail`

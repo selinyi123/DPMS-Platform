@@ -79,7 +79,7 @@ updated: 2026-06-13
 
 | 提交 | 活动 | 关联记录 |
 | --- | --- | --- |
-| （本次提交） | 推进 V8：Transition Runtime（策略迁移图，发布/激活分离，宽松化强制留痕） | [[DPMS_V8_TransitionRuntime_实施记录_20260613]] |
+| `3581ccd` | 推进 V8：Transition Runtime（策略迁移图，发布/激活分离，宽松化强制留痕） | [[DPMS_V8_TransitionRuntime_实施记录_20260613]] |
 
 ## 记录原则
 
