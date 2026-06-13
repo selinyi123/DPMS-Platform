@@ -84,6 +84,7 @@ updated: 2026-06-13
 | `5e3c90a` | V9 增强：Governance 评估面板与决策表交叉链接到语义链（跨页导航下沉至 uiContext） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 | `15de710` | V9 增强：consistency_checks 新增"执行状态滞后于最近任务运行"跨层检查 | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 | `bdb868d` | V9 增强：语义链泛化到 account 主体（复用 V6 信誉/风险与 task_runs，修正跨类型主键碰撞） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `599fd4c` | V9 增强：语义链泛化到 task 主体（UUID subject_id，Intent/Policy 继承自所属 lottery） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 
 ## 记录原则
 

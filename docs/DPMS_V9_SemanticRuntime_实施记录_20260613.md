@@ -94,9 +94,23 @@ V9 的重点**不是新增决策能力**，而是新增一个**纯聚合的解�
 
 新增 2 项纯模块测试（account 意图用信誉/档位且不带驱动子句、lottery 仍带驱动子句），core 单元测试增至 **197 项全部通过**；`app.main` 导入正常（94 条路由不变，同一端点现支持两类主体）；`npm run build` 通过（127 modules）。安全边界不变：account 语义链同样只读、advisory，account 的 Policy 层在尚未产生 account 级门禁决策时按 fail-soft 显示"暂无决策"。
 
+## 后续增强（2026-06-13）：subject_type 泛化到 task
+
+回应「下一步」中"将 `subject_type` 进一步泛化到 `task` 等主体（account 已落地）"，本次把语义链扩展到 **lottery + account + task** 三类主体，是 V9 规划范围内最后一个 subject_type 候选。仍**不新增数据表、不新增决策权**：
+
+- **关键差异：`task` 的 `subject_id` 是 UUID 字符串**（`task_runs.task_id`，`CHAR(36)`），不能像 lottery/account 一样 `int(subject_id)`。`semantic_trace()` 因此重排：先取主体无关的 institution/transition；`subject_type == "task"` 时跳过整数解析，交给新函数 `_build_task_layers(task_id)`；其余两类主体的整数校验与原逻辑一致（非整数仍 400）。
+- **`_build_task_layers(task_id)`**：按 `task_id` 取单条 `task_runs` 行（含 `lottery_id`/`account_id`/`status`/`task_mode`/三个时间字段），404 若不存在。一个任务运行本身没有策略/风险记录——
+  - **Intent** 继承自其 `lottery_id`：直接复用既有 `_build_intent(lottery_id)`（V5/V6.5，与 lottery 主体完全一致的取数路径）。
+  - **Policy** 继承自该 lottery 的最新门禁决策：`_latest_decision("lottery", str(lottery_id))`（`policy_decisions.subject_id` 本就存 `str(lottery_id)`，无需额外处理）。
+  - **Execution** 就是这一条记录本身：`{status, task_runs: [row], count: 1, latest_run_status: status}`。
+- **纯模块 `trace.py` 零改动**：`_intent_score_tier` 已能渲染继承来的 lottery 意图（评分/档位/首要驱动）；执行叙述模板 "across {n} task run(s)" 对 `n=1` 同样成立；两条既有一致性检查在 task 主体上行为良好——①"门禁阻塞却执行成功"现在是针对**这一条具体执行记录**的精确提示；③"lottery 状态滞后于最近任务运行"因 `execution.status` 与 `latest_run_status` 取自同一行而恒等，对 task 主体是结构性 no-op（不会误报）。
+- **前端 `SemanticTrace.jsx`**：主体类型下拉新增"任务运行"；选中后 ID 输入框切换为自由文本（UUID）并显示对应占位提示；Execution 卡片对 task 主体额外展示 `task_mode`（`dry_run`/`real_run`），不再重复显示与 `status` 相同的"最近运行状态"。i18n 两端新增 `semantic.subjectTypes.task`、`semantic.lookupPlaceholderTask`、`semantic.execution.taskMode`。
+
+新增 3 项纯模块测试（task 主体渲染继承意图与单条执行记录；继承的门禁阻塞配合该次成功执行被提示；"滞后"检查对 task 恒为空），core 单元测试增至 **200 项全部通过**；`app.main` 导入正常（94 条路由不变，同一端点现支持三类主体）；`npm run build` 通过（127 modules）。安全边界不变：task 语义链同样只读、advisory，Intent/Policy 完全来自既有 lottery 数据的复用查询，未引入新取数路径。
+
 ## 下一步
 
-V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：继续为 `consistency_checks` 增补跨层不变量；将 `subject_type` 进一步泛化到 `task` 等主体（account 已落地）。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
+V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑，其 `subject_type` 泛化候选（lottery / account / task）均已落地。后续如需支持新的主体类型，可复用本次确立的分流模式（institution/transition 主体无关，仅 intent/policy/execution 按主体接入）；`consistency_checks` 仍可按需增补新的跨层不变量。规划基线以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准；若两份文档暂无新计划项，V9 阶段的增量增强可视为完成。
 
 ## 对应 Git 提交
 
@@ -104,3 +118,4 @@ V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最
 - `5e3c90a Link Governance real-run panel and decisions to the Semantic Trace`
 - `15de710 Add a third semantic consistency check: stale lottery status after a succeeded run`
 - `bdb868d Generalize the semantic trace to account subjects alongside lotteries`
+- `599fd4c Generalize the semantic trace to task-run subjects`
