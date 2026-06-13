@@ -14,6 +14,7 @@ import Learning from './pages/Learning';
 import Lotteries from './pages/Lotteries';
 import RiskCenter from './pages/RiskCenter';
 import RiskIntelligence from './pages/RiskIntelligence';
+import SemanticTrace from './pages/SemanticTrace';
 import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
 import TransitionGraph from './pages/TransitionGraph';
@@ -30,6 +31,7 @@ const pages = {
   learning: { Component: Learning },
   governance: { Component: Governance },
   transitions: { Component: TransitionGraph },
+  semantic: { Component: SemanticTrace },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },

@@ -1797,3 +1797,37 @@ button:disabled {
     width: 100%;
   }
 }
+
+/* Semantic Runtime (V9 / S8): five-layer trace cards + narrative list. */
+.alert-warn {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.reason-list-block {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.semantic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.semantic-card {
+  border-top: 4px solid var(--accent);
+}
+
+@media (max-width: 920px) {
+  .semantic-grid {
+    grid-template-columns: 1fr;
+  }
+}

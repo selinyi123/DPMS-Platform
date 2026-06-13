@@ -21,7 +21,7 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic
 
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
@@ -530,6 +530,8 @@ app.include_router(learning.router, prefix="/api/learning", tags=["learning"])
 app.include_router(governance.router, prefix="/api/governance", tags=["governance"])
 
 app.include_router(transitions.router, prefix="/api/transitions", tags=["transitions"])
+
+app.include_router(semantic.router, prefix="/api/semantic", tags=["semantic"])
 
 
 @app.get("/api/auth/me")

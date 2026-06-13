@@ -37,6 +37,7 @@ $mappings = @(
     @{ Source = "docs\DPMS_DecisionExplainability_实施记录_20260611.md"; Destination = "02_架构演进\DPMS_DecisionExplainability_实施记录_20260611.md" },
     @{ Source = "docs\DPMS_V5.5-V7_RuntimeExpansion_实施记录_20260612.md"; Destination = "02_架构演进\DPMS_V5.5-V7_RuntimeExpansion_实施记录_20260612.md" },
     @{ Source = "docs\DPMS_V8_TransitionRuntime_实施记录_20260613.md"; Destination = "02_架构演进\DPMS_V8_TransitionRuntime_实施记录_20260613.md" },
+    @{ Source = "docs\DPMS_V9_SemanticRuntime_实施记录_20260613.md"; Destination = "02_架构演进\DPMS_V9_SemanticRuntime_实施记录_20260613.md" },
     @{ Source = "docs\DPMS_ShadowRun_实施记录_20260605.md"; Destination = "03_工作流与运行时\DPMS_ShadowRun_实施记录_20260605.md" },
     @{ Source = "docs\DPMS_RuntimeRollback_实施记录_20260606.md"; Destination = "03_工作流与运行时\DPMS_RuntimeRollback_实施记录_20260606.md" },
     @{ Source = "docs\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md"; Destination = "03_工作流与运行时\DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611.md" },
