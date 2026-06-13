@@ -41,7 +41,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`（开发分支 `claude/code-review-ul0pqt`）
 - 最近功能提交：S8 Semantic Runtime（Intent→Execution 语义执行链，纯只读聚合解释层，不新增数据表），详见 [[DPMS_V9_SemanticRuntime_实施记录_20260613]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]
-- 测试基线：core **195 项**（94 + 26 + 15 + 14 + 15 + 19 + 10 + 2）+ worker 21 项单元测试通过
+- 测试基线：core **197 项**（94 + 26 + 15 + 14 + 15 + 19 + 10 + 4）+ worker 21 项单元测试通过
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -97,7 +97,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - S5 前半（已完成 / V6.5）：Learning Runtime（Feature Store + 透明概率模型，advisory-only）。
 - S6（已完成 / V7）：Governance Runtime（real-run 门禁制度化为可版本化、可回放的 Policy Object）。
 - S7（已完成 / V8）：Transition Runtime（策略迁移图 / 制度血统，发布与激活分离，宽松化变更强制留痕）。
-- S8（已完成 / V9）：Semantic Runtime（Intent → Institution → Policy → Transition → Execution 语义执行链，纯只读聚合解释层，不新增数据表）。
+- S8（已完成 / V9）：Semantic Runtime（Intent → Institution → Policy → Transition → Execution 语义执行链，纯只读聚合解释层，不新增数据表；已泛化至 lottery + account 两类主体）。
 
 运营侧人工关卡（保持不变）：
 

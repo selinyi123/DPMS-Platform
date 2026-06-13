@@ -5,19 +5,22 @@ import { useUi } from '../uiContext';
 
 export default function SemanticTrace() {
   const { t, language, pageParams } = useUi();
+  const [subjectType, setSubjectType] = useState('lottery');
   const [subjectId, setSubjectId] = useState('');
   const [trace, setTrace] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const lookup = async (rawId) => {
+  const lookup = async (rawId, rawType) => {
     const id = String(rawId ?? subjectId).trim();
+    const type = rawType ?? subjectType;
     if (!id) return;
     setSubjectId(id);
+    setSubjectType(type);
     setLoading(true);
     setError('');
     try {
-      const data = await fetchJSON(`/semantic/trace/lottery/${encodeURIComponent(id)}`);
+      const data = await fetchJSON(`/semantic/trace/${type}/${encodeURIComponent(id)}`);
       setTrace(data);
     } catch (err) {
       setError(err.message);
@@ -28,10 +31,11 @@ export default function SemanticTrace() {
   };
 
   // Deep link from another page (e.g. Governance) pre-fills and auto-traces.
+  // subjectType defaults to lottery so existing Governance links keep working.
   useEffect(() => {
     const deepId = pageParams?.subjectId;
     if (deepId != null && String(deepId).trim() !== '') {
-      lookup(deepId);
+      lookup(deepId, pageParams?.subjectType || 'lottery');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageParams]);
@@ -49,7 +53,9 @@ export default function SemanticTrace() {
   const execution = trace?.execution || {};
   const lineage = transition.lineage || [];
   const latestHop = lineage.length ? lineage[lineage.length - 1] : null;
-  const hasIntent = intent.strategy_score != null || intent.priority_tier != null;
+  const isAccount = subjectType === 'account';
+  const hasIntent = intent.strategy_score != null || intent.priority_tier != null
+    || intent.reputation_score != null || intent.account_tier != null;
   const failedGates = (policy.reasons || [])
     .map(r => (typeof r === 'string' ? r : r?.code))
     .filter(Boolean);
@@ -74,6 +80,17 @@ export default function SemanticTrace() {
 
       <div className="panel">
         <div className="stack-form">
+          <label>
+            <span>{t('semantic.subjectTypeLabel')}</span>
+            <select
+              className="input"
+              value={subjectType}
+              onChange={e => setSubjectType(e.target.value)}
+            >
+              <option value="lottery">{t('semantic.subjectTypes.lottery')}</option>
+              <option value="account">{t('semantic.subjectTypes.account')}</option>
+            </select>
+          </label>
           <label>
             <span>{t('semantic.lookupLabel')}</span>
             <input
@@ -118,6 +135,14 @@ export default function SemanticTrace() {
             <div className="panel semantic-card">
               <div className="panel-title">{t('semantic.layers.intent')}</div>
               {hasIntent ? (
+                isAccount ? (
+                <>
+                  {kv(t('semantic.intent.reputationScore'), intent.reputation_score)}
+                  {kv(t('semantic.intent.accountTier'), intent.account_tier)}
+                  {intent.forecast_band != null && kv(t('semantic.intent.forecastBand'), intent.forecast_band)}
+                  {intent.recommended_action != null && kv(t('semantic.intent.recommendedAction'), intent.recommended_action)}
+                </>
+                ) : (
                 <>
                   {kv(t('semantic.intent.strategyScore'), intent.strategy_score)}
                   {kv(t('semantic.intent.priorityTier'), intent.priority_tier)}
@@ -132,6 +157,7 @@ export default function SemanticTrace() {
                     </div>
                   )}
                 </>
+                )
               ) : <div className="empty-cell">{t('semantic.intent.none')}</div>}
             </div>
 

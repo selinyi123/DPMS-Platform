@@ -19,39 +19,59 @@ from fastapi import APIRouter, HTTPException
 from app.api.governance import _load_active_policy
 from app.api.learning import target_predictions
 from app.api.lotteries import explain_lottery_strategy, parse_json_field
+from app.api.risk_intel import account_risk_intelligence
 from app.api.transitions import policy_lineage
 from app.db import database
 from app.governance.policy import REAL_RUN_GATE_POLICY_KEY
 from app.semantic.trace import build_semantic_trace
+from app.strategy.engine import account_tier
 
 
 router = APIRouter()
 
+# Subject types the trace can assemble today. Both share the institution and
+# transition layers (the real-run gate governs lotteries; account-level
+# decisions, when present, are recorded under the same policy object) and
+# differ only in their intent and execution sources.
+SUPPORTED_SUBJECTS = {"lottery", "account"}
+
 
 @router.get("/trace/{subject_type}/{subject_id}")
 async def semantic_trace(subject_type: str, subject_id: str):
-    """Return the five-layer semantic trace for a subject (currently a lottery)."""
-    if subject_type != "lottery":
-        raise HTTPException(400, detail="Only subject_type='lottery' is supported")
+    """Return the five-layer semantic trace for a lottery or an account."""
+    if subject_type not in SUPPORTED_SUBJECTS:
+        supported = ", ".join(sorted(SUPPORTED_SUBJECTS))
+        raise HTTPException(400, detail=f"subject_type must be one of: {supported}")
     try:
-        lottery_id = int(subject_id)
+        numeric_id = int(subject_id)
     except (TypeError, ValueError):
-        raise HTTPException(400, detail="subject_id must be an integer lottery id")
+        raise HTTPException(400, detail="subject_id must be an integer id")
 
-    lottery = await database.fetch_one(
-        "SELECT id, status FROM lotteries WHERE id = :id", {"id": lottery_id}
-    )
-    if not lottery:
-        raise HTTPException(404, detail="Lottery not found")
-
-    intent = await _build_intent(lottery_id)
+    # Institution and transition are subject-agnostic: the same policy object
+    # and its lineage govern every subject under this real-run gate.
     institution = await _build_institution(REAL_RUN_GATE_POLICY_KEY)
-    policy_decision = await _latest_decision(subject_id)
     transition_lineage = await policy_lineage(REAL_RUN_GATE_POLICY_KEY)
-    execution = await _build_execution(lottery_id, lottery["status"])
+    policy_decision = await _latest_decision(subject_type, subject_id)
+
+    if subject_type == "lottery":
+        lottery = await database.fetch_one(
+            "SELECT id, status FROM lotteries WHERE id = :id", {"id": numeric_id}
+        )
+        if not lottery:
+            raise HTTPException(404, detail="Lottery not found")
+        intent = await _build_intent(numeric_id)
+        execution = await _build_execution(numeric_id, lottery["status"])
+    else:  # account
+        account = await database.fetch_one(
+            "SELECT id, status FROM accounts WHERE id = :id", {"id": numeric_id}
+        )
+        if not account:
+            raise HTTPException(404, detail="Account not found")
+        intent = await _build_account_intent(numeric_id)
+        execution = await _build_account_execution(numeric_id, account["status"])
 
     return build_semantic_trace(
-        subject_type="lottery",
+        subject_type=subject_type,
         subject_id=subject_id,
         intent=intent,
         institution=institution,
@@ -90,19 +110,46 @@ async def _build_intent(lottery_id: int) -> dict | None:
     return intent
 
 
+async def _build_account_intent(account_id: int) -> dict | None:
+    """Intent layer for an account: reputation/tier and 24h risk forecast (V6)."""
+    try:
+        intel = await account_risk_intelligence(account_id)
+    except HTTPException:
+        return None
+    reputation = intel.get("reputation_score")
+    return {
+        "reputation_score": reputation,
+        "account_tier": account_tier(reputation) if isinstance(reputation, int) else None,
+        "platform": intel.get("platform"),
+        "account_status": intel.get("status"),
+        "forecast_band": intel.get("forecast_band"),
+        "forecast_24h": intel.get("forecast_24h"),
+        "recommended_action": intel.get("recommended_action"),
+        # An account has no learning drivers; keep the key so callers/UI are uniform.
+        "top_drivers": [],
+    }
+
+
 async def _build_institution(policy_key: str) -> dict:
     """Institution layer: which policy object is active, at which version (V7)."""
     policy = await _load_active_policy(policy_key)
     return {"policy_key": policy.get("policy_key"), "active_version": policy.get("version")}
 
 
-async def _latest_decision(subject_id: str) -> dict | None:
-    """Policy layer: the most recent recorded gate decision for this subject (V7)."""
+async def _latest_decision(subject_type: str, subject_id: str) -> dict | None:
+    """Policy layer: the most recent recorded gate decision for this subject (V7).
+
+    Filters on both ``subject_type`` and ``subject_id`` so an account and a
+    lottery that happen to share a numeric id never pick up each other's
+    decision.
+    """
     row = await database.fetch_one(
         """SELECT decision_id, policy_key, policy_version, subject_type, subject_id,
                   outcome, reasons, created_at
-           FROM policy_decisions WHERE subject_id = :sid ORDER BY id DESC LIMIT 1""",
-        {"sid": subject_id},
+           FROM policy_decisions
+           WHERE subject_type = :stype AND subject_id = :sid
+           ORDER BY id DESC LIMIT 1""",
+        {"stype": subject_type, "sid": subject_id},
     )
     if not row:
         return None
@@ -123,6 +170,24 @@ async def _build_execution(lottery_id: int, lottery_status) -> dict:
     runs = [dict(row) for row in rows]
     return {
         "status": lottery_status,
+        "task_runs": runs,
+        "count": len(runs),
+        "latest_run_status": runs[0]["status"] if runs else None,
+    }
+
+
+async def _build_account_execution(account_id: int, account_status) -> dict:
+    """Execution layer for an account: the task runs it actually performed."""
+    rows = await database.fetch_all(
+        """SELECT task_id, status, lottery_id,
+                  COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) AS task_mode,
+                  created_at, finished_at
+           FROM task_runs WHERE account_id = :aid ORDER BY id DESC LIMIT 20""",
+        {"aid": account_id},
+    )
+    runs = [dict(row) for row in rows]
+    return {
+        "status": account_status,
         "task_runs": runs,
         "count": len(runs),
         "latest_run_status": runs[0]["status"] if runs else None,

@@ -120,9 +120,39 @@ class NarrativeLinesTests(unittest.TestCase):
     def test_missing_layers_render_no_record_lines(self):
         trace = build_semantic_trace(subject_type="lottery", subject_id=1)
         en = " ".join(narrative_lines(trace, lang="en"))
-        self.assertIn("no strategy/learning record", en)
+        self.assertIn("no strategy/reputation record", en)
         self.assertIn("no active policy", en)
         self.assertIn("no gate-evaluation decision", en)
+
+    def test_account_intent_uses_reputation_and_tier(self):
+        # An account carries reputation_score/account_tier and no top_drivers;
+        # the generic intent line renders them without a "top driver" clause.
+        trace = build_semantic_trace(
+            subject_type="account", subject_id=7,
+            intent={
+                "reputation_score": 78,
+                "account_tier": "A",
+                "forecast_band": "moderate",
+                "top_drivers": [],
+            },
+            institution={"policy_key": "real_run_gate", "active_version": 1},
+        )
+        en = narrative_lines(trace, lang="en")
+        self.assertIn("Subject 7 scored 78 (tier A).", en[0])
+        self.assertNotIn("top driver", en[0])
+        zh = narrative_lines(trace, lang="zh")
+        self.assertIn("目标 7 评分 78（A 档）。", zh[0])
+
+    def test_lottery_intent_still_appends_top_driver(self):
+        intent, institution, policy_decision, lineage, execution = full_inputs()
+        trace = build_semantic_trace(
+            subject_type="lottery", subject_id=123,
+            intent=intent, institution=institution,
+            policy_decision=policy_decision, transition_lineage=lineage, execution=execution,
+        )
+        en = narrative_lines(trace, lang="en")
+        self.assertIn("Subject 123 scored 82 (tier A)", en[0])
+        self.assertIn("top driver: win_rate", en[0])
 
 
 class ConsistencyChecksTests(unittest.TestCase):

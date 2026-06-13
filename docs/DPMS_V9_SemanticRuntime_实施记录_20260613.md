@@ -83,12 +83,24 @@ V9 的重点**不是新增决策能力**，而是新增一个**纯聚合的解�
 
 新增 2 项单元测试（`test_stale_lottery_status_after_successful_run_is_flagged`、`test_lottery_status_matching_latest_run_has_no_stale_hint`），均通过；core 单元测试增至 **195 项全部通过**（原 193 + 新增 2）。`narrative_lines` 与既有两条检查均未改动，前端 `SemanticTrace.jsx` 无需改动（已通用渲染 `consistency_checks` 列表）。
 
+## 后续增强（2026-06-13）：subject_type 泛化到 account
+
+回应「下一步」中"将 `subject_type` 泛化到 `account`/`task` 等主体"，本次把语义链从"仅 lottery"扩展到 **lottery + account** 两类主体。后端复用 V6 风险情报与 `task_runs`，**不新增数据表、不新增决策权**：
+
+- **纯模块 `trace.py` 保持主体无关**：`narrative_lines` 的意图句改为读取通用 (score, tier)——lottery 用 `strategy_score`/`priority_tier`（V5），account 用 `reputation_score`/`account_tier`（V6）；新增 `_intent_score_tier` 做字段回退。叙述的"首要驱动"子句改为**仅在存在驱动因子时拼接**，因此 account（无学习驱动）输出"目标 7 评分 78（A 档）。"而 lottery 仍输出带驱动的整句。lottery 既有输出逐字不变。
+- **API `semantic.py` 按 `subject_type` 分流**：`SUPPORTED_SUBJECTS = {"lottery", "account"}`；institution/transition 两层主体无关（同一 `real_run_gate` 策略对象与其血统治理所有主体），仅 intent/execution 按主体取数。account 的 intent 复用 `account_risk_intelligence(account_id)`（信誉分 + `account_tier()` + 24h 风险等级 + 建议动作），execution 改按 `task_runs.account_id` 取该账号的运行记录。
+- **修正潜在跨类型主键碰撞**：`_latest_decision` 原仅按 `subject_id` 取最新决策，泛化后 lottery #5 与 account #5 会互相串号；现改为同时按 `subject_type` 与 `subject_id` 过滤（对既有 lottery 行为等价，因当前只写过 `subject_type='lottery'`）。
+- **前端 `SemanticTrace.jsx` 新增主体类型下拉**（抽奖目标 / 账号），查询走 `/semantic/trace/{type}/{id}`；account 的意图卡片展示信誉分/档位/风险等级/建议动作。Governance 既有深链不带 `subjectType`，默认回退 `lottery`，行为不变。i18n 两端新增 `semantic.subjectType*` 与 `semantic.intent.{reputationScore,accountTier,forecastBand,recommendedAction}`。
+
+新增 2 项纯模块测试（account 意图用信誉/档位且不带驱动子句、lottery 仍带驱动子句），core 单元测试增至 **197 项全部通过**；`app.main` 导入正常（94 条路由不变，同一端点现支持两类主体）；`npm run build` 通过（127 modules）。安全边界不变：account 语义链同样只读、advisory，account 的 Policy 层在尚未产生 account 级门禁决策时按 fail-soft 显示"暂无决策"。
+
 ## 下一步
 
-V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：继续为 `consistency_checks` 增补跨层不变量；将 `subject_type` 泛化到 `account`/`task` 等主体。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
+V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：继续为 `consistency_checks` 增补跨层不变量；将 `subject_type` 进一步泛化到 `task` 等主体（account 已落地）。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
 
 ## 对应 Git 提交
 
 - `f61aa98 Add Semantic Runtime (V9 / stage S8): read-only Intent->Execution trace`
 - `5e3c90a Link Governance real-run panel and decisions to the Semantic Trace`
 - `15de710 Add a third semantic consistency check: stale lottery status after a succeeded run`
+- `__PENDING__` Generalize the semantic trace to account subjects alongside lotteries

@@ -130,8 +130,10 @@ def _failed_gate_codes(policy: dict) -> list[str]:
 # Narrative templates, kept side by side so English and Chinese never drift.
 _TEMPLATES = {
     "en": {
-        "intent": "Subject {sid} scored {score} (tier {tier}); top driver: {driver}.",
-        "intent_none": "Intent: no strategy/learning record for this subject yet.",
+        "intent": "Subject {sid} scored {score} (tier {tier})",
+        "intent_driver": "; top driver: {driver}",
+        "intent_end": ".",
+        "intent_none": "Intent: no strategy/reputation record for this subject yet.",
         "institution": "Governing policy '{key}' is currently active at version v{ver}.",
         "institution_none": "Institution: no active policy object recorded.",
         "policy_block": "Gate evaluation returned '{outcome}'; failing gate(s): {gates}; next action: {action}.",
@@ -143,8 +145,10 @@ _TEMPLATES = {
         "execution_none": "Execution: no task runs recorded for this subject.",
     },
     "zh": {
-        "intent": "目标 {sid} 评分 {score}（{tier} 档）；首要驱动：{driver}。",
-        "intent_none": "意图：该目标暂无策略/学习记录。",
+        "intent": "目标 {sid} 评分 {score}（{tier} 档）",
+        "intent_driver": "；首要驱动：{driver}",
+        "intent_end": "。",
+        "intent_none": "意图：该目标暂无策略/信誉记录。",
         "institution": "适用制度 '{key}' 当前生效版本为 v{ver}。",
         "institution_none": "制度：暂无生效的策略对象记录。",
         "policy_block": "门禁评估结果为 '{outcome}'；未通过门禁：{gates}；下一步：{action}。",
@@ -156,6 +160,20 @@ _TEMPLATES = {
         "execution_none": "执行：该目标暂无任务运行记录。",
     },
 }
+
+
+def _intent_score_tier(intent: dict):
+    """Generic (score, tier) for the intent line, regardless of subject type.
+
+    A lottery carries ``strategy_score``/``priority_tier`` (V5); an account
+    carries ``reputation_score``/``account_tier`` (V6 risk intelligence). Either
+    set renders the same way, so the narrative stays subject-agnostic.
+    """
+    score = intent.get("strategy_score")
+    if score is None:
+        score = intent.get("reputation_score")
+    tier = intent.get("priority_tier") or intent.get("account_tier")
+    return ("n/a" if score is None else score, tier or "n/a")
 
 
 def narrative_lines(trace: dict, lang: str = "en") -> list[str]:
@@ -170,15 +188,14 @@ def narrative_lines(trace: dict, lang: str = "en") -> list[str]:
 
     intent = _as_dict(trace.get("intent"))
     if intent:
+        score, tier = _intent_score_tier(intent)
+        line = tpl["intent"].format(sid=trace.get("subject_id"), score=score, tier=tier)
         drivers = _as_list(intent.get("top_drivers"))
         top = drivers[0] if drivers else None
-        driver_name = top.get("feature") if isinstance(top, dict) else (top if top else "n/a")
-        lines.append(tpl["intent"].format(
-            sid=trace.get("subject_id"),
-            score=intent.get("strategy_score", "n/a"),
-            tier=intent.get("priority_tier", "n/a"),
-            driver=driver_name,
-        ))
+        driver_name = top.get("feature") if isinstance(top, dict) else top
+        if driver_name:
+            line += tpl["intent_driver"].format(driver=driver_name)
+        lines.append(line + tpl["intent_end"])
     else:
         lines.append(tpl["intent_none"])
 
