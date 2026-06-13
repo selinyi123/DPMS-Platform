@@ -1708,6 +1708,40 @@ button:disabled {
   display: inline-block;
 }
 
+.transition-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.transition-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.transition-edge-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 16px;
+  border-left: 2px dashed var(--panel-border, #e2e8f0);
+}
+
+.transition-edge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  justify-content: flex-start;
+}
+
+:root[data-theme="dark"] .transition-edge-group {
+  border-left-color: #29364c;
+}
+
 .ellipsis-cell {
   max-width: 320px;
   overflow: hidden;

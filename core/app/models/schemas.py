@@ -302,3 +302,23 @@ class ExperimentStopRequest(BaseModel):
 class ExperimentBranchStopRequest(BaseModel):
 
     reason: Optional[str] = "manual branch stop"
+
+
+class PolicyPublishRequest(BaseModel):
+
+    policy_key: str = "real_run_gate"
+
+    definition: dict[str, Any]
+
+    reason_code: str
+
+    rollback_condition: str
+
+    loosening_justification: Optional[str] = None
+
+    note: Optional[str] = None
+
+
+class PolicyActivateRequest(BaseModel):
+
+    note: Optional[str] = None

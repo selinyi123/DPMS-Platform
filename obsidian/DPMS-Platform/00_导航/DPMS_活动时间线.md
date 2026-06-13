@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-11
+updated: 2026-06-13
 ---
 
 # DPMS 活动时间线
@@ -74,6 +74,12 @@ updated: 2026-06-11
 | --- | --- | --- |
 | `02a8d99` | 一次性推进 V5.5/V6/V6.5/V7：Experiment / Risk Intelligence / Learning / Governance Runtime | [[DPMS_V5.5-V7_RuntimeExpansion_实施记录_20260612]] |
 | `02a8d99` | 制定 V8 Transition Runtime 与 V9 Semantic Runtime 后续版本规划 | [[DPMS_V8-V9_后续版本规划_20260612]] |
+
+## 2026-06-13
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| （本次提交） | 推进 V8：Transition Runtime（策略迁移图，发布/激活分离，宽松化强制留痕） | [[DPMS_V8_TransitionRuntime_实施记录_20260613]] |
 
 ## 记录原则
 

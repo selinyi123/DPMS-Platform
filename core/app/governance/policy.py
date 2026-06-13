@@ -131,7 +131,13 @@ def replay_decision(*, policy: dict, record: dict) -> dict:
 
 
 def diff_policies(old: dict, new: dict) -> dict:
-    """Structurally diff two policy versions for change review."""
+    """Structurally diff two policy versions for change review.
+
+    ``added_gates_required``/``changed_required_to`` map each added or
+    required-changed gate code to its *new* ``required`` flag, so V8's
+    ``classify_transition`` can tell a stricter change from a looser one
+    without re-reading the full policy objects.
+    """
     old_gates = {g["code"]: g for g in old.get("gates", []) if g.get("code")}
     new_gates = {g["code"]: g for g in new.get("gates", []) if g.get("code")}
     added = [code for code in new_gates if code not in old_gates]
@@ -147,4 +153,6 @@ def diff_policies(old: dict, new: dict) -> dict:
         "added_gates": added,
         "removed_gates": removed,
         "changed_required": changed_required,
+        "added_gates_required": {code: bool(new_gates[code].get("required", True)) for code in added},
+        "changed_required_to": {code: bool(new_gates[code].get("required", True)) for code in changed_required},
     }

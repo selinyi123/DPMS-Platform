@@ -1,5 +1,5 @@
 
-import sys, asyncio, warnings
+import json, sys, asyncio, warnings
 
 from pathlib import Path
 
@@ -21,9 +21,10 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions
 
 from app.config import settings
+from app.governance.policy import DEFAULT_REAL_RUN_POLICY
 
 from app.utils.log import structured_log
 from app.security import authenticate_request
@@ -391,6 +392,42 @@ async def ensure_governance_schema():
           INDEX idx_policy_decision_policy (policy_key, policy_version, created_at)
         ) ENGINE=InnoDB"""
     )
+    # Seed policy_versions with v1 = the built-in default so the first ever
+    # transition has a real `from_version` to diff against, instead of a
+    # special-cased "no history" branch.
+    await database.execute(
+        """INSERT INTO policy_versions (policy_key, version, definition, note, active, created_by)
+           VALUES (:policy_key, :version, :definition, 'seed: built-in default', 1, 'system')
+           ON DUPLICATE KEY UPDATE policy_key = policy_key""",
+        {
+            "policy_key": DEFAULT_REAL_RUN_POLICY["policy_key"],
+            "version": DEFAULT_REAL_RUN_POLICY["version"],
+            "definition": json.dumps(DEFAULT_REAL_RUN_POLICY, ensure_ascii=False),
+        },
+    )
+    # Transition Runtime (V8 / S7): append-only audit trail of how policy
+    # versions evolved (reason, classification, rollback condition).
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS policy_transitions (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          policy_key VARCHAR(64) NOT NULL,
+          from_version INT NOT NULL,
+          to_version INT NOT NULL,
+          reason_code VARCHAR(32) NOT NULL,
+          classification VARCHAR(16) NOT NULL,
+          trigger_event VARCHAR(128) NULL,
+          experiment_id CHAR(36) NULL,
+          diff JSON NOT NULL,
+          impact_scope JSON NULL,
+          rollback_condition TEXT NOT NULL,
+          loosening_justification TEXT NULL,
+          requires_extra_review TINYINT NOT NULL DEFAULT 0,
+          activated_at TIMESTAMP NULL,
+          created_by VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_policy_transition_key (policy_key, to_version)
+        ) ENGINE=InnoDB"""
+    )
 
 
 async def ensure_column(table: str, column: str, definition: str, after: str | None = None) -> None:
@@ -491,6 +528,8 @@ app.include_router(risk_intel.router, prefix="/api/risk", tags=["risk-intel"])
 app.include_router(learning.router, prefix="/api/learning", tags=["learning"])
 
 app.include_router(governance.router, prefix="/api/governance", tags=["governance"])
+
+app.include_router(transitions.router, prefix="/api/transitions", tags=["transitions"])
 
 
 @app.get("/api/auth/me")

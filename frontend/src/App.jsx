@@ -16,6 +16,7 @@ import RiskCenter from './pages/RiskCenter';
 import RiskIntelligence from './pages/RiskIntelligence';
 import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
+import TransitionGraph from './pages/TransitionGraph';
 import { useUi } from './uiContext';
 
 const pages = {
@@ -28,6 +29,7 @@ const pages = {
   riskIntel: { Component: RiskIntelligence },
   learning: { Component: Learning },
   governance: { Component: Governance },
+  transitions: { Component: TransitionGraph },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },
