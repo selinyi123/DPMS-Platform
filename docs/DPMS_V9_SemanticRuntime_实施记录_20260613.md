@@ -64,10 +64,22 @@ V9 的重点**不是新增决策能力**，而是新增一个**纯聚合的解�
 - Intent 的 `top_drivers`/`probability` 依赖学习预测集合（仅含 `pending`/`claimed` 目标）；目标不在该集合时这两项为空，叙述以策略评分/档位为主，属预期 fail-soft 行为。
 - 带数据库的端到端联调（针对一个有真实门禁评估记录的 lottery 验证五段齐备）依赖部署环境的 MySQL；本次在无 DB 环境完成纯逻辑测试、路由注册与前端构建验证，端到端联调留待本机部署环境执行。
 
+## 后续增强（2026-06-13）：Governance ↔ Semantic 交叉链接
+
+规划文档（V9 前端章节）要求"语义链可作为 Governance 页'评估真实运行门禁'面板的'查看完整语义链'跳转目标，避免与 V7 页面重复造轮子"。本次补齐该集成，**纯前端改动，未触碰任何后端/接口**：
+
+- **跨页导航下沉到 `uiContext`**：把原本散落在 `App.jsx` 内的 `page` 状态上移到全局 `UiProvider`，新增 `pageParams` 与 `navigate(nextPage, params)`。导航栏按钮走 `navigate(key)`（不带 params，等同于清空上一次的深链负载），任意页面均可通过 `navigate('semantic', { subjectId })` 携带参数深链跳转。`App.jsx` 改为从 context 读取 `page`/`navigate`，并对未知 page key 回退 `dashboard`。
+- **Governance 页两处跳转点**：①"评估真实运行门禁"结果面板底部新增"查看完整语义链"按钮，携带刚评估的 `lotteryId` 跳转；②"近期决策"表中 `subject_type === 'lottery'` 的行新增同名按钮，携带该决策的 `subject_id` 跳转。
+- **`SemanticTrace.jsx` 消费深链参数**：`useEffect` 监听 `pageParams.subjectId`，存在时自动回填输入框并触发查询（`lookup` 重构为可接收显式 id）；手动从导航栏进入时 params 为空，行为不变。
+- i18n 新增 `governance.viewSemanticTrace`（中"查看完整语义链"/英"View full semantic trace"）。
+
+安全边界不变：跳转只是把同一个只读 `GET /api/semantic/trace/lottery/{id}` 的入口前置到 Governance 操作流里，不新增任何写操作或决策权。`npm run build` 通过（127 modules），core 193 项测试不受影响（本次零后端改动）。
+
 ## 下一步
 
-V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：把语义链作为 Governance 页"评估真实运行门禁"面板的跳转目标；为 `consistency_checks` 增补更多跨层不变量；将 `subject_type` 泛化到 `account`/`task` 等主体。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
+V9 是 `docs/DPMS_能力演化路线图_v4-v9_20260605.md` 规划范围内的最后一个里程碑。后续可选方向（均为既有运行时的深化，而非新增安全性质）：为 `consistency_checks` 增补更多跨层不变量；将 `subject_type` 泛化到 `account`/`task` 等主体。规划基线仍以 [[DPMS_总设计方案_v1_20260611]] 与 [[DPMS_V8-V9_后续版本规划_20260612]] 为准。
 
 ## 对应 Git 提交
 
 - `f61aa98 Add Semantic Runtime (V9 / stage S8): read-only Intent->Execution trace`
+- `__PENDING__ Link Governance real-run panel and decisions to the Semantic Trace`

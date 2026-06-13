@@ -1,18 +1,19 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { fetchJSON } from '../api';
 import { useUi } from '../uiContext';
 
 export default function SemanticTrace() {
-  const { t, language } = useUi();
+  const { t, language, pageParams } = useUi();
   const [subjectId, setSubjectId] = useState('');
   const [trace, setTrace] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const lookup = async () => {
-    const id = subjectId.trim();
+  const lookup = async (rawId) => {
+    const id = String(rawId ?? subjectId).trim();
     if (!id) return;
+    setSubjectId(id);
     setLoading(true);
     setError('');
     try {
@@ -25,6 +26,15 @@ export default function SemanticTrace() {
       setLoading(false);
     }
   };
+
+  // Deep link from another page (e.g. Governance) pre-fills and auto-traces.
+  useEffect(() => {
+    const deepId = pageParams?.subjectId;
+    if (deepId != null && String(deepId).trim() !== '') {
+      lookup(deepId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageParams]);
 
   const onKeyDown = (e) => {
     if (e.key === 'Enter') lookup();

@@ -836,6 +836,7 @@ const dictionaries = {
       replayMismatch: '重放结果不一致',
       versionMatch: '策略版本一致',
       versionMismatch: '策略版本不一致',
+      viewSemanticTrace: '查看完整语义链',
       gateCode: '门禁项',
       outcomes: {
         allow: '允许',
@@ -1836,6 +1837,7 @@ const dictionaries = {
       replayMismatch: 'Replay mismatch',
       versionMatch: 'Policy version matches',
       versionMismatch: 'Policy version differs',
+      viewSemanticTrace: 'View full semantic trace',
       gateCode: 'Gate',
       outcomes: {
         allow: 'Allow',
@@ -2009,6 +2011,8 @@ export function UiProvider({ children }) {
   const [language, setLanguageState] = useState(() => localStorage.getItem('dpms_language') || 'zh');
   const [theme, setThemeState] = useState(() => localStorage.getItem('dpms_theme') || 'system');
   const [toasts, setToasts] = useState([]);
+  const [page, setPage] = useState('dashboard');
+  const [pageParams, setPageParams] = useState({});
 
   useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
@@ -2047,9 +2051,17 @@ export function UiProvider({ children }) {
     return current || path;
   }, [language]);
 
+  // Cross-page navigation with an optional params payload (e.g. a deep link
+  // from Governance into the Semantic Trace for a specific lottery). Manual
+  // nav-bar clicks pass no params, which clears any stale deep-link payload.
+  const navigate = useCallback((nextPage, params = {}) => {
+    setPageParams(params);
+    setPage(nextPage);
+  }, []);
+
   const value = useMemo(
-    () => ({ language, setLanguage, theme, setTheme, toasts, notify, t }),
-    [language, notify, setLanguage, setTheme, t, theme, toasts],
+    () => ({ language, setLanguage, theme, setTheme, toasts, notify, t, page, setPage, pageParams, navigate }),
+    [language, notify, setLanguage, setTheme, t, theme, toasts, page, pageParams, navigate],
   );
 
   return <UiContext.Provider value={value}>{children}</UiContext.Provider>;

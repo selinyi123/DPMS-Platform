@@ -39,14 +39,13 @@ const pages = {
 };
 
 export default function App() {
-  const [page, setPage] = useState('dashboard');
   const [tokenDraft, setTokenDraft] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(
     () => !window.matchMedia('(max-width: 920px)').matches,
   );
   const [authState, setAuthState] = useState({ status: 'unknown', role: '', error: '' });
-  const PageComponent = pages[page].Component;
-  const { language, setLanguage, theme, setTheme, t } = useUi();
+  const { language, setLanguage, theme, setTheme, t, page, navigate } = useUi();
+  const PageComponent = (pages[page] || pages.dashboard).Component;
   const authText = language === 'en'
     ? {
       label: 'Admin token',
@@ -123,7 +122,7 @@ export default function App() {
 
         <nav className="nav-list">
           {Object.entries(pages).map(([key]) => (
-            <NavButton key={key} active={page === key} onClick={() => setPage(key)}>
+            <NavButton key={key} active={page === key} onClick={() => navigate(key)}>
               {t(`nav.${key}`)}
             </NavButton>
           ))}
