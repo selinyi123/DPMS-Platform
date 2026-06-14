@@ -104,6 +104,9 @@ updated: 2026-06-14
 | `09fdb82` | 一致性事务化：派发原子化 + 事务性 outbox（至少一次、不重复投递、活动任务唯一约束）+ worker 任务生命周期事务化 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 | `a87b1ac` | real-run 门禁合流：Governance policy 成为唯一权威，decision_id/policy_version 绑定 task_runs | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 | `edc016a` | P2 长期演化：指纹资产隔离池、CookieVault AAD 上下文绑定、关键事件死信表 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `126db99` | 生产部署基线：production 密钥校验、API/nginx 安全响应头与 CSP、日志脱敏、移除 worker SYS_ADMIN | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `5c49bb3` | 前端统一 auth guard：未登录不渲染数据页面，改为登录卡 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `820b44d` | 版本化 SQL 迁移框架（schema_migrations + core/migrations）+ baseline 0001 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 
 ## 记录原则
 
