@@ -16,7 +16,7 @@ gate the trace describes.
 
 from fastapi import APIRouter, HTTPException
 
-from app.api.governance import _load_active_policy
+from app.services.real_run_gate import load_active_policy
 from app.api.learning import target_predictions
 from app.api.lotteries import explain_lottery_strategy, parse_json_field
 from app.api.risk_intel import account_risk_intelligence
@@ -140,7 +140,7 @@ async def _build_account_intent(account_id: int) -> dict | None:
 
 async def _build_institution(policy_key: str) -> dict:
     """Institution layer: which policy object is active, at which version (V7)."""
-    policy = await _load_active_policy(policy_key)
+    policy = await load_active_policy(policy_key)
     return {"policy_key": policy.get("policy_key"), "active_version": policy.get("version")}
 
 
@@ -158,6 +158,21 @@ async def _latest_decision(subject_type: str, subject_id: str) -> dict | None:
            WHERE subject_type = :stype AND subject_id = :sid
            ORDER BY id DESC LIMIT 1""",
         {"stype": subject_type, "sid": subject_id},
+    )
+    if not row:
+        return None
+    record = dict(row)
+    record["reasons"] = parse_json_field(record.get("reasons")) or []
+    return record
+
+
+async def _decision_by_id(decision_id: str) -> dict | None:
+    """Fetch one recorded gate decision by its id (the task-bound decision)."""
+    row = await database.fetch_one(
+        """SELECT decision_id, policy_key, policy_version, subject_type, subject_id,
+                  outcome, reasons, created_at
+           FROM policy_decisions WHERE decision_id = :did""",
+        {"did": decision_id},
     )
     if not row:
         return None
@@ -212,6 +227,7 @@ async def _build_task_layers(task_id: str):
     row = await database.fetch_one(
         """SELECT task_id, lottery_id, account_id, status,
                   COALESCE(task_mode, IF(dry_run = 1, 'dry_run', 'real_run')) AS task_mode,
+                  decision_id, policy_version,
                   created_at, started_at, finished_at
            FROM task_runs WHERE task_id = :tid""",
         {"tid": task_id},
@@ -220,7 +236,13 @@ async def _build_task_layers(task_id: str):
         raise HTTPException(404, detail="Task run not found")
     run = dict(row)
     intent = await _build_intent(run["lottery_id"])
-    policy_decision = await _latest_decision("lottery", str(run["lottery_id"]))
+    # Prefer the exact gate decision bound to this task at dispatch (P1-4); fall
+    # back to the lottery's latest decision for legacy tasks with no binding.
+    policy_decision = None
+    if run.get("decision_id"):
+        policy_decision = await _decision_by_id(run["decision_id"])
+    if policy_decision is None:
+        policy_decision = await _latest_decision("lottery", str(run["lottery_id"]))
     execution = {
         "status": run["status"],
         "task_runs": [run],

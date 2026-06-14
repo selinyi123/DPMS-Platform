@@ -262,6 +262,9 @@ async def ensure_runtime_schema():
         structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions MODIFY status", error=str(exc))
     await ensure_column("task_runs", "screenshot_path", "VARCHAR(512) NULL")
     await ensure_column("task_runs", "task_mode", "VARCHAR(32) NOT NULL DEFAULT 'dry_run'", after="dry_run")
+    # P1-4: bind each real-run task to the gate decision that authorised it.
+    await ensure_column("task_runs", "decision_id", "CHAR(36) NULL", after="task_mode")
+    await ensure_column("task_runs", "policy_version", "INT NULL", after="decision_id")
     try:
         await database.execute("UPDATE task_runs SET task_mode = IF(dry_run = 1, 'dry_run', 'real_run') WHERE task_mode IS NULL OR task_mode = ''")
     except Exception as exc:
