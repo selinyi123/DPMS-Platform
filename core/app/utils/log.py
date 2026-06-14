@@ -4,6 +4,29 @@ import json, asyncio
 from datetime import datetime, timezone
 
 
+# Mirrors app.security.SENSITIVE_KEY_PARTS so structured logs and audit details
+# redact consistently (Phase 4). A kwarg whose name contains any of these is
+# masked before it reaches stdout or the structured_logs stream.
+SENSITIVE_LOG_PARTS = (
+    "cookie",
+    "credential",
+    "password",
+    "secret",
+    "token",
+    "signature",
+    "webhook",
+    "key",
+    "authorization",
+)
+
+
+def _redact_extra(key, value):
+    lowered = str(key).lower()
+    if any(part in lowered for part in SENSITIVE_LOG_PARTS):
+        return "<redacted>"
+    return str(value)
+
+
 
 def structured_log(level: str, event: str, **kwargs):
 
@@ -31,7 +54,7 @@ def structured_log(level: str, event: str, **kwargs):
 
         "latency_ms": kwargs.pop("latency_ms", None),
 
-        "extra": {key: str(value) for key, value in kwargs.items()}
+        "extra": {key: _redact_extra(key, value) for key, value in kwargs.items()}
 
     }
 

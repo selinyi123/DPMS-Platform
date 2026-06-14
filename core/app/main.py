@@ -26,6 +26,7 @@ from app.api import accounts, lotteries, update, notify, metrics, proxies, event
 
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
+from app.security_posture import format_posture_problems, secret_posture
 
 from app.utils.log import structured_log
 from app.security import authenticate_request
@@ -41,6 +42,21 @@ async def lifespan(app: FastAPI):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
         await ensure_runtime_schema()
+
+    # Production secret-posture guard (Phase 4): never run a real deployment on
+    # the shipped default ADMIN_TOKEN / UPDATE_SECRET or an unset ENCRYPTION_KEY.
+    posture_problems = secret_posture(
+        admin_token=settings.admin_token,
+        update_secret=settings.update_secret,
+        encryption_key=settings.encryption_key,
+        database_url=settings.database_url,
+    )
+    if posture_problems:
+        summary = format_posture_problems(posture_problems)
+        if settings.deployment_mode == "production":
+            structured_log("error", "insecure_secret_posture", mode="production", problems=summary)
+            raise RuntimeError(f"Refusing to start in production with insecure secrets: {summary}")
+        structured_log("warning", "insecure_secret_posture", mode=settings.deployment_mode, problems=summary)
 
     # 启动时健康检查
 
@@ -568,6 +584,28 @@ async def require_admin_token(request: Request, call_next):
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
     return await call_next(request)
+
+
+# Security response headers (Phase 4). Registered after the auth middleware so it
+# is the outermost layer and applies to every response, including 401s. API
+# responses are JSON, never embedded HTML, so the CSP can be maximally strict and
+# caches must never store the (often sensitive) bodies.
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+    "Cache-Control": "no-store",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
 
 
 
