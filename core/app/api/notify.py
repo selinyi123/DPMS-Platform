@@ -314,7 +314,8 @@ async def send_serverchan(title: str, content: str):
         raise ValueError("SERVERCHAN_KEY is not configured")
     url = f"https://sctapi.ftqq.com/{serverchan_key}.send"
     async with httpx.AsyncClient() as client:
-        await client.post(url, data={"title": title, "desp": content}, timeout=10)
+        response = await client.post(url, data={"title": title, "desp": content}, timeout=10)
+        response.raise_for_status()
 
 
 async def send_feishu(title: str, content: str):
@@ -329,7 +330,8 @@ async def send_feishu(title: str, content: str):
         },
     }
     async with httpx.AsyncClient() as client:
-        await client.post(feishu_webhook, json=payload, timeout=10)
+        response = await client.post(feishu_webhook, json=payload, timeout=10)
+        response.raise_for_status()
 
 
 async def send_webhook(title: str, content: str):
@@ -337,7 +339,8 @@ async def send_webhook(title: str, content: str):
     if not generic_webhook_url:
         raise ValueError("GENERIC_WEBHOOK_URL is not configured")
     async with httpx.AsyncClient() as client:
-        await client.post(generic_webhook_url, json={"title": title, "content": content}, timeout=10)
+        response = await client.post(generic_webhook_url, json={"title": title, "content": content}, timeout=10)
+        response.raise_for_status()
 
 
 async def send_telegram(title: str, content: str):
@@ -347,11 +350,12 @@ async def send_telegram(title: str, content: str):
         raise ValueError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured")
     url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(
+        response = await client.post(
             url,
             json={"chat_id": telegram_chat_id, "text": f"{title}\n\n{content}"},
             timeout=10,
         )
+        response.raise_for_status()
 
 
 SENDERS = {
