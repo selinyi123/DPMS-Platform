@@ -1840,3 +1840,70 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 }
+
+/* Unified auth guard (Phase 4): the main pane is blocked until the admin token
+   verifies, so unauthenticated users see a clear sign-in prompt instead of
+   pages that would all 401. */
+.auth-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  padding: 24px;
+}
+
+.auth-gate-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 28px;
+  background: var(--surface-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  text-align: center;
+}
+
+.auth-gate-card h2 {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+
+.auth-gate-card p {
+  margin: 0 0 18px;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.auth-gate-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 10px;
+  background: var(--control-bg);
+  color: var(--control-text);
+  box-sizing: border-box;
+}
+
+.auth-gate-card button {
+  width: 100%;
+  min-height: 40px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-gate-card button:hover {
+  background: var(--accent-hover);
+}
+
+.auth-gate-error {
+  margin-top: 12px;
+  color: var(--warning-text);
+  font-size: 13px;
+}
