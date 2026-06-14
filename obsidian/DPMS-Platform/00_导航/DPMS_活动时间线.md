@@ -86,6 +86,15 @@ updated: 2026-06-13
 | `bdb868d` | V9 增强：语义链泛化到 account 主体（复用 V6 信誉/风险与 task_runs，修正跨类型主键碰撞） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 | `599fd4c` | V9 增强：语义链泛化到 task 主体（UUID subject_id，Intent/Policy 继承自所属 lottery） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
 
+## 2026-06-14
+
+运营规模化主线 V10–V13（编排时间 → 编排资源 → 编排广度 → 守住可持续），详见 [[DPMS_V10-V13_运营规模化_后续版本规划_20260614]] 与 [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]]。
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `a37fa1b` | 推进 V10–V13 后端：Scheduling / Capacity / Orchestration / Throughput 四个只读运营规模化运行时（+42 测试，新增 campaign_plans 审计表） | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
+| `a527d13` | V10–V13 前端：四个只读控制台页面（排程/容量/批量编排/吞吐治理）+ 中英 i18n | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
+
 ## 记录原则
 
 - Git 提交是代码变更的权威记录。
