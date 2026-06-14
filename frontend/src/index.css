@@ -1808,6 +1808,15 @@ button:disabled {
   color: var(--warning-text);
 }
 
+.alert-ok {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  background: rgba(5, 150, 105, 0.12);
+  color: #047857;
+}
+
 .reason-list-block {
   margin: 0;
   padding-left: 18px;

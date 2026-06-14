@@ -4,6 +4,7 @@ import { fetchJSON } from './api';
 import NavButton from './components/NavButton';
 import ToastStack from './components/ToastStack';
 import Accounts from './pages/Accounts';
+import Capacity from './pages/Capacity';
 import Dashboard from './pages/Dashboard';
 import Deploy from './pages/Deploy';
 import EventTimeline from './pages/EventTimeline';
@@ -12,11 +13,14 @@ import Governance from './pages/Governance';
 import Knowledge from './pages/Knowledge';
 import Learning from './pages/Learning';
 import Lotteries from './pages/Lotteries';
+import Orchestration from './pages/Orchestration';
 import RiskCenter from './pages/RiskCenter';
 import RiskIntelligence from './pages/RiskIntelligence';
+import Scheduling from './pages/Scheduling';
 import SemanticTrace from './pages/SemanticTrace';
 import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
+import Throughput from './pages/Throughput';
 import TransitionGraph from './pages/TransitionGraph';
 import { useUi } from './uiContext';
 
@@ -32,6 +36,10 @@ const pages = {
   governance: { Component: Governance },
   transitions: { Component: TransitionGraph },
   semantic: { Component: SemanticTrace },
+  scheduling: { Component: Scheduling },
+  capacity: { Component: Capacity },
+  orchestration: { Component: Orchestration },
+  throughput: { Component: Throughput },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },
