@@ -105,7 +105,17 @@ async def list_campaign_drafts(limit: int = 20):
 
 
 async def _load_targets(platform: str | None):
-    """Candidate lotteries with readiness derived purely from recorded data."""
+    """Candidate lotteries with readiness derived purely from recorded data.
+
+    ``gate_ready`` is deliberately strict (P0-4): a single historical ``allow``
+    is NOT enough to stage a real_run wave. The *latest* recorded gate decision
+    for the lottery must be ``allow``, made under the *currently active* policy
+    version, and within the last 24h — so a subsequent ``block``, a policy
+    bump, or a stale decision all correctly drop the target out of real_run.
+    (Full live re-evaluation of the gate per target is the planned next step;
+    this latest-valid-decision check is the conservative interim that never
+    over-permits.)
+    """
     placeholders = ", ".join(f":s{i}" for i in range(len(CANDIDATE_STATUSES)))
     values: dict = {f"s{i}": status for i, status in enumerate(CANDIDATE_STATUSES)}
     where = (
@@ -115,14 +125,30 @@ async def _load_targets(platform: str | None):
     if platform:
         where += " AND l.platform = :platform"
         values["platform"] = platform
+
+    active_row = await database.fetch_one(
+        "SELECT version FROM policy_versions WHERE policy_key = 'real_run_gate' AND active = 1 "
+        "ORDER BY version DESC LIMIT 1"
+    )
+    # No active policy => no target can be gate_ready (fail-closed).
+    values["active_version"] = active_row["version"] if active_row else None
+
     rows = await database.fetch_all(
         f"""SELECT l.id, l.platform, l.value_score,
                    EXISTS(SELECT 1 FROM task_runs tr
                           WHERE tr.lottery_id = l.id AND tr.task_mode = 'shadow_run'
                             AND tr.status = 'succeeded') AS shadow_eligible,
                    EXISTS(SELECT 1 FROM policy_decisions pd
-                          WHERE pd.subject_type = 'lottery' AND pd.subject_id = CAST(l.id AS CHAR)
-                            AND pd.outcome = 'allow') AS gate_ready
+                          WHERE pd.subject_type = 'lottery'
+                            AND pd.subject_id = CAST(l.id AS CHAR)
+                            AND pd.policy_key = 'real_run_gate'
+                            AND pd.id = (SELECT MAX(pd2.id) FROM policy_decisions pd2
+                                         WHERE pd2.subject_type = 'lottery'
+                                           AND pd2.subject_id = CAST(l.id AS CHAR)
+                                           AND pd2.policy_key = 'real_run_gate')
+                            AND pd.outcome = 'allow'
+                            AND pd.policy_version = :active_version
+                            AND pd.created_at >= (UTC_TIMESTAMP() - INTERVAL 24 HOUR)) AS gate_ready
             FROM lotteries l
             WHERE {where}
             ORDER BY l.value_score DESC, l.id ASC LIMIT 500""",

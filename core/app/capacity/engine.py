@@ -84,10 +84,13 @@ def compute_capacity(
 
     for platform, bucket in per_platform.items():
         max_daily = bucket["max_daily_per_account"]
-        # Sustainable supply is bounded by both safe accounts and the healthy
-        # proxies actually backing them — whichever is scarcer.
-        backing = min(bucket["safe_accounts"], bucket["healthy_bound_proxies"]) \
-            if bucket["healthy_bound_proxies"] else bucket["safe_accounts"]
+        # Under the one-account-one-proxy isolation invariant, an account with
+        # no healthy proxy backing it cannot sustainably run. Sustainable supply
+        # is therefore the scarcer of safe accounts and the healthy proxies
+        # actually bound to them — and with zero healthy bound proxies it is
+        # zero. (Never fall back to the bare account count: that would invent
+        # capacity the isolation model forbids and mislead V10/V12/V13.)
+        backing = min(bucket["safe_accounts"], bucket["healthy_bound_proxies"])
         bucket["sustainable_daily"] = backing * max_daily
 
     free_healthy = sorted(healthy_proxy_ids - bound_proxy_ids, key=lambda x: (x is None, x))

@@ -471,15 +471,28 @@ async def ensure_column(table: str, column: str, definition: str, after: str | N
 app = FastAPI(title="Lottery System v3.0.2", version="0.3.2", lifespan=lifespan)
 
 
+# Paths under /api that are intentionally unauthenticated. Keep this minimal:
+# only the container health probe (docker healthcheck curls /api/health).
+PUBLIC_API_PATHS = {"/api/health"}
+
+
 @app.middleware("http")
 
 async def require_admin_token(request: Request, call_next):
 
     request.state.actor = None
 
-    is_write = request.method not in {"GET", "HEAD", "OPTIONS"}
+    path = request.url.path
 
-    if request.url.path.startswith("/api/") and is_write:
+    # Default-closed (P0-1): every /api request is authenticated, not just
+    # writes — read endpoints expose account/proxy/schedule/governance state
+    # and must not be public. CORS preflight (OPTIONS) and the health probe
+    # are the only exemptions.
+    if (
+        request.method != "OPTIONS"
+        and path.startswith("/api/")
+        and path not in PUBLIC_API_PATHS
+    ):
 
         try:
             await authenticate_request(request)

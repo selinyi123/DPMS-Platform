@@ -1,5 +1,5 @@
 
-import hashlib, hmac, json, shutil, zipfile
+import hashlib, hmac, json, shutil, stat, zipfile
 
 from pathlib import Path
 
@@ -22,7 +22,10 @@ RELEASES_DIR = Path("/app/releases")
 
 BACKUPS_DIR = Path("/app/backups")
 
-UPLOAD_DIR = Path("/var/www/releases")
+# Uploads land under the mounted releases volume (P1-1): the old
+# ``/var/www/releases`` path was never mounted into the core container, so the
+# upload either failed or wrote to ephemeral container storage.
+UPLOAD_DIR = RELEASES_DIR / "_uploads"
 
 APP_CURRENT = Path("/app/app")
 
@@ -35,6 +38,40 @@ def verify_signature(manifest_bytes: bytes, signature_hex: str) -> bool:
     return hmac.compare_digest(expected, signature_hex)
 
 
+def _is_symlink_member(member: zipfile.ZipInfo) -> bool:
+    # Unix mode is stored in the high 16 bits of external_attr.
+    return stat.S_ISLNK(member.external_attr >> 16)
+
+
+def safe_extract(zf: zipfile.ZipFile, target_dir: Path, allowed_names: set[str]) -> None:
+    """Extract ``zf`` into ``target_dir`` rejecting unsafe or unexpected members.
+
+    Defends the hot-update path (P0-5) against zip-slip and smuggled files:
+
+    - no absolute paths, no ``..`` traversal, no path that resolves outside
+      ``target_dir``;
+    - no symlink members (which could later be followed to escape the tree);
+    - every non-directory member must be ``manifest.json`` or appear in the
+      signed manifest's ``files_sha256`` set — nothing extra rides along.
+    """
+    target_dir = target_dir.resolve()
+    for member in zf.infolist():
+        name = member.filename
+        normalized = name.replace("\\", "/")
+        if name.startswith("/") or name.startswith("\\") or ".." in Path(normalized).parts:
+            raise ValueError(f"Unsafe zip path: {name}")
+        if _is_symlink_member(member):
+            raise ValueError(f"Symlink not allowed in update archive: {name}")
+        out_path = (target_dir / normalized).resolve()
+        if out_path != target_dir and not out_path.is_relative_to(target_dir):
+            raise ValueError(f"Zip path escapes target dir: {name}")
+        if not member.is_dir():
+            base = normalized.lstrip("/")
+            if base != "manifest.json" and base not in allowed_names:
+                raise ValueError(f"File not listed in signed manifest: {name}")
+    zf.extractall(target_dir)
+
+
 
 @router.post("/upload")
 
@@ -42,6 +79,7 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
     require_min_role(request, "owner")
     require_confirmation(request)
 
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     upload_path = UPLOAD_DIR / "update.zip"
 
     with open(upload_path, "wb") as f:
@@ -74,7 +112,8 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
 
                 shutil.rmtree(version_dir)
 
-            zf.extractall(version_dir)
+            allowed_names = {name.replace("\\", "/").lstrip("/") for name in manifest["files_sha256"]}
+            safe_extract(zf, version_dir, allowed_names)
 
 
 

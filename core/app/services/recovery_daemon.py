@@ -1,126 +1,146 @@
+"""Recovery daemon: re-dispatch tasks whose stream message went stale.
 
-import asyncio, time
+When a worker claims a ``lottery_tasks`` message but dies before acking it, the
+message lingers in the consumer group's pending list. This daemon reclaims such
+messages after an idle threshold and re-enqueues them.
 
-from app.db import redis
+Safety / correctness (P0-2): the re-enqueued message must be a *complete* task
+payload — the same field set the original dispatch produced — rebuilt from the
+authoritative database rows (``task_runs`` + ``lotteries``), not a stub. A stub
+carrying only ``task_id`` made the worker fail immediately (``int(None)`` on the
+missing ``account_id``), which then looped back into recovery until the task was
+permanently failed. We reuse the *recorded* account/lottery/mode so recovery
+never re-selects an account or changes the execution mode; the worker still
+re-validates the account and the real-run gate at execution time.
+"""
 
+import asyncio
+import json
+import time
+
+from app.adapter_config import load_runtime_selector_config
+from app.db import database, redis
 from app.utils.log import structured_log
 
 
-
 STREAM_KEY = "lottery_tasks"
-
 GROUP_NAME = "workers"
-
 RECOVERY_CONSUMER = "recovery-daemon"
-
 MAX_RECOVERY_COUNT = 3
-
+IDLE_THRESHOLD_MS = 120_000
 
 
 async def start_recovery_daemon():
-
     while True:
-
         try:
-
             now_ms = int(time.time() * 1000)
-
             pending = await redis.xpending_range(
-
                 STREAM_KEY, GROUP_NAME, min="-", max="+", count=50
-
             )
-
             for msg in pending:
-
                 idle_ms = now_ms - msg["idle"]
-
-                if idle_ms < 120_000:
-
+                if idle_ms < IDLE_THRESHOLD_MS:
                     continue
-
-
 
                 claimed = await redis.xclaim(
-
                     STREAM_KEY, GROUP_NAME, RECOVERY_CONSUMER,
-
-                    min_idle_time=120_000,
-
-                    message_ids=[msg["message_id"]]
-
+                    min_idle_time=IDLE_THRESHOLD_MS,
+                    message_ids=[msg["message_id"]],
                 )
-
                 if not claimed:
-
                     continue
-
-
 
                 message_id, fields = claimed[0]
-
                 task_id = fields.get("task_id", message_id)
 
-
-
                 recovery_key = f"recovery_count:{task_id}"
-
                 current_count = int(await redis.get(recovery_key) or 0)
 
-
-
                 if current_count >= MAX_RECOVERY_COUNT:
-
                     structured_log("error", "task_permanent_failure",
-
                                    task_id=task_id, recovery_count=current_count)
-
                     await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
-
                     await redis.delete(recovery_key)
-
                     continue
 
-
+                payload = await _rebuild_task_payload(task_id)
+                if payload is None:
+                    # No authoritative task row to rebuild from — re-enqueueing a
+                    # stub would only fail again. Drop it and log, rather than
+                    # loop until MAX_RECOVERY_COUNT.
+                    structured_log("error", "recovery_task_row_missing", task_id=task_id)
+                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.delete(recovery_key)
+                    continue
 
                 new_count = await redis.incr(recovery_key)
-
                 await redis.expire(recovery_key, 86400)
 
-
+                payload["resume_from_phase"] = "latest"
+                payload["recovery_generation"] = str(new_count)
 
                 structured_log("warning", "recovered_pending_task",
+                               task_id=task_id, recovery_count=new_count,
+                               mode=payload.get("mode"))
 
-                               task_id=task_id, recovery_count=new_count)
-
-
-
-                retry_msg_id = await redis.xadd(STREAM_KEY, {
-
-                    "task_id": task_id,
-
-                    "resume_from_phase": "latest",
-
-                    "recovery_generation": str(new_count)
-
-                })
-
-
-
+                retry_msg_id = await redis.xadd(STREAM_KEY, payload)
                 if retry_msg_id:
-
                     await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
-
                 else:
-
-                    structured_log("error", "recovery_enqueue_failed",
-
-                                   task_id=task_id)
-
-
+                    structured_log("error", "recovery_enqueue_failed", task_id=task_id)
 
         except Exception as e:
-
             structured_log("error", "recovery_daemon_error", exception=e)
-
         await asyncio.sleep(60)
+
+
+async def _rebuild_task_payload(task_id: str) -> dict | None:
+    """Rebuild the full dispatch message for ``task_id`` from the database.
+
+    Mirrors the field set produced by ``dispatch_lottery`` so the worker has
+    everything it needs (account, lottery, platform, urls, mode, selector
+    config, action plan). Returns ``None`` if no task row exists.
+    """
+    row = await database.fetch_one(
+        """SELECT tr.account_id, tr.lottery_id, tr.task_mode, tr.dry_run,
+                  l.platform, l.raw_url, l.canonical_url, l.action_plan
+           FROM task_runs tr
+           JOIN lotteries l ON l.id = tr.lottery_id
+           WHERE tr.task_id = :task_id""",
+        {"task_id": task_id},
+    )
+    if not row:
+        return None
+
+    platform = row["platform"]
+    # task_mode can be NULL on legacy rows; fall back to the dry_run flag.
+    task_mode = row["task_mode"] or ("dry_run" if row["dry_run"] else "real_run")
+    dry_run = task_mode != "real_run"
+
+    selector_config = await load_runtime_selector_config()
+    platform_selectors = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
+
+    return {
+        "task_id": task_id,
+        "account_id": str(row["account_id"]),
+        "lottery_id": str(row["lottery_id"]),
+        "platform": platform,
+        "raw_url": row["raw_url"] or "",
+        "canonical_url": row["canonical_url"] or "",
+        "dry_run": "1" if dry_run else "0",
+        "mode": task_mode,
+        "selector_config": json.dumps(platform_selectors, ensure_ascii=False),
+        "action_plan": _json_text(row["action_plan"]),
+    }
+
+
+def _json_text(value) -> str:
+    """Normalise an action_plan column value to a JSON string for the stream."""
+    if value is None:
+        return "{}"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "ignore")
+    text = str(value).strip()
+    return text or "{}"

@@ -36,6 +36,18 @@ class ComputeCapacityTests(unittest.TestCase):
         self.assertEqual(bili["safe_accounts"], 2)  # account 3 is cooling
         self.assertEqual(bili["sustainable_daily"], 2 * 8)
 
+    def test_no_healthy_bound_proxy_means_zero_sustainable(self):
+        # Safety invariant (P0-3): ready accounts with no healthy proxy backing
+        # them must NOT invent capacity. Isolation requires a healthy proxy per
+        # account, so sustainable_daily is 0 here despite 2 safe accounts.
+        accounts = [acct(1, proxy_id=None, fingerprint_id=100), acct(2, proxy_id=None, fingerprint_id=101)]
+        proxies = []
+        cap = compute_capacity(accounts, proxies, limits=LIMITS)
+        bili = cap["per_platform"]["bilibili"]
+        self.assertEqual(bili["safe_accounts"], 2)
+        self.assertEqual(bili["healthy_bound_proxies"], 0)
+        self.assertEqual(bili["sustainable_daily"], 0)
+
     def test_unhealthy_proxy_does_not_back_capacity(self):
         accounts = [acct(1, proxy_id=10, fingerprint_id=100), acct(2, proxy_id=11, fingerprint_id=101)]
         proxies = [proxy(10, health_score=100), proxy(11, health_score=10)]  # 11 unhealthy
