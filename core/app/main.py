@@ -18,6 +18,7 @@ from app.db import database, redis
 
 from app.services.recovery_daemon import start_recovery_daemon
 from app.services.notification_dispatcher import start_notification_dispatcher
+from app.services.outbox import start_outbox_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
@@ -72,6 +73,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(start_recovery_daemon())
 
     asyncio.create_task(start_notification_dispatcher())
+
+    asyncio.create_task(start_outbox_dispatcher())
 
     asyncio.create_task(scheduler_loop())
 
@@ -305,6 +308,49 @@ async def ensure_runtime_schema():
     await ensure_experiment_schema()
     await ensure_governance_schema()
     await ensure_orchestration_schema()
+    await ensure_consistency_schema()
+
+
+async def ensure_consistency_schema():
+    # Transactional outbox (P1-2): the dispatch path writes the would-be Redis
+    # stream message here inside the same transaction as the task_runs row and
+    # the lottery claim, so the enqueue is atomic with the state change. The
+    # outbox dispatcher relays committed rows at-least-once; dedup_key (task_id)
+    # keeps that relay idempotent.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS outbox_events (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          stream_key VARCHAR(64) NOT NULL,
+          payload JSON NOT NULL,
+          status ENUM('pending','sending','sent','failed') NOT NULL DEFAULT 'pending',
+          attempts INT NOT NULL DEFAULT 0,
+          last_error TEXT NULL,
+          dedup_key VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          sent_at TIMESTAMP NULL,
+          UNIQUE KEY uk_outbox_dedup (dedup_key),
+          INDEX idx_outbox_status (status, id)
+        ) ENGINE=InnoDB"""
+    )
+    # Active-task uniqueness (P1-2 roadmap item 6): a virtual column that is the
+    # lottery_id only while the task is queued/running (NULL once terminal),
+    # plus a unique index, so the database itself refuses a second live task per
+    # lottery even if the in-transaction FOR UPDATE guard is somehow bypassed.
+    # Both ALTERs are best-effort/idempotent: skipped if already present or if
+    # legacy data already violates the constraint.
+    try:
+        await database.execute(
+            """ALTER TABLE task_runs
+               ADD COLUMN active_lottery_lock BIGINT
+               GENERATED ALWAYS AS (CASE WHEN status IN ('queued','running') THEN lottery_id END) VIRTUAL"""
+        )
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD active_lottery_lock", error=str(exc))
+    try:
+        await database.execute("ALTER TABLE task_runs ADD UNIQUE KEY uk_active_task_per_lottery (active_lottery_lock)")
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD uk_active_task_per_lottery", error=str(exc))
 
 
 async def ensure_orchestration_schema():

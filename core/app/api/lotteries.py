@@ -42,6 +42,7 @@ from app.strategy.engine import (
 )
 from app.services.discovery import run_discovery
 from app.services.lottery_rules import parse_lottery_rule
+from app.services.outbox import build_lottery_task_message, enqueue_outbox, try_flush_dedup
 from app.security import (
     audit_event,
     circuit_breaker_allows,
@@ -642,36 +643,50 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
 
     task_id = str(uuid.uuid4())
-    await database.execute(
-        """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode)
-           VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode)""",
-        {
-            "task_id": task_id,
-            "account_id": account["id"],
-            "lottery_id": lottery_id,
-            "dry_run": int(dry_run),
-            "task_mode": task_mode,
-        },
+    message = build_lottery_task_message(
+        task_id=task_id,
+        account_id=account["id"],
+        lottery_id=lottery_id,
+        platform=lottery["platform"],
+        raw_url=lottery["raw_url"],
+        canonical_url=lottery["canonical_url"],
+        task_mode=task_mode,
+        dry_run=dry_run,
+        platform_selectors=platform_selectors,
+        action_plan=parse_json_field(lottery["action_plan"]) or {},
     )
-    await database.execute(
-        "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
-        {"task_id": task_id, "id": lottery_id},
-    )
-    await redis.xadd(
-        "lottery_tasks",
-        {
-            "task_id": task_id,
-            "account_id": str(account["id"]),
-            "lottery_id": str(lottery_id),
-            "platform": lottery["platform"],
-            "raw_url": lottery["raw_url"],
-            "canonical_url": lottery["canonical_url"],
-            "dry_run": "1" if dry_run else "0",
-            "mode": task_mode,
-            "selector_config": json.dumps(platform_selectors, ensure_ascii=False) if isinstance(platform_selectors, dict) else "{}",
-            "action_plan": json.dumps(parse_json_field(lottery["action_plan"]) or {}, ensure_ascii=False),
-        },
-    )
+    # Atomic dispatch (P1-2): task_runs row, lottery claim, and the queued
+    # stream message (as an outbox row) commit together. A FOR UPDATE guard
+    # rejects a duplicate active dispatch for the same lottery.
+    async with database.transaction():
+        locked = await database.fetch_one(
+            "SELECT status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            {"id": lottery_id},
+        )
+        if locked and locked["execution_lock"] and locked["status"] in {"claimed", "running"}:
+            raise HTTPException(409, detail="Lottery already has an active task in flight")
+        await database.execute(
+            """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode)
+               VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode)""",
+            {
+                "task_id": task_id,
+                "account_id": account["id"],
+                "lottery_id": lottery_id,
+                "dry_run": int(dry_run),
+                "task_mode": task_mode,
+            },
+        )
+        await database.execute(
+            "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
+            {"task_id": task_id, "id": lottery_id},
+        )
+        await enqueue_outbox(message, "lottery_tasks", dedup_key=task_id)
+    # Best-effort immediate relay so dispatch latency stays low; if Redis is
+    # momentarily unavailable the outbox dispatcher loop retries the committed row.
+    try:
+        await try_flush_dedup(task_id)
+    except Exception as exc:
+        structured_log("warning", "dispatch_immediate_flush_failed", task_id=task_id, error=str(exc))
     if task_mode == "real_run":
         await audit_event(
             request,

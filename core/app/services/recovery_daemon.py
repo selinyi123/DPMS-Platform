@@ -20,6 +20,7 @@ import time
 
 from app.adapter_config import load_runtime_selector_config
 from app.db import database, redis
+from app.services.outbox import build_lottery_task_message
 from app.utils.log import structured_log
 
 
@@ -120,27 +121,34 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
     selector_config = await load_runtime_selector_config()
     platform_selectors = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
 
-    return {
-        "task_id": task_id,
-        "account_id": str(row["account_id"]),
-        "lottery_id": str(row["lottery_id"]),
-        "platform": platform,
-        "raw_url": row["raw_url"] or "",
-        "canonical_url": row["canonical_url"] or "",
-        "dry_run": "1" if dry_run else "0",
-        "mode": task_mode,
-        "selector_config": json.dumps(platform_selectors, ensure_ascii=False),
-        "action_plan": _json_text(row["action_plan"]),
-    }
+    # Reuse the canonical dispatch builder so a recovered message has exactly the
+    # same field set the worker expects (no drift between dispatch and recovery).
+    return build_lottery_task_message(
+        task_id=task_id,
+        account_id=row["account_id"],
+        lottery_id=row["lottery_id"],
+        platform=platform,
+        raw_url=row["raw_url"],
+        canonical_url=row["canonical_url"],
+        task_mode=task_mode,
+        dry_run=dry_run,
+        platform_selectors=platform_selectors,
+        action_plan=_parse_action_plan(row["action_plan"]),
+    )
 
 
-def _json_text(value) -> str:
-    """Normalise an action_plan column value to a JSON string for the stream."""
+def _parse_action_plan(value):
+    """Normalise an action_plan column value to a dict/list for the builder."""
     if value is None:
-        return "{}"
+        return {}
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        return value
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("utf-8", "ignore")
     text = str(value).strip()
-    return text or "{}"
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
