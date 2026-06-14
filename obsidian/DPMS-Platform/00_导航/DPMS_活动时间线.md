@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-13
+updated: 2026-06-14
 ---
 
 # DPMS 活动时间线
@@ -94,6 +94,16 @@ updated: 2026-06-13
 | --- | --- | --- |
 | `a37fa1b` | 推进 V10–V13 后端：Scheduling / Capacity / Orchestration / Throughput 四个只读运营规模化运行时（+42 测试，新增 campaign_plans 审计表） | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
 | `a527d13` | V10–V13 前端：四个只读控制台页面（排程/容量/批量编排/吞吐治理）+ 中英 i18n | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
+
+运行时可信度硬化（按深度审阅路线图 P0→P1→P2 分阶段推进），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]。
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `84afd84` / `f85b3be` | P0 安全修复：默认鉴权、recovery 完整重建、capacity 零代理零容量、orchestration 最新有效 decision、ZIP safe_extract | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `e6ca6e0` | 快速 P1：Proxy SSRF 白名单、通知 raise_for_status、Proxy 变更审计 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `09fdb82` | 一致性事务化：派发原子化 + 事务性 outbox（至少一次、不重复投递、活动任务唯一约束）+ worker 任务生命周期事务化 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `a87b1ac` | real-run 门禁合流：Governance policy 成为唯一权威，decision_id/policy_version 绑定 task_runs | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `edc016a` | P2 长期演化：指纹资产隔离池、CookieVault AAD 上下文绑定、关键事件死信表 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 
 ## 记录原则
 

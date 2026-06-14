@@ -40,12 +40,13 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`（开发分支 `claude/code-review-ul0pqt`）
 - 最近功能提交：运营规模化主线 V10–V13（Scheduling / Capacity / Orchestration / Throughput，四个只读 advisory 运行时；编排时间→资源→广度→可持续），详见 [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]]
+- 最近硬化：运行时可信度硬化（P0→P1→P2：默认鉴权、派发原子化+outbox、Governance 唯一 real-run 权威、密文上下文绑定、关键事件死信），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]、[[DPMS_V10-V13_运营规模化_后续版本规划_20260614]]
-- 测试基线：core **242 项**（原 200 + V10–V13 新增 42：12+8+11+11）+ worker 21 项单元测试通过
+- 测试基线：core **294 项**（V10–V13 后 242 + 硬化新增 52）+ worker 21 项单元测试通过
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
-- 当前生产策略：Real-run 默认关闭，证据不完整时禁止真实执行；V7 起该门禁同时以版本化 Policy Object（`real_run_gate` v1）形式可查询、可回放
+- 当前生产策略：Real-run 默认关闭，证据不完整时禁止真实执行；V7 起该门禁同时以版本化 Policy Object（`real_run_gate` v1）形式可查询、可回放；P1-4 起 Governance policy 为 real-run 唯一权威，每次真实执行绑定授权它的 `decision_id`
 
 ## 快速导航
 
