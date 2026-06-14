@@ -7,7 +7,7 @@ from app.db import database
 from app.event_store.service import record_event
 from app.models.schemas import NotifyRequest, NotifySecretBundleUpdate, NotifySecretUpdate
 from app.security import audit_event, require_confirmation, require_min_role
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import cookie_vault, notification_secret_aad
 
 
 router = APIRouter()
@@ -410,7 +410,7 @@ def looks_like_placeholder_secret(value: str) -> bool:
 
 
 async def save_secret(key_name: str, value: str):
-    encrypted = cookie_vault.encrypt(value)
+    encrypted = cookie_vault.encrypt(value, aad=notification_secret_aad(key_name))
     row = await database.fetch_one(
         "SELECT id FROM notification_secrets WHERE key_name = :key_name",
         {"key_name": key_name},
@@ -433,7 +433,7 @@ async def secret_value(key_name: str) -> str:
         {"key_name": key_name},
     )
     if row and row["encrypted_value"]:
-        return cookie_vault.decrypt(row["encrypted_value"])
+        return cookie_vault.decrypt(row["encrypted_value"], aad=notification_secret_aad(key_name))
     attr = SECRET_ATTRS.get(key_name)
     return getattr(settings, attr, "") if attr else ""
 

@@ -1,9 +1,13 @@
+import asyncio
 import json
 import uuid
 from typing import Any
 
 from app.db import database
 from app.utils.log import structured_log
+
+
+EVENT_WRITE_ATTEMPTS = 3
 
 
 async def record_event(
@@ -17,7 +21,16 @@ async def record_event(
     actor_type: str = "system",
     actor_id: Any | None = None,
     source_service: str = "core-api",
+    critical: bool = False,
 ) -> str | None:
+    """Append an event to the store.
+
+    P2-3: a write failure is no longer silently swallowed. The insert is retried
+    a few times to ride out a transient blip, and for ``critical=True`` events
+    (real-run dispatch, policy activation, …) a persistent failure is logged at
+    ERROR *with the full payload* and durably captured in ``failed_events`` for
+    later replay, so a high-risk action's audit trail is never lost without trace.
+    """
     event_id = str(uuid.uuid4())
     values = {
         "id": event_id,
@@ -31,24 +44,71 @@ async def record_event(
         "actor_id": str(actor_id) if actor_id is not None else None,
         "source_service": source_service,
     }
-    try:
-        await database.execute(
-            """INSERT INTO events
-               (id, aggregate, aggregate_id, event_type, payload, correlation_id, causation_id, actor_type, actor_id, source_service)
-               VALUES (:id, :aggregate, :aggregate_id, :event_type, :payload, :correlation_id, :causation_id, :actor_type, :actor_id, :source_service)""",
-            values,
+
+    last_exc: Exception | None = None
+    for attempt in range(EVENT_WRITE_ATTEMPTS):
+        try:
+            await database.execute(
+                """INSERT INTO events
+                   (id, aggregate, aggregate_id, event_type, payload, correlation_id, causation_id, actor_type, actor_id, source_service)
+                   VALUES (:id, :aggregate, :aggregate_id, :event_type, :payload, :correlation_id, :causation_id, :actor_type, :actor_id, :source_service)""",
+                values,
+            )
+            return event_id
+        except Exception as exc:
+            last_exc = exc
+            if attempt < EVENT_WRITE_ATTEMPTS - 1:
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+    if critical:
+        structured_log(
+            "error",
+            "event_store_write_failed_critical",
+            aggregate=aggregate,
+            aggregate_id=aggregate_id,
+            event_type=event_type,
+            payload=values["payload"],
+            exception=last_exc,
         )
-        return event_id
-    except Exception as exc:
+        await _dead_letter(values, last_exc)
+    else:
         structured_log(
             "warning",
             "event_store_write_failed",
             aggregate=aggregate,
             aggregate_id=aggregate_id,
             event_type=event_type,
-            exception=exc,
+            exception=last_exc,
         )
-        return None
+    return None
+
+
+async def _dead_letter(values: dict[str, Any], exc: Exception | None) -> None:
+    """Durably capture a critical event that could not be written to ``events``.
+
+    Uses a loose schema (TEXT payload) so an event that failed the strict
+    ``events`` table can still be preserved for replay. Best-effort: if even this
+    fails (e.g. the database is fully down) the ERROR log above is the record.
+    """
+    try:
+        await database.execute(
+            """INSERT INTO failed_events
+               (id, aggregate, aggregate_id, event_type, payload, actor_type, actor_id, source_service, error)
+               VALUES (:id, :aggregate, :aggregate_id, :event_type, :payload, :actor_type, :actor_id, :source_service, :error)""",
+            {
+                "id": values["id"],
+                "aggregate": values["aggregate"],
+                "aggregate_id": values["aggregate_id"],
+                "event_type": values["event_type"],
+                "payload": values["payload"],
+                "actor_type": values["actor_type"],
+                "actor_id": values["actor_id"],
+                "source_service": values["source_service"],
+                "error": str(exc)[:480] if exc else None,
+            },
+        )
+    except Exception as inner:
+        structured_log("error", "event_dead_letter_failed", event_id=values["id"], exception=inner)
 
 
 def parse_payload(value: Any) -> Any:

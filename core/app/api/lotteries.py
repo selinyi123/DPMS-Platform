@@ -588,6 +588,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 payload={"platform": lottery["platform"], "reason": exc.detail},
                 actor_type="operator",
                 actor_id=actor["actor_id"],
+                critical=True,
             )
             await emit_real_run_gate_notification(lottery, exc.detail, actor_id=actor["actor_id"])
             raise
@@ -651,6 +652,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 },
                 actor_type="operator",
                 actor_id=actor["actor_id"],
+                critical=True,
             )
             await emit_real_run_gate_notification(
                 lottery,
@@ -760,10 +762,13 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "mode": task_mode,
             "raw_url": lottery["raw_url"],
             "action_plan": parse_json_field(lottery["action_plan"]) or {},
+            "decision_id": decision_id,
+            "policy_version": policy_version,
         },
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=(task_mode == "real_run"),
     )
     await record_event(
         aggregate="lottery",
@@ -773,6 +778,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=(task_mode == "real_run"),
     )
     return {
         "status": "queued",

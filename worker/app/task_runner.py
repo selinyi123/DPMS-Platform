@@ -10,7 +10,7 @@ from app.event_store.service import record_event
 from app.safety import detect_page_risk, ensure_account_can_run
 from app.utils.log import structured_log
 from app.utils.cookies import inject_account_cookies
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 
 
 STREAM_KEY = "lottery_tasks"
@@ -375,7 +375,7 @@ async def prepare_account_login(ctx, account_id: int, platform: str):
 
     credential_blob = row["encrypted_credential"]
     try:
-        credential = cookie_vault.decrypt(credential_blob)
+        credential = cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
     except Exception:
         if isinstance(credential_blob, bytes):
             credential = credential_blob.decode("utf-8")

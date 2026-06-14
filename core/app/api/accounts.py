@@ -15,7 +15,7 @@ from app.services.risk_engine import check_all_accounts_health
 from app.security import audit_event, require_confirmation, require_min_role
 from app.services.state_machine import transition_account
 from app.utils.cookies import parse_cookie_payload, validate_required_cookies
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 
 
 PROFILES_DIR = Path("/profiles")
@@ -140,7 +140,7 @@ async def create_account(data: AccountCreate, request: Request):
             normalized = normalize_and_validate_credential(data.platform, data.encrypted_credential)
         except Exception as e:
             raise HTTPException(400, detail=str(e))
-        credential = cookie_vault.encrypt(normalized)
+        credential = cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)
         status = "warming"
 
     account_id = await database.execute(
@@ -382,7 +382,7 @@ async def update_credential(account_id: int, data: AccountCredentialUpdate, requ
         """UPDATE accounts
            SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(), version = version + 1
            WHERE id = :id""",
-        {"id": account_id, "credential": cookie_vault.encrypt(normalized)},
+        {"id": account_id, "credential": cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)},
     )
     calibration = await queue_account_calibration(account_id, row["platform"])
     await audit_event(
@@ -675,7 +675,7 @@ async def finalize_bilibili_qr_login(session_id: str, cookies: list[dict]) -> in
         account_id = await database.execute(
             """INSERT INTO accounts (platform, fingerprint_id, encrypted_credential, status)
                VALUES ('bilibili', :fingerprint_id, :credential, 'warming')""",
-            {"fingerprint_id": fingerprint_id, "credential": cookie_vault.encrypt(normalized)},
+            {"fingerprint_id": fingerprint_id, "credential": cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)},
         )
         await database.execute(
             """UPDATE login_sessions
@@ -726,21 +726,57 @@ async def finalize_bilibili_qr_login(session_id: str, cookies: list[dict]) -> in
     return account_id
 
 
+# A small pool of realistic, stable desktop browser profiles (P2-1). The goal
+# is asset-isolation *consistency*, not anti-detection: each account binds a
+# stable fingerprint, and new accounts spread across the pool instead of all
+# sharing one row. Every profile uses ordinary, current browser values and a
+# zh-CN / Asia-Shanghai locale consistent with the supported platforms — nothing
+# fabricated or anomalous. Each entry has a distinct user_agent because the
+# fingerprints table is unique on (platform, user_agent).
+DEFAULT_FINGERPRINT_POOL = [
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "vw": 1920, "vh": 1080},
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36", "vw": 1536, "vh": 864},
+    {"ua": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "vw": 1366, "vh": 768},
+    {"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36", "vw": 1440, "vh": 900},
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "vw": 1280, "vh": 720},
+]
+
+
 async def ensure_default_fingerprint(platform: str) -> int:
+    """Return a fingerprint id for a new account, balanced across the pool.
+
+    Find-or-creates each pool profile for the platform, then picks the one
+    currently bound to the fewest accounts, so accounts are distributed across
+    distinct fingerprints rather than funnelled onto a single shared one.
+    """
     if not get_platform(platform):
         raise HTTPException(400, detail=f"Unsupported platform: {platform}")
-    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
-    row = await database.fetch_one(
-        "SELECT id FROM fingerprints WHERE platform = :platform AND user_agent = :ua",
-        {"platform": platform, "ua": user_agent},
+
+    profile_ids: list[int] = []
+    for profile in DEFAULT_FINGERPRINT_POOL:
+        row = await database.fetch_one(
+            "SELECT id FROM fingerprints WHERE platform = :platform AND user_agent = :ua",
+            {"platform": platform, "ua": profile["ua"]},
+        )
+        if row:
+            profile_ids.append(row["id"])
+            continue
+        fingerprint_id = await database.execute(
+            """INSERT INTO fingerprints (platform, user_agent, viewport_width, viewport_height, timezone, locale)
+               VALUES (:platform, :ua, :vw, :vh, 'Asia/Shanghai', 'zh-CN')""",
+            {"platform": platform, "ua": profile["ua"], "vw": profile["vw"], "vh": profile["vh"]},
+        )
+        profile_ids.append(fingerprint_id)
+
+    placeholders = ", ".join(f":id{index}" for index in range(len(profile_ids)))
+    usage_values = {f"id{index}": fid for index, fid in enumerate(profile_ids)}
+    usage_rows = await database.fetch_all(
+        f"SELECT fingerprint_id, COUNT(*) AS cnt FROM accounts WHERE fingerprint_id IN ({placeholders}) GROUP BY fingerprint_id",
+        usage_values,
     )
-    if row:
-        return row["id"]
-    return await database.execute(
-        """INSERT INTO fingerprints (platform, user_agent, viewport_width, viewport_height, timezone, locale)
-           VALUES (:platform, :ua, 1920, 1080, 'Asia/Shanghai', 'zh-CN')""",
-        {"platform": platform, "ua": user_agent},
-    )
+    usage = {row["fingerprint_id"]: row["cnt"] for row in usage_rows}
+    # Least-used first; ties keep pool order (deterministic).
+    return min(profile_ids, key=lambda fid: usage.get(fid, 0))
 
 
 async def validate_proxy_assignment(proxy_id: int, account_id: int | None = None):

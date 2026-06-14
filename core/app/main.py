@@ -336,6 +336,25 @@ async def ensure_consistency_schema():
           INDEX idx_outbox_status (status, id)
         ) ENGINE=InnoDB"""
     )
+    # Critical-event dead-letter (P2-3): captures real-run / policy-activation
+    # events whose write to the strict ``events`` table failed, so a high-risk
+    # action's audit record is durably recoverable instead of silently dropped.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS failed_events (
+          id CHAR(36) PRIMARY KEY,
+          aggregate VARCHAR(64) NOT NULL,
+          aggregate_id VARCHAR(128) NOT NULL,
+          event_type VARCHAR(128) NOT NULL,
+          payload LONGTEXT NULL,
+          actor_type VARCHAR(32) NULL,
+          actor_id VARCHAR(128) NULL,
+          source_service VARCHAR(64) NULL,
+          error TEXT NULL,
+          replayed TINYINT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_failed_events_replayed (replayed, created_at)
+        ) ENGINE=InnoDB"""
+    )
     # Active-task uniqueness (P1-2 roadmap item 6): a virtual column that is the
     # lottery_id only while the task is queued/running (NULL once terminal),
     # plus a unique index, so the database itself refuses a second live task per

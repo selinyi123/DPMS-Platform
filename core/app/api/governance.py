@@ -241,6 +241,7 @@ async def activate_policy_version(version: int, data: PolicyActivateRequest, req
         payload={"version": version, "previous_version": previous_version, "note": data.note},
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=True,
     )
     return {"status": "activated", "policy_key": policy_key, "version": version, "previous_version": previous_version}
 
