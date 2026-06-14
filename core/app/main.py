@@ -21,7 +21,7 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic, scheduling, capacity, orchestration, throughput
 
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
@@ -304,6 +304,27 @@ async def ensure_runtime_schema():
     )
     await ensure_experiment_schema()
     await ensure_governance_schema()
+    await ensure_orchestration_schema()
+
+
+async def ensure_orchestration_schema():
+    # Orchestration Runtime (V12 / S11): inert, audit-only campaign drafts.
+    # A draft is never auto-executed and never activated; adopting a plan
+    # always goes back through the existing gated dispatch flow.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS campaign_plans (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          campaign_key VARCHAR(64) NOT NULL,
+          platform_scope JSON NULL,
+          plan JSON NOT NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'draft',
+          waves INT NOT NULL DEFAULT 0,
+          requires_review TINYINT NOT NULL DEFAULT 0,
+          created_by VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_campaign_plan_key (campaign_key, created_at)
+        ) ENGINE=InnoDB"""
+    )
 
 
 async def ensure_experiment_schema():
@@ -532,6 +553,14 @@ app.include_router(governance.router, prefix="/api/governance", tags=["governanc
 app.include_router(transitions.router, prefix="/api/transitions", tags=["transitions"])
 
 app.include_router(semantic.router, prefix="/api/semantic", tags=["semantic"])
+
+app.include_router(scheduling.router, prefix="/api/scheduling", tags=["scheduling"])
+
+app.include_router(capacity.router, prefix="/api/capacity", tags=["capacity"])
+
+app.include_router(orchestration.router, prefix="/api/orchestration", tags=["orchestration"])
+
+app.include_router(throughput.router, prefix="/api/throughput", tags=["throughput"])
 
 
 @app.get("/api/auth/me")
