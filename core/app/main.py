@@ -27,6 +27,7 @@ from app.api import accounts, lotteries, update, notify, metrics, proxies, event
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
 from app.security_posture import format_posture_problems, secret_posture
+from app.migrations_runner import run_migrations
 
 from app.utils.log import structured_log
 from app.security import authenticate_request
@@ -42,6 +43,16 @@ async def lifespan(app: FastAPI):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
         await ensure_runtime_schema()
+        # Versioned migrations run after the idempotent ensure_* safety net so
+        # every referenced table is present. Non-fatal: a migration failure is
+        # logged but does not block startup (the ensure_* hooks still hold the
+        # baseline schema).
+        try:
+            applied = await run_migrations()
+            if applied:
+                structured_log("info", "migrations_applied", versions=",".join(applied))
+        except Exception as exc:
+            structured_log("error", "migrations_failed", exception=exc)
 
     # Production secret-posture guard (Phase 4): never run a real deployment on
     # the shipped default ADMIN_TOKEN / UPDATE_SECRET or an unset ENCRYPTION_KEY.

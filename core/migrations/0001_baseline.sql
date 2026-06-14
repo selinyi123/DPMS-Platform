@@ -1,0 +1,12 @@
+-- 0001_baseline: establish the versioned migration baseline (Phase 4).
+--
+-- This is the first tracked migration. The canonical schema is still created by
+-- init.sql plus the idempotent ensure_* startup hooks; from here on, additive
+-- schema changes should be added as new core/migrations/NNNN_*.sql files instead
+-- of new ensure_* calls.
+--
+-- It adds an index that supports the orphaned-lock reconciler introduced with
+-- the transactional outbox (it scans lotteries by locked_at). The migration is
+-- applied exactly once (recorded in schema_migrations), so a plain ADD INDEX is
+-- safe here.
+ALTER TABLE lotteries ADD INDEX idx_lottery_locked_at (locked_at)
