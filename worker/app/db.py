@@ -7,8 +7,51 @@ from app.config import settings
 from app.utils.log import structured_log
 
 
+TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 
-database = databases.Database(settings.database_url)
+
+class WorkerDatabase:
+
+    def __init__(self, url: str):
+
+        self._db = databases.Database(url)
+
+
+    async def execute(self, query, values=None, *args, **kwargs):
+
+        await self._guard_terminal_task_reopen(query, values)
+
+        return await self._db.execute(query, values, *args, **kwargs)
+
+
+    async def _guard_terminal_task_reopen(self, query, values):
+
+        text = str(query or "").strip().lower()
+
+        if not text.startswith("update task_runs set status = 'running'"):
+
+            return
+
+        task_id = (values or {}).get("task_id")
+
+        if not task_id:
+
+            return
+
+        row = await self._db.fetch_one("SELECT status FROM task_runs WHERE task_id = :task_id", {"task_id": task_id})
+
+        if row and str(row["status"] or "") in TERMINAL_TASK_STATUSES:
+
+            raise RuntimeError(f"Refusing to reopen terminal task {task_id} from {row['status']}")
+
+
+    def __getattr__(self, name):
+
+        return getattr(self._db, name)
+
+
+
+database = WorkerDatabase(settings.database_url)
 
 
 
