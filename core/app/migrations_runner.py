@@ -16,11 +16,21 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from app.config import settings
 from app.db import database
 from app.utils.log import structured_log
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 VERSION_RE = re.compile(r"^(\d{4})_.+\.sql$")
+
+
+class FatalMigrationError(BaseException):
+    """Bypass broad ``except Exception`` startup handlers in production.
+
+    ``core.app.main`` intentionally logs migration failures in development, but
+    production must not continue with a half-applied schema. This BaseException
+    subclass is not caught by the existing non-fatal startup handler.
+    """
 
 
 def parse_version(filename: str) -> str | None:
@@ -64,8 +74,8 @@ def split_statements(sql: str) -> list[str]:
     """Split a migration file into individual statements.
 
     Drops ``--`` line comments and blank statements. Migration files are
-    author-controlled, so a simple ``;`` split (no ``;`` inside string literals)
-    is sufficient and keeps the runner dependency-free.
+author-controlled, so a simple ``;`` split (no ``;`` inside string literals)
+is sufficient and keeps the runner dependency-free.
     """
     statements: list[str] = []
     for chunk in sql.split(";"):
@@ -76,27 +86,42 @@ def split_statements(sql: str) -> list[str]:
     return statements
 
 
+def _production_mode() -> bool:
+    return str(settings.deployment_mode or "").strip().lower() == "production"
+
+
+def _handle_migration_error(exc: Exception) -> None:
+    if _production_mode():
+        raise FatalMigrationError(f"Refusing to start in production after migration failure: {exc}") from exc
+    raise exc
+
+
 async def run_migrations(dir_path: Path = MIGRATIONS_DIR) -> list[str]:
     """Apply pending migrations in order; return the versions applied this run."""
-    await database.execute(
-        """CREATE TABLE IF NOT EXISTS schema_migrations (
-          version VARCHAR(16) PRIMARY KEY,
-          applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB"""
-    )
-    rows = await database.fetch_all("SELECT version FROM schema_migrations")
-    applied = {row["version"] for row in rows}
-    pending = pending_migrations(discover_migrations(dir_path), applied)
-
-    applied_now: list[str] = []
-    for version, path in pending:
-        sql = Path(path).read_text(encoding="utf-8")
-        for statement in split_statements(sql):
-            await database.execute(statement)
+    try:
         await database.execute(
-            "INSERT INTO schema_migrations (version) VALUES (:version)",
-            {"version": version},
+            """CREATE TABLE IF NOT EXISTS schema_migrations (
+              version VARCHAR(16) PRIMARY KEY,
+              applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB"""
         )
-        applied_now.append(version)
-        structured_log("info", "migration_applied", version=version)
-    return applied_now
+        rows = await database.fetch_all("SELECT version FROM schema_migrations")
+        applied = {row["version"] for row in rows}
+        pending = pending_migrations(discover_migrations(dir_path), applied)
+
+        applied_now: list[str] = []
+        for version, path in pending:
+            sql = Path(path).read_text(encoding="utf-8")
+            for statement in split_statements(sql):
+                await database.execute(statement)
+            await database.execute(
+                "INSERT INTO schema_migrations (version) VALUES (:version)",
+                {"version": version},
+            )
+            applied_now.append(version)
+            structured_log("info", "migration_applied", version=version)
+        return applied_now
+    except Exception as exc:
+        structured_log("error", "migration_run_failed", mode=settings.deployment_mode, exception=exc)
+        _handle_migration_error(exc)
+        raise
