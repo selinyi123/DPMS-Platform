@@ -54,7 +54,11 @@ def get_platform(platform: str) -> dict | None:
     if not cfg:
         return None
     output = dict(cfg)
-    if platform != "bilibili" and platform_has_real_adapter(platform):
+    # A platform's real-action adapter turns on only when a complete, reviewed
+    # selector config exists for it (selector_config_complete). Bilibili is a
+    # first-class structured platform and follows the same selector-driven path
+    # as weibo/douyin/xiaohongshu — no platform is special-cased here.
+    if platform_has_real_adapter(platform):
         output["action_adapter"] = True
         output["adapter_status"] = "configured"
     return output

@@ -1,0 +1,80 @@
+import base64
+import json
+import os
+import unittest
+
+# Valid env so importing app.db / app.config never fails during collection.
+os.environ.setdefault("ENCRYPTION_KEY", base64.b64encode(os.urandom(32)).decode())
+os.environ.setdefault("UPDATE_SECRET", "test-secret")
+os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
+
+from app.adapter_config import SELECTOR_B64_ENV, SELECTOR_ENV  # noqa: E402
+from app.platforms import get_platform  # noqa: E402
+
+STRUCTURED = ("bilibili", "weibo", "douyin", "xiaohongshu")
+
+
+def _complete_config(platform):
+    return {
+        platform: {
+            "followed": ["button:has-text('关注')"],
+            "liked": ["[aria-label*='点赞']"],
+            "reposted": ["button:has-text('转发')"],
+            "commented": {"input": ["textarea"], "submit": ["button:has-text('发布')"]},
+        }
+    }
+
+
+class PlatformAdapterStatusTests(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in (SELECTOR_ENV, SELECTOR_B64_ENV)}
+        os.environ.pop(SELECTOR_B64_ENV, None)
+        os.environ.pop(SELECTOR_ENV, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_no_selector_config_stays_calibration_required(self):
+        for platform in STRUCTURED:
+            cfg = get_platform(platform)
+            self.assertFalse(cfg["action_adapter"], platform)
+            self.assertEqual(cfg["adapter_status"], "calibration_required", platform)
+
+    def test_complete_selector_config_enables_adapter(self):
+        """A complete selector config flips action_adapter on for EVERY structured
+        platform, including bilibili (previously special-cased off)."""
+        for platform in STRUCTURED:
+            os.environ[SELECTOR_ENV] = json.dumps(_complete_config(platform))
+            cfg = get_platform(platform)
+            self.assertTrue(cfg["action_adapter"], platform)
+            self.assertEqual(cfg["adapter_status"], "configured", platform)
+            os.environ.pop(SELECTOR_ENV, None)
+
+    def test_bilibili_not_special_cased(self):
+        """Bilibili must behave identically to the other structured platforms."""
+        os.environ[SELECTOR_ENV] = json.dumps(_complete_config("bilibili"))
+        bilibili = get_platform("bilibili")
+        os.environ[SELECTOR_ENV] = json.dumps(_complete_config("weibo"))
+        weibo = get_platform("weibo")
+        self.assertEqual(bilibili["action_adapter"], weibo["action_adapter"])
+        self.assertEqual(bilibili["adapter_status"], weibo["adapter_status"])
+
+    def test_incomplete_config_does_not_enable(self):
+        # Missing the commented input/submit group -> not complete.
+        os.environ[SELECTOR_ENV] = json.dumps(
+            {"bilibili": {"followed": ["x"], "liked": ["y"], "reposted": ["z"]}}
+        )
+        cfg = get_platform("bilibili")
+        self.assertFalse(cfg["action_adapter"])
+        self.assertEqual(cfg["adapter_status"], "calibration_required")
+
+    def test_unknown_platform_returns_none(self):
+        self.assertIsNone(get_platform("nonexistent"))
+
+
+if __name__ == "__main__":
+    unittest.main()
