@@ -28,6 +28,8 @@ GROUP_NAME = "workers"
 RECOVERY_CONSUMER = "recovery-daemon"
 MAX_RECOVERY_COUNT = 3
 IDLE_THRESHOLD_MS = 120_000
+WORKER_HEARTBEAT_STALE_SECONDS = 90
+TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 
 
 def pending_idle_ms(entry: dict) -> int:
@@ -52,16 +54,41 @@ async def start_recovery_daemon():
                 if idle_ms < IDLE_THRESHOLD_MS:
                     continue
 
+                message_id = msg["message_id"]
+                fields = await _read_stream_fields(message_id)
+                task_id = fields.get("task_id", message_id)
+
+                decision = await _recovery_decision(task_id)
+                if decision == "skip_running_with_live_worker":
+                    structured_log(
+                        "info",
+                        "recovery_skipped_running_task_with_live_worker",
+                        task_id=task_id,
+                        message_id=message_id,
+                        idle_ms=idle_ms,
+                    )
+                    continue
+                if decision == "ack_terminal_task":
+                    structured_log(
+                        "info",
+                        "recovery_ack_terminal_task",
+                        task_id=task_id,
+                        message_id=message_id,
+                    )
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await redis.delete(f"recovery_count:{task_id}")
+                    continue
+
                 claimed = await redis.xclaim(
                     STREAM_KEY, GROUP_NAME, RECOVERY_CONSUMER,
                     min_idle_time=IDLE_THRESHOLD_MS,
-                    message_ids=[msg["message_id"]],
+                    message_ids=[message_id],
                 )
                 if not claimed:
                     continue
 
-                message_id, fields = claimed[0]
-                task_id = fields.get("task_id", message_id)
+                _claimed_id, claimed_fields = claimed[0]
+                task_id = claimed_fields.get("task_id", task_id)
 
                 recovery_key = f"recovery_count:{task_id}"
                 current_count = int(await redis.get(recovery_key) or 0)
@@ -69,7 +96,7 @@ async def start_recovery_daemon():
                 if current_count >= MAX_RECOVERY_COUNT:
                     structured_log("error", "task_permanent_failure",
                                    task_id=task_id, recovery_count=current_count)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                     await redis.delete(recovery_key)
                     continue
 
@@ -79,7 +106,7 @@ async def start_recovery_daemon():
                     # stub would only fail again. Drop it and log, rather than
                     # loop until MAX_RECOVERY_COUNT.
                     structured_log("error", "recovery_task_row_missing", task_id=task_id)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                     await redis.delete(recovery_key)
                     continue
 
@@ -95,13 +122,63 @@ async def start_recovery_daemon():
 
                 retry_msg_id = await redis.xadd(STREAM_KEY, payload)
                 if retry_msg_id:
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                 else:
                     structured_log("error", "recovery_enqueue_failed", task_id=task_id)
 
         except Exception as e:
             structured_log("error", "recovery_daemon_error", exception=e)
         await asyncio.sleep(60)
+
+
+async def _read_stream_fields(message_id) -> dict:
+    """Read the original stream fields without claiming the message.
+
+    Claiming a message resets ownership/idle time. We inspect the task_id first
+    so a long-running task with a live worker is not stolen by recovery.
+    """
+    try:
+        rows = await redis.xrange(STREAM_KEY, min=message_id, max=message_id, count=1)
+    except Exception as exc:
+        structured_log("warning", "recovery_read_stream_fields_failed", message_id=message_id, error=str(exc))
+        return {}
+    if not rows:
+        return {}
+    _mid, fields = rows[0]
+    return dict(fields or {})
+
+
+async def _recovery_decision(task_id: str) -> str:
+    """Return whether a pending stream entry should be recovered now.
+
+    Redis pending idle only proves a message has not been acked; it does not
+    prove the worker died. If the DB says the task is running and at least one
+    worker heartbeat is fresh, do not reclaim it. This conservative gate avoids
+    duplicate side-effect execution during long shadow/real runs.
+    """
+    row = await database.fetch_one(
+        "SELECT status FROM task_runs WHERE task_id = :task_id",
+        {"task_id": task_id},
+    )
+    if not row:
+        return "recover"
+    status = str(row["status"] or "")
+    if status in TERMINAL_TASK_STATUSES:
+        return "ack_terminal_task"
+    if status == "running" and await _has_recent_worker_heartbeat():
+        return "skip_running_with_live_worker"
+    return "recover"
+
+
+async def _has_recent_worker_heartbeat() -> bool:
+    row = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM worker_heartbeats
+           WHERE status = 'ok'
+             AND last_seen_at >= (NOW() - INTERVAL :seconds SECOND)""",
+        {"seconds": WORKER_HEARTBEAT_STALE_SECONDS},
+    )
+    return bool(row and int(row["cnt"] or 0) > 0)
 
 
 async def _rebuild_task_payload(task_id: str) -> dict | None:
