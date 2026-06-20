@@ -1,0 +1,41 @@
+{
+  "__note__": "Starter selector config. These are PLAUSIBLE selectors derived from each platform's probe defaults — you MUST verify each one against the real lottery page (via the probe step) before relying on it. A platform's real-action adapter only turns on when followed/liked/reposted have click selectors AND commented has both an input and a submit selector. Real-run still additionally requires: global real-run switch on, a calibrated 'ready' account, a recent probe reporting ready_for_real_actions, a recent successful shadow-run, a human-reviewed action plan, and no recent account risk.",
+  "bilibili": {
+    "followed": ["button:has-text('关注')", "[class*='follow-btn']:has-text('关注')"],
+    "liked": ["[aria-label*='点赞']", "button[class*='like']"],
+    "reposted": ["button:has-text('转发')", "button[class*='share']"],
+    "commented": {
+      "input": ["textarea", "[contenteditable='true'][role='textbox']"],
+      "submit": ["button:has-text('发布')"],
+      "text": "参与抽奖",
+      "done": []
+    }
+  },
+  "weibo": {
+    "followed": ["button:has-text('关注')", "[title*='关注']"],
+    "liked": ["[title*='赞']", "button[class*='like']"],
+    "reposted": ["button:has-text('转发')", "[title*='转发']"],
+    "commented": {
+      "input": ["textarea[placeholder*='评论']", "textarea"],
+      "submit": ["button:has-text('评论')", "button:has-text('发布')"]
+    }
+  },
+  "douyin": {
+    "followed": ["button:has-text('关注')", "[data-e2e='follow-icon']"],
+    "liked": ["[data-e2e='like-icon']", "[aria-label*='赞']"],
+    "reposted": ["[data-e2e='share-icon']", "button:has-text('分享')"],
+    "commented": {
+      "input": ["[data-e2e='comment-input']", "[contenteditable='true']"],
+      "submit": ["button:has-text('发布')"]
+    }
+  },
+  "xiaohongshu": {
+    "followed": ["button:has-text('关注')"],
+    "liked": ["[class*='like-wrapper']", "[aria-label*='点赞']"],
+    "reposted": ["[class*='share-wrapper']", "button:has-text('分享')"],
+    "commented": {
+      "input": ["[contenteditable='true']", "textarea"],
+      "submit": ["button:has-text('发送')"]
+    }
+  }
+}
