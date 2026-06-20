@@ -8,14 +8,35 @@ DPMS 是一个多平台抽奖自动化与账号资产管理运行时，目标流
 -> 证据保存 -> 通知 -> 复盘 -> 策略建议
 ```
 
+## 当前版本状态
+
+```text
+Product Version: 0.3.4
+Architecture Stage: S8 / Runtime Reliability Hardening
+Runtime Stage: Shadow-run Closed Loop + Reliability Baseline
+Real-run Status: Gated / Calibration Required
+Production Readiness: Not Ready
+```
+
+详见 `VERSION.md`。
+
 ## 当前能力
 
 - 多平台账号池：支持二维码登录会话和原始 Cookie 粘贴导入。
-- 工作流：支持目标上传、活动池、任务派发、dry-run、real-run 门禁。
+- 工作流：支持目标上传、活动池、任务派发、dry-run、shadow-run、real-run 门禁。
 - 账号安全：支持管理员令牌、危险操作确认、熔断器、账号状态机、代理隔离入口。
+- 执行可靠性：支持 Redis Streams consumer group、pending recovery、transactional outbox、worker heartbeat、orphan lock reconciliation。
+- 数据演进：保留启动期幂等 schema safety net，并引入 `core/migrations/` + `schema_migrations` 的版本化 SQL migration runner。
 - 通知：支持 ServerChan、飞书、Webhook、Telegram 的运行时密钥配置。
-- 前端：支持中文/英文、浅色/深色/跟随系统主题、操作反馈和事件时间线。
-- V4 Event Store：记录账号、任务、通知、风险、Worker、探针和登录事件。
+- 前端：支持中文/英文、浅色/深色/跟随系统主题、操作反馈、事件时间线与 readiness 视图。
+- Event Store / Governance / Transition Runtime：记录账号、任务、通知、风险、Worker、探针、登录、策略决策与策略迁移链路。
+
+## 安全边界
+
+- `REAL_RUN_ENABLED=false` 是默认安全姿态。
+- `DEPLOYMENT_MODE=production` 时，系统会拒绝使用默认 `ADMIN_TOKEN`、默认 `UPDATE_SECRET` 或空 `ENCRYPTION_KEY` 启动。
+- real-run 不是默认能力；必须通过账号校准、selector probe、evidence gate、策略门禁、熔断器和二次确认。
+- 本项目的账号安全目标是合规限速、风险识别、账号隔离，以及在需要人工处理时停止并通知。
 
 ## 本地启动
 
@@ -25,7 +46,12 @@ DPMS 是一个多平台抽奖自动化与账号资产管理运行时，目标流
 Copy-Item .env.example .env
 ```
 
-2. 编辑 `.env`，至少设置数据库、Redis、`ADMIN_TOKEN` 和通知密钥。
+2. 编辑 `.env`，至少设置数据库、Redis、`ADMIN_TOKEN`、`UPDATE_SECRET`、`ENCRYPTION_KEY` 和通知密钥。开发环境保持：
+
+```text
+DEPLOYMENT_MODE=dev
+REAL_RUN_ENABLED=false
+```
 
 3. 启动服务：
 
@@ -53,11 +79,14 @@ npm run build
 
 - 不要提交 `.env`、`browser-profiles/`、`logs/`、`backups/`、`releases/`。
 - `browser-profiles/` 可能包含登录态、Cookie、二维码登录会话和账号浏览器数据。
-- “反爬与账号安全”在本项目中仅指合规限速、风险识别、账号隔离和触发验证码/审核时停止并通知，不用于绕过验证码或规避平台保护机制。
+- 不要把生产密钥写入 `.env.example`、文档、截图或 Issue。
 
 ## 关键文档
 
-- `docs/DPMS_总设计方案_v1_20260611.md`（后续开发总设计方案，分阶段计划与验收标准）
+- `VERSION.md`（当前产品版本、架构阶段、运行阶段、real-run 状态）
+- `docs/DPMS_外部调研与v0.3.5规划_20260620.md`（本轮外部调研、方案比较与下一关键节点规划）
+- `docs/DPMS_运行时可信度硬化_实施记录_20260614.md`
+- `docs/DPMS_总设计方案_v1_20260611.md`
 - `docs/DPMS_能力演化路线图_v4-v9_20260605.md`
 - `docs/DPMS_EventStore_V4_实施记录_20260605.md`
 - `docs/DPMS_最终搭建审阅与漏洞清单_20260602.md`
