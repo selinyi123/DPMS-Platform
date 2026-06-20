@@ -70,6 +70,26 @@ def selector_config_complete(platform: str, configured: dict) -> bool:
     )
 
 
+def recommended_config_from_probe(probe_result, platform: str) -> dict:
+    """The selector config a succeeded probe recommends for ``platform``.
+
+    A probe stores ``_recommended_config`` (built worker-side from the
+    selectors it actually saw visible on the page) keyed by platform. This is
+    the pure extractor: it pulls that platform's recommendation out of a stored
+    probe ``result`` and returns it, or ``{}`` when the probe has no usable
+    recommendation. It does NOT decide completeness — callers gate on
+    ``selector_config_complete`` so the same bar as a hand-saved config applies.
+    """
+    result = parse_json(probe_result)
+    if not isinstance(result, dict):
+        return {}
+    recommended = result.get("_recommended_config")
+    if not isinstance(recommended, dict):
+        return {}
+    platform_config = recommended.get(platform)
+    return platform_config if isinstance(platform_config, dict) and platform_config else {}
+
+
 def click_selectors(value) -> list[str]:
     if isinstance(value, dict):
         value = value.get("click") or value.get("selectors") or value.get("buttons")
