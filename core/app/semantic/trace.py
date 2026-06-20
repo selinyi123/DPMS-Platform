@@ -27,6 +27,8 @@ Safety boundary (non-negotiable):
 
 from __future__ import annotations
 
+from app.governance.policy import gate_codes_from_reasons
+
 
 # Outcomes that mean the gate refused to allow a real run.
 BLOCKING_OUTCOMES = {"block", "deny", "blocked"}
@@ -118,13 +120,7 @@ def _policy_next_action(policy: dict):
 
 
 def _failed_gate_codes(policy: dict) -> list[str]:
-    codes = []
-    for reason in _as_list(policy.get("reasons")):
-        if isinstance(reason, dict) and reason.get("code"):
-            codes.append(reason["code"])
-        elif isinstance(reason, str):
-            codes.append(reason)
-    return codes
+    return gate_codes_from_reasons(_as_list(policy.get("reasons")))
 
 
 # Narrative templates, kept side by side so English and Chinese never drift.

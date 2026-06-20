@@ -30,6 +30,7 @@ from app.governance.policy import (
     DEFAULT_REAL_RUN_POLICY,
     REAL_RUN_GATE_POLICY_KEY,
     build_decision_record,
+    gate_codes_from_reasons,
 )
 from app.security import circuit_breaker_allows, is_real_run_enabled
 
@@ -57,14 +58,14 @@ def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
 
 
 def failed_gate_codes(decision: dict) -> list[str]:
-    """The codes of the gates that blocked, from a decision record's ``reasons``.
+    """The codes of the gates that blocked a recorded decision.
 
-    ``build_decision_record`` carries the full ``reasons`` (one
-    ``{"code", "remediation"}`` item per failed gate) but, unlike
+    ``build_decision_record`` carries the full ``reasons`` but, unlike
     ``evaluate_policy``, does not expose a flat ``failed`` list — so derive the
-    codes from ``reasons`` here rather than reading a key that does not exist.
+    codes from ``reasons`` via the shared extractor rather than reading a key
+    that does not exist.
     """
-    return [item["code"] for item in (decision.get("reasons") or []) if "code" in item]
+    return gate_codes_from_reasons(decision.get("reasons"))
 
 
 def _as_policy_dict(definition) -> dict | None:
