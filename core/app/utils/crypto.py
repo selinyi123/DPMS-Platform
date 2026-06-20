@@ -53,4 +53,29 @@ class CookieVault:
             return self._aesgcm.decrypt(nonce, ct, None).decode()
 
 
-cookie_vault = CookieVault()
+class LazyCookieVault:
+    """Import-safe proxy for CookieVault.
+
+    The old module-level ``cookie_vault = CookieVault()`` decoded
+    ENCRYPTION_KEY during import, before startup secret-posture checks could
+    report a controlled error. This proxy keeps existing call sites
+    (``cookie_vault.encrypt/decrypt``) while constructing the vault only when a
+    credential operation actually needs it.
+    """
+
+    def __init__(self):
+        self._vault: CookieVault | None = None
+
+    def _get(self) -> CookieVault:
+        if self._vault is None:
+            self._vault = CookieVault()
+        return self._vault
+
+    def encrypt(self, *args, **kwargs):
+        return self._get().encrypt(*args, **kwargs)
+
+    def decrypt(self, *args, **kwargs):
+        return self._get().decrypt(*args, **kwargs)
+
+
+cookie_vault = LazyCookieVault()
