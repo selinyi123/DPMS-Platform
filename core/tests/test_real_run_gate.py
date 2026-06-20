@@ -7,8 +7,12 @@ os.environ.setdefault("ENCRYPTION_KEY", base64.b64encode(os.urandom(32)).decode(
 os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
-from app.governance.policy import DEFAULT_REAL_RUN_POLICY, evaluate_policy  # noqa: E402
-from app.services.real_run_gate import gate_inputs  # noqa: E402
+from app.governance.policy import (  # noqa: E402
+    DEFAULT_REAL_RUN_POLICY,
+    build_decision_record,
+    evaluate_policy,
+)
+from app.services.real_run_gate import failed_gate_codes, gate_inputs  # noqa: E402
 
 
 def _full_pass_gate():
@@ -81,6 +85,47 @@ class GateInputContractTests(unittest.TestCase):
         decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
         self.assertEqual(decision["outcome"], "block")
         self.assertIn("global_real_run_enabled", decision["failed"])
+
+
+class FailedGateCodesTests(unittest.TestCase):
+    """``evaluate_real_run_decision`` derives ``failed_gates`` from a decision
+    record, which carries ``reasons`` but no flat ``failed`` list. Reading the
+    wrong key 500s every real-run dispatch, so pin the contract here.
+    """
+
+    def test_record_has_reasons_not_failed_key(self):
+        gate = _full_pass_gate()
+        gate["real_run_enabled"] = False
+        inputs = gate_inputs(gate, breaker_allowed=True)
+        record = build_decision_record(
+            policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs, subject_type="lottery", subject_id="1"
+        )
+        self.assertNotIn("failed", record)
+        self.assertIn("reasons", record)
+
+    def test_codes_match_evaluate_policy_failed(self):
+        gate = _full_pass_gate()
+        gate["real_run_enabled"] = False
+        gate["safe_accounts"] = 0
+        inputs = gate_inputs(gate, breaker_allowed=False)
+        record = build_decision_record(
+            policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs, subject_type="lottery", subject_id="1"
+        )
+        decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
+        self.assertEqual(failed_gate_codes(record), decision["failed"])
+        self.assertIn("global_real_run_enabled", failed_gate_codes(record))
+
+    def test_allow_record_has_no_failed_gates(self):
+        inputs = gate_inputs(_full_pass_gate(), breaker_allowed=True)
+        record = build_decision_record(
+            policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs, subject_type="lottery", subject_id="1"
+        )
+        self.assertEqual(failed_gate_codes(record), [])
+
+    def test_empty_and_malformed_reasons_are_safe(self):
+        self.assertEqual(failed_gate_codes({}), [])
+        self.assertEqual(failed_gate_codes({"reasons": None}), [])
+        self.assertEqual(failed_gate_codes({"reasons": [{"remediation": "x"}]}), [])
 
 
 if __name__ == "__main__":

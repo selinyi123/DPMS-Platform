@@ -56,6 +56,17 @@ def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
     }
 
 
+def failed_gate_codes(decision: dict) -> list[str]:
+    """The codes of the gates that blocked, from a decision record's ``reasons``.
+
+    ``build_decision_record`` carries the full ``reasons`` (one
+    ``{"code", "remediation"}`` item per failed gate) but, unlike
+    ``evaluate_policy``, does not expose a flat ``failed`` list — so derive the
+    codes from ``reasons`` here rather than reading a key that does not exist.
+    """
+    return [item["code"] for item in (decision.get("reasons") or []) if "code" in item]
+
+
 def _as_policy_dict(definition) -> dict | None:
     if isinstance(definition, dict):
         return definition
@@ -146,7 +157,7 @@ async def evaluate_real_run_decision(lottery, *, account_id: int | None, record:
         "policy_version": policy["version"],
         "policy_key": policy["policy_key"],
         "blockers": list(gate.get("blockers") or []),
-        "failed_gates": decision["failed"],
+        "failed_gates": failed_gate_codes(decision),
         "next_action": decision["next_action"],
         "inputs": inputs,
         "gate": gate,

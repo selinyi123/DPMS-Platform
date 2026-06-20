@@ -16,7 +16,6 @@ re-validates the account and the real-run gate at execution time.
 
 import asyncio
 import json
-import time
 
 from app.adapter_config import load_runtime_selector_config
 from app.db import database, redis
@@ -31,15 +30,25 @@ MAX_RECOVERY_COUNT = 3
 IDLE_THRESHOLD_MS = 120_000
 
 
+def pending_idle_ms(entry: dict) -> int:
+    """Idle time (ms) for a redis ``xpending_range`` entry.
+
+    redis-py parses each pending entry with the keys ``message_id``,
+    ``consumer``, ``time_since_delivered`` and ``times_delivered`` — there is no
+    ``idle`` key, and ``time_since_delivered`` is already the elapsed
+    milliseconds since the message was last delivered to a consumer.
+    """
+    return int(entry.get("time_since_delivered") or 0)
+
+
 async def start_recovery_daemon():
     while True:
         try:
-            now_ms = int(time.time() * 1000)
             pending = await redis.xpending_range(
                 STREAM_KEY, GROUP_NAME, min="-", max="+", count=50
             )
             for msg in pending:
-                idle_ms = now_ms - msg["idle"]
+                idle_ms = pending_idle_ms(msg)
                 if idle_ms < IDLE_THRESHOLD_MS:
                     continue
 

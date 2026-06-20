@@ -30,6 +30,10 @@ def _redact_extra(key, value):
 
 def structured_log(level: str, event: str, **kwargs):
 
+    # Pop the exception before building ``extra`` so it is reported once (as
+    # ``record["exception"]``) instead of also leaking into ``extra``.
+    exception = kwargs.pop("exception", None)
+
     record = {
 
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -58,9 +62,9 @@ def structured_log(level: str, event: str, **kwargs):
 
     }
 
-    if "exception" in kwargs:
+    if exception is not None:
 
-        record["exception"] = str(kwargs["exception"])
+        record["exception"] = str(exception)
 
     print(json.dumps(record, ensure_ascii=False, default=str))
 
