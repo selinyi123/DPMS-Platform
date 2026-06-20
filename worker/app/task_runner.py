@@ -10,7 +10,7 @@ from app.event_store.service import record_event
 from app.safety import detect_page_risk, ensure_account_can_run
 from app.utils.log import structured_log
 from app.utils.cookies import inject_account_cookies
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 
 
 STREAM_KEY = "lottery_tasks"
@@ -47,20 +47,24 @@ async def save_phase(task_id: str, account_id: int, lottery_id: int, phase: str)
 
 
 async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task_mode: str):
-    await database.execute(
-        "UPDATE task_runs SET status = 'running', task_mode = :task_mode, started_at = NOW() WHERE task_id = :task_id",
-        {"task_id": task_id, "task_mode": task_mode},
-    )
-    await database.execute(
-        "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id",
-        {"lottery_id": lottery_id},
-    )
-    await database.execute(
-        """UPDATE accounts
-           SET status = 'executing', daily_task_count = daily_task_count + 1, last_active_at = NOW()
-           WHERE id = :account_id""",
-        {"account_id": account_id},
-    )
+    # P1-3: the three state tables move together or not at all, so a crash
+    # mid-update can't leave task_runs=running with the lottery still claimed or
+    # the account counter un-incremented.
+    async with database.transaction():
+        await database.execute(
+            "UPDATE task_runs SET status = 'running', task_mode = :task_mode, started_at = NOW() WHERE task_id = :task_id",
+            {"task_id": task_id, "task_mode": task_mode},
+        )
+        await database.execute(
+            "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id",
+            {"lottery_id": lottery_id},
+        )
+        await database.execute(
+            """UPDATE accounts
+               SET status = 'executing', daily_task_count = daily_task_count + 1, last_active_at = NOW()
+               WHERE id = :account_id""",
+            {"account_id": account_id},
+        )
     await record_event(
         aggregate="task",
         aggregate_id=task_id,
@@ -86,35 +90,40 @@ async def mark_task_finished(
     error: str | None = None,
     screenshot_path: str | None = None,
 ):
-    await database.execute(
-        """UPDATE task_runs
-           SET status = :status, error_message = :error, screenshot_path = :screenshot_path, finished_at = NOW()
-           WHERE task_id = :task_id""",
-        {
-            "task_id": task_id,
-            "status": "succeeded" if success else "failed",
-            "error": error,
-            "screenshot_path": screenshot_path,
-        },
-    )
     lottery_status = "participated" if success and task_mode == "real_run" else "pending"
-    await database.execute(
-        "UPDATE lotteries SET status = :status, execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id",
-        {"lottery_id": lottery_id, "status": lottery_status},
-    )
-    await database.execute(
-        "UPDATE accounts SET status = 'ready', updated_at = NOW() WHERE id = :account_id AND status = 'executing'",
-        {"account_id": account_id},
-    )
-    await database.execute(
-        """INSERT INTO notify_logs (channel, title, content, success)
-           VALUES ('system', :title, :content, :success)""",
-        {
-            "title": f"Task {task_id[:8]} {task_mode} {'succeeded' if success else 'failed'}",
-            "content": error or f"Lottery {lottery_id} handled by account {account_id} in {task_mode}",
-            "success": 1 if success else 0,
-        },
-    )
+    # P1-3: terminal state across task_runs / lotteries / accounts plus the
+    # notify_logs row commit atomically. The lottery lock is released only if the
+    # whole transaction succeeds, preventing "task succeeded but lottery still
+    # running / lock stuck" drift. Redis notify is emitted after commit.
+    async with database.transaction():
+        await database.execute(
+            """UPDATE task_runs
+               SET status = :status, error_message = :error, screenshot_path = :screenshot_path, finished_at = NOW()
+               WHERE task_id = :task_id""",
+            {
+                "task_id": task_id,
+                "status": "succeeded" if success else "failed",
+                "error": error,
+                "screenshot_path": screenshot_path,
+            },
+        )
+        await database.execute(
+            "UPDATE lotteries SET status = :status, execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id",
+            {"lottery_id": lottery_id, "status": lottery_status},
+        )
+        await database.execute(
+            "UPDATE accounts SET status = 'ready', updated_at = NOW() WHERE id = :account_id AND status = 'executing'",
+            {"account_id": account_id},
+        )
+        await database.execute(
+            """INSERT INTO notify_logs (channel, title, content, success)
+               VALUES ('system', :title, :content, :success)""",
+            {
+                "title": f"Task {task_id[:8]} {task_mode} {'succeeded' if success else 'failed'}",
+                "content": error or f"Lottery {lottery_id} handled by account {account_id} in {task_mode}",
+                "success": 1 if success else 0,
+            },
+        )
     await record_event(
         aggregate="task",
         aggregate_id=task_id,
@@ -366,7 +375,7 @@ async def prepare_account_login(ctx, account_id: int, platform: str):
 
     credential_blob = row["encrypted_credential"]
     try:
-        credential = cookie_vault.decrypt(credential_blob)
+        credential = cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
     except Exception:
         if isinstance(credential_blob, bytes):
             credential = credential_blob.decode("utf-8")

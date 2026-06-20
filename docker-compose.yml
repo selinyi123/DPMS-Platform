@@ -83,8 +83,13 @@ services:
           memory: 2048M
     restart: unless-stopped
     shm_size: "1gb"
-    cap_add:
-      - SYS_ADMIN
+    # Chromium launches with --no-sandbox --disable-dev-shm-usage (see
+    # worker/app/browser_pool.py) and shm_size above, so the broad SYS_ADMIN
+    # capability is unnecessary. Dropping it and blocking privilege escalation
+    # tightens the worker's blast radius (Phase 4). Validate browser launch in a
+    # real container after this change.
+    security_opt:
+      - no-new-privileges:true
 
   mysql:
     image: mysql:8.0

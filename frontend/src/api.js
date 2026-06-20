@@ -77,8 +77,11 @@ async function requestJSON(path, options = {}) {
 }
 
 export async function fetchJSON(path, options = {}) {
+  // Always attach the admin token: GET /api endpoints are now authenticated
+  // (default-closed), so every read must carry the token. The previous
+  // opt-in `options.auth` is kept as a harmless no-op for older call sites.
   return requestJSON(path, {
-    headers: options.auth ? adminHeaders() : undefined,
+    headers: adminHeaders(),
     timeoutMs: options.timeoutMs,
   });
 }

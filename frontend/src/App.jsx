@@ -4,6 +4,7 @@ import { fetchJSON } from './api';
 import NavButton from './components/NavButton';
 import ToastStack from './components/ToastStack';
 import Accounts from './pages/Accounts';
+import Capacity from './pages/Capacity';
 import Dashboard from './pages/Dashboard';
 import Deploy from './pages/Deploy';
 import EventTimeline from './pages/EventTimeline';
@@ -12,10 +13,14 @@ import Governance from './pages/Governance';
 import Knowledge from './pages/Knowledge';
 import Learning from './pages/Learning';
 import Lotteries from './pages/Lotteries';
+import Orchestration from './pages/Orchestration';
 import RiskCenter from './pages/RiskCenter';
 import RiskIntelligence from './pages/RiskIntelligence';
+import Scheduling from './pages/Scheduling';
+import SemanticTrace from './pages/SemanticTrace';
 import Strategy from './pages/Strategy';
 import TaskMonitor from './pages/TaskMonitor';
+import Throughput from './pages/Throughput';
 import TransitionGraph from './pages/TransitionGraph';
 import { useUi } from './uiContext';
 
@@ -30,6 +35,11 @@ const pages = {
   learning: { Component: Learning },
   governance: { Component: Governance },
   transitions: { Component: TransitionGraph },
+  semantic: { Component: SemanticTrace },
+  scheduling: { Component: Scheduling },
+  capacity: { Component: Capacity },
+  orchestration: { Component: Orchestration },
+  throughput: { Component: Throughput },
   tasks: { Component: TaskMonitor },
   events: { Component: EventTimeline },
   risk: { Component: RiskCenter },
@@ -37,14 +47,13 @@ const pages = {
 };
 
 export default function App() {
-  const [page, setPage] = useState('dashboard');
   const [tokenDraft, setTokenDraft] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(
     () => !window.matchMedia('(max-width: 920px)').matches,
   );
   const [authState, setAuthState] = useState({ status: 'unknown', role: '', error: '' });
-  const PageComponent = pages[page].Component;
-  const { language, setLanguage, theme, setTheme, t } = useUi();
+  const { language, setLanguage, theme, setTheme, t, page, navigate } = useUi();
+  const PageComponent = (pages[page] || pages.dashboard).Component;
   const authText = language === 'en'
     ? {
       label: 'Admin token',
@@ -55,6 +64,9 @@ export default function App() {
       missing: 'Not signed in',
       failed: 'Invalid token',
       settings: 'Access & display settings',
+      gateTitle: 'Sign in required',
+      gateBody: 'Enter a valid ADMIN_TOKEN to access the console — every data endpoint requires authentication.',
+      checking: 'Checking session…',
     }
     : {
       label: '管理令牌',
@@ -65,6 +77,9 @@ export default function App() {
       missing: '未登录',
       failed: '令牌无效',
       settings: '访问与显示设置',
+      gateTitle: '需要登录',
+      gateBody: '请输入有效的 ADMIN_TOKEN 以访问控制台——所有数据接口均需鉴权。',
+      checking: '正在校验会话…',
     };
 
   const verifyToken = async () => {
@@ -121,7 +136,7 @@ export default function App() {
 
         <nav className="nav-list">
           {Object.entries(pages).map(([key]) => (
-            <NavButton key={key} active={page === key} onClick={() => setPage(key)}>
+            <NavButton key={key} active={page === key} onClick={() => navigate(key)}>
               {t(`nav.${key}`)}
             </NavButton>
           ))}
@@ -183,7 +198,33 @@ export default function App() {
       </aside>
 
       <main className="main-pane">
-        <PageComponent />
+        {authState.status === 'verified' ? (
+          <PageComponent />
+        ) : authState.status === 'unknown' ? (
+          <div className="auth-gate">
+            <div className="auth-gate-card">{authText.checking}</div>
+          </div>
+        ) : (
+          <div className="auth-gate">
+            <div className="auth-gate-card">
+              <h2>{authText.gateTitle}</h2>
+              <p>{authText.gateBody}</p>
+              <input
+                className="auth-gate-input"
+                type="password"
+                value={tokenDraft}
+                onChange={e => setTokenDraft(e.target.value)}
+                placeholder={authText.placeholder}
+                autoComplete="off"
+                onKeyDown={e => { if (e.key === 'Enter') saveToken(); }}
+              />
+              <button type="button" onClick={saveToken}>{authText.save}</button>
+              {authState.status === 'failed' && (
+                <div className="auth-gate-error">{authState.error || authText.failed}</div>
+              )}
+            </div>
+          </div>
+        )}
       </main>
       <ToastStack />
     </div>

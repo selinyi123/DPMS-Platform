@@ -18,13 +18,16 @@ from app.db import database, redis
 
 from app.services.recovery_daemon import start_recovery_daemon
 from app.services.notification_dispatcher import start_notification_dispatcher
+from app.services.outbox import start_outbox_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions
+from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic, scheduling, capacity, orchestration, throughput
 
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
+from app.security_posture import format_posture_problems, secret_posture
+from app.migrations_runner import run_migrations
 
 from app.utils.log import structured_log
 from app.security import authenticate_request
@@ -40,6 +43,31 @@ async def lifespan(app: FastAPI):
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
         await ensure_runtime_schema()
+        # Versioned migrations run after the idempotent ensure_* safety net so
+        # every referenced table is present. Non-fatal: a migration failure is
+        # logged but does not block startup (the ensure_* hooks still hold the
+        # baseline schema).
+        try:
+            applied = await run_migrations()
+            if applied:
+                structured_log("info", "migrations_applied", versions=",".join(applied))
+        except Exception as exc:
+            structured_log("error", "migrations_failed", exception=exc)
+
+    # Production secret-posture guard (Phase 4): never run a real deployment on
+    # the shipped default ADMIN_TOKEN / UPDATE_SECRET or an unset ENCRYPTION_KEY.
+    posture_problems = secret_posture(
+        admin_token=settings.admin_token,
+        update_secret=settings.update_secret,
+        encryption_key=settings.encryption_key,
+        database_url=settings.database_url,
+    )
+    if posture_problems:
+        summary = format_posture_problems(posture_problems)
+        if settings.deployment_mode == "production":
+            structured_log("error", "insecure_secret_posture", mode="production", problems=summary)
+            raise RuntimeError(f"Refusing to start in production with insecure secrets: {summary}")
+        structured_log("warning", "insecure_secret_posture", mode=settings.deployment_mode, problems=summary)
 
     # 启动时健康检查
 
@@ -72,6 +100,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(start_recovery_daemon())
 
     asyncio.create_task(start_notification_dispatcher())
+
+    asyncio.create_task(start_outbox_dispatcher())
 
     asyncio.create_task(scheduler_loop())
 
@@ -259,6 +289,9 @@ async def ensure_runtime_schema():
         structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER TABLE login_sessions MODIFY status", error=str(exc))
     await ensure_column("task_runs", "screenshot_path", "VARCHAR(512) NULL")
     await ensure_column("task_runs", "task_mode", "VARCHAR(32) NOT NULL DEFAULT 'dry_run'", after="dry_run")
+    # P1-4: bind each real-run task to the gate decision that authorised it.
+    await ensure_column("task_runs", "decision_id", "CHAR(36) NULL", after="task_mode")
+    await ensure_column("task_runs", "policy_version", "INT NULL", after="decision_id")
     try:
         await database.execute("UPDATE task_runs SET task_mode = IF(dry_run = 1, 'dry_run', 'real_run') WHERE task_mode IS NULL OR task_mode = ''")
     except Exception as exc:
@@ -304,6 +337,89 @@ async def ensure_runtime_schema():
     )
     await ensure_experiment_schema()
     await ensure_governance_schema()
+    await ensure_orchestration_schema()
+    await ensure_consistency_schema()
+
+
+async def ensure_consistency_schema():
+    # Transactional outbox (P1-2): the dispatch path writes the would-be Redis
+    # stream message here inside the same transaction as the task_runs row and
+    # the lottery claim, so the enqueue is atomic with the state change. The
+    # outbox dispatcher relays committed rows at-least-once; dedup_key (task_id)
+    # keeps that relay idempotent.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS outbox_events (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          stream_key VARCHAR(64) NOT NULL,
+          payload JSON NOT NULL,
+          status ENUM('pending','sending','sent','failed') NOT NULL DEFAULT 'pending',
+          attempts INT NOT NULL DEFAULT 0,
+          last_error TEXT NULL,
+          dedup_key VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          sent_at TIMESTAMP NULL,
+          UNIQUE KEY uk_outbox_dedup (dedup_key),
+          INDEX idx_outbox_status (status, id)
+        ) ENGINE=InnoDB"""
+    )
+    # Critical-event dead-letter (P2-3): captures real-run / policy-activation
+    # events whose write to the strict ``events`` table failed, so a high-risk
+    # action's audit record is durably recoverable instead of silently dropped.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS failed_events (
+          id CHAR(36) PRIMARY KEY,
+          aggregate VARCHAR(64) NOT NULL,
+          aggregate_id VARCHAR(128) NOT NULL,
+          event_type VARCHAR(128) NOT NULL,
+          payload LONGTEXT NULL,
+          actor_type VARCHAR(32) NULL,
+          actor_id VARCHAR(128) NULL,
+          source_service VARCHAR(64) NULL,
+          error TEXT NULL,
+          replayed TINYINT NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_failed_events_replayed (replayed, created_at)
+        ) ENGINE=InnoDB"""
+    )
+    # Active-task uniqueness (P1-2 roadmap item 6): a virtual column that is the
+    # lottery_id only while the task is queued/running (NULL once terminal),
+    # plus a unique index, so the database itself refuses a second live task per
+    # lottery even if the in-transaction FOR UPDATE guard is somehow bypassed.
+    # Both ALTERs are best-effort/idempotent: skipped if already present or if
+    # legacy data already violates the constraint.
+    try:
+        await database.execute(
+            """ALTER TABLE task_runs
+               ADD COLUMN active_lottery_lock BIGINT
+               GENERATED ALWAYS AS (CASE WHEN status IN ('queued','running') THEN lottery_id END) VIRTUAL"""
+        )
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD active_lottery_lock", error=str(exc))
+    try:
+        await database.execute("ALTER TABLE task_runs ADD UNIQUE KEY uk_active_task_per_lottery (active_lottery_lock)")
+    except Exception as exc:
+        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD uk_active_task_per_lottery", error=str(exc))
+
+
+async def ensure_orchestration_schema():
+    # Orchestration Runtime (V12 / S11): inert, audit-only campaign drafts.
+    # A draft is never auto-executed and never activated; adopting a plan
+    # always goes back through the existing gated dispatch flow.
+    await database.execute(
+        """CREATE TABLE IF NOT EXISTS campaign_plans (
+          id BIGINT AUTO_INCREMENT PRIMARY KEY,
+          campaign_key VARCHAR(64) NOT NULL,
+          platform_scope JSON NULL,
+          plan JSON NOT NULL,
+          status VARCHAR(16) NOT NULL DEFAULT 'draft',
+          waves INT NOT NULL DEFAULT 0,
+          requires_review TINYINT NOT NULL DEFAULT 0,
+          created_by VARCHAR(128) NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_campaign_plan_key (campaign_key, created_at)
+        ) ENGINE=InnoDB"""
+    )
 
 
 async def ensure_experiment_schema():
@@ -450,15 +566,28 @@ async def ensure_column(table: str, column: str, definition: str, after: str | N
 app = FastAPI(title="Lottery System v3.0.2", version="0.3.2", lifespan=lifespan)
 
 
+# Paths under /api that are intentionally unauthenticated. Keep this minimal:
+# only the container health probe (docker healthcheck curls /api/health).
+PUBLIC_API_PATHS = {"/api/health"}
+
+
 @app.middleware("http")
 
 async def require_admin_token(request: Request, call_next):
 
     request.state.actor = None
 
-    is_write = request.method not in {"GET", "HEAD", "OPTIONS"}
+    path = request.url.path
 
-    if request.url.path.startswith("/api/") and is_write:
+    # Default-closed (P0-1): every /api request is authenticated, not just
+    # writes — read endpoints expose account/proxy/schedule/governance state
+    # and must not be public. CORS preflight (OPTIONS) and the health probe
+    # are the only exemptions.
+    if (
+        request.method != "OPTIONS"
+        and path.startswith("/api/")
+        and path not in PUBLIC_API_PATHS
+    ):
 
         try:
             await authenticate_request(request)
@@ -466,6 +595,28 @@ async def require_admin_token(request: Request, call_next):
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
     return await call_next(request)
+
+
+# Security response headers (Phase 4). Registered after the auth middleware so it
+# is the outermost layer and applies to every response, including 401s. API
+# responses are JSON, never embedded HTML, so the CSP can be maximally strict and
+# caches must never store the (often sensitive) bodies.
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+    "Cache-Control": "no-store",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
 
 
 
@@ -530,6 +681,16 @@ app.include_router(learning.router, prefix="/api/learning", tags=["learning"])
 app.include_router(governance.router, prefix="/api/governance", tags=["governance"])
 
 app.include_router(transitions.router, prefix="/api/transitions", tags=["transitions"])
+
+app.include_router(semantic.router, prefix="/api/semantic", tags=["semantic"])
+
+app.include_router(scheduling.router, prefix="/api/scheduling", tags=["scheduling"])
+
+app.include_router(capacity.router, prefix="/api/capacity", tags=["capacity"])
+
+app.include_router(orchestration.router, prefix="/api/orchestration", tags=["orchestration"])
+
+app.include_router(throughput.router, prefix="/api/throughput", tags=["throughput"])
 
 
 @app.get("/api/auth/me")

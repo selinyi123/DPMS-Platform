@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-13
+updated: 2026-06-14
 ---
 
 # DPMS 活动时间线
@@ -80,6 +80,33 @@ updated: 2026-06-13
 | 提交 | 活动 | 关联记录 |
 | --- | --- | --- |
 | `3581ccd` | 推进 V8：Transition Runtime（策略迁移图，发布/激活分离，宽松化强制留痕） | [[DPMS_V8_TransitionRuntime_实施记录_20260613]] |
+| `f61aa98` | 推进 V9：Semantic Runtime（Intent→Execution 语义执行链，纯只读聚合，不新增数据表） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `5e3c90a` | V9 增强：Governance 评估面板与决策表交叉链接到语义链（跨页导航下沉至 uiContext） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `15de710` | V9 增强：consistency_checks 新增"执行状态滞后于最近任务运行"跨层检查 | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `bdb868d` | V9 增强：语义链泛化到 account 主体（复用 V6 信誉/风险与 task_runs，修正跨类型主键碰撞） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+| `599fd4c` | V9 增强：语义链泛化到 task 主体（UUID subject_id，Intent/Policy 继承自所属 lottery） | [[DPMS_V9_SemanticRuntime_实施记录_20260613]] |
+
+## 2026-06-14
+
+运营规模化主线 V10–V13（编排时间 → 编排资源 → 编排广度 → 守住可持续），详见 [[DPMS_V10-V13_运营规模化_后续版本规划_20260614]] 与 [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]]。
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `a37fa1b` | 推进 V10–V13 后端：Scheduling / Capacity / Orchestration / Throughput 四个只读运营规模化运行时（+42 测试，新增 campaign_plans 审计表） | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
+| `a527d13` | V10–V13 前端：四个只读控制台页面（排程/容量/批量编排/吞吐治理）+ 中英 i18n | [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]] |
+
+运行时可信度硬化（按深度审阅路线图 P0→P1→P2 分阶段推进），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]。
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `84afd84` / `f85b3be` | P0 安全修复：默认鉴权、recovery 完整重建、capacity 零代理零容量、orchestration 最新有效 decision、ZIP safe_extract | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `e6ca6e0` | 快速 P1：Proxy SSRF 白名单、通知 raise_for_status、Proxy 变更审计 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `09fdb82` | 一致性事务化：派发原子化 + 事务性 outbox（至少一次、不重复投递、活动任务唯一约束）+ worker 任务生命周期事务化 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `a87b1ac` | real-run 门禁合流：Governance policy 成为唯一权威，decision_id/policy_version 绑定 task_runs | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `edc016a` | P2 长期演化：指纹资产隔离池、CookieVault AAD 上下文绑定、关键事件死信表 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `126db99` | 生产部署基线：production 密钥校验、API/nginx 安全响应头与 CSP、日志脱敏、移除 worker SYS_ADMIN | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `5c49bb3` | 前端统一 auth guard：未登录不渲染数据页面，改为登录卡 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+| `820b44d` | 版本化 SQL 迁移框架（schema_migrations + core/migrations）+ baseline 0001 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 
 ## 记录原则
 

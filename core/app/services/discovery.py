@@ -6,7 +6,7 @@ from urllib.parse import unquote
 from app.db import database
 from app.services.bilibili_discovery import fetch_bilibili_space_dynamics
 from app.utils.cookies import parse_cookie_payload
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 from app.utils.canonicalizer import canonicalize_platform_url
 from app.utils.lottery_targets import validate_lottery_target
 from app.utils.log import structured_log
@@ -117,7 +117,7 @@ async def load_bilibili_discovery_cookie_header() -> str:
     )
     if not row:
         raise RuntimeError("Bilibili UP discovery requires a calibrated ready account")
-    credential = cookie_vault.decrypt(row["encrypted_credential"])
+    credential = cookie_vault.decrypt(row["encrypted_credential"], aad=CREDENTIAL_AAD)
     cookies = parse_cookie_payload("bilibili", credential)
     return "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in cookies)
 

@@ -42,6 +42,8 @@ from app.strategy.engine import (
 )
 from app.services.discovery import run_discovery
 from app.services.lottery_rules import parse_lottery_rule
+from app.services.outbox import build_lottery_task_message, enqueue_outbox, try_flush_dedup
+from app.services.real_run_gate import evaluate_real_run_decision
 from app.security import (
     audit_event,
     circuit_breaker_allows,
@@ -586,6 +588,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 payload={"platform": lottery["platform"], "reason": exc.detail},
                 actor_type="operator",
                 actor_id=actor["actor_id"],
+                critical=True,
             )
             await emit_real_run_gate_notification(lottery, exc.detail, actor_id=actor["actor_id"])
             raise
@@ -623,55 +626,104 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         )
         raise HTTPException(400, detail="No available account. Create a ready account first.")
 
+    # The Governance policy is now the single real-run authority (P1-4): a
+    # decision is evaluated against the *chosen* account, recorded, and only an
+    # "allow" outcome may dispatch. The recorded decision_id / policy_version are
+    # bound to the task below, so every real run is traceable to the exact gate
+    # decision that authorised it.
+    decision_id = None
+    policy_version = None
     if task_mode == "real_run":
-        evidence = await validate_real_run_evidence(lottery, account_id=account["id"])
-        if not evidence["allowed"]:
+        decision = await evaluate_real_run_decision(lottery, account_id=account["id"], record=True)
+        decision_id = decision["decision_id"]
+        policy_version = decision["policy_version"]
+        if not decision["allowed"]:
             await record_event(
                 aggregate="lottery",
                 aggregate_id=lottery_id,
                 event_type="RealRunDenied",
-                payload={"platform": lottery["platform"], "account_id": account["id"], "blockers": evidence["blockers"]},
+                payload={
+                    "platform": lottery["platform"],
+                    "account_id": account["id"],
+                    "blockers": decision["blockers"],
+                    "failed_gates": decision["failed_gates"],
+                    "decision_id": decision_id,
+                    "policy_version": policy_version,
+                },
                 actor_type="operator",
                 actor_id=actor["actor_id"],
+                critical=True,
             )
             await emit_real_run_gate_notification(
                 lottery,
-                {"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"], "account_id": account["id"]},
+                {
+                    "message": "Real-run policy gate is not satisfied",
+                    "blockers": decision["blockers"],
+                    "failed_gates": decision["failed_gates"],
+                    "account_id": account["id"],
+                    "decision_id": decision_id,
+                    "policy_version": policy_version,
+                },
                 actor_id=actor["actor_id"],
             )
-            raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "Real-run policy gate is not satisfied",
+                    "blockers": decision["blockers"],
+                    "failed_gates": decision["failed_gates"],
+                    "decision_id": decision_id,
+                    "policy_version": policy_version,
+                },
+            )
 
     task_id = str(uuid.uuid4())
-    await database.execute(
-        """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode)
-           VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode)""",
-        {
-            "task_id": task_id,
-            "account_id": account["id"],
-            "lottery_id": lottery_id,
-            "dry_run": int(dry_run),
-            "task_mode": task_mode,
-        },
+    message = build_lottery_task_message(
+        task_id=task_id,
+        account_id=account["id"],
+        lottery_id=lottery_id,
+        platform=lottery["platform"],
+        raw_url=lottery["raw_url"],
+        canonical_url=lottery["canonical_url"],
+        task_mode=task_mode,
+        dry_run=dry_run,
+        platform_selectors=platform_selectors,
+        action_plan=parse_json_field(lottery["action_plan"]) or {},
     )
-    await database.execute(
-        "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
-        {"task_id": task_id, "id": lottery_id},
-    )
-    await redis.xadd(
-        "lottery_tasks",
-        {
-            "task_id": task_id,
-            "account_id": str(account["id"]),
-            "lottery_id": str(lottery_id),
-            "platform": lottery["platform"],
-            "raw_url": lottery["raw_url"],
-            "canonical_url": lottery["canonical_url"],
-            "dry_run": "1" if dry_run else "0",
-            "mode": task_mode,
-            "selector_config": json.dumps(platform_selectors, ensure_ascii=False) if isinstance(platform_selectors, dict) else "{}",
-            "action_plan": json.dumps(parse_json_field(lottery["action_plan"]) or {}, ensure_ascii=False),
-        },
-    )
+    # Atomic dispatch (P1-2): task_runs row, lottery claim, and the queued
+    # stream message (as an outbox row) commit together. A FOR UPDATE guard
+    # rejects a duplicate active dispatch for the same lottery.
+    async with database.transaction():
+        locked = await database.fetch_one(
+            "SELECT status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            {"id": lottery_id},
+        )
+        if locked and locked["execution_lock"] and locked["status"] in {"claimed", "running"}:
+            raise HTTPException(409, detail="Lottery already has an active task in flight")
+        await database.execute(
+            """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode, decision_id, policy_version)
+               VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode, :decision_id, :policy_version)""",
+            {
+                "task_id": task_id,
+                "account_id": account["id"],
+                "lottery_id": lottery_id,
+                "dry_run": int(dry_run),
+                "task_mode": task_mode,
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+            },
+        )
+        await database.execute(
+            "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
+            {"task_id": task_id, "id": lottery_id},
+        )
+        await enqueue_outbox(message, "lottery_tasks", dedup_key=task_id)
+    # Best-effort immediate relay so dispatch latency stays low; if Redis is
+    # momentarily unavailable the outbox dispatcher loop retries the committed row.
+    try:
+        await try_flush_dedup(task_id)
+    except Exception as exc:
+        structured_log("warning", "dispatch_immediate_flush_failed", task_id=task_id, error=str(exc))
     if task_mode == "real_run":
         await audit_event(
             request,
@@ -680,7 +732,13 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             resource_id=lottery_id,
             result="queued",
             risk_level="critical",
-            detail={"platform": lottery["platform"], "task_id": task_id, "account_id": account["id"]},
+            detail={
+                "platform": lottery["platform"],
+                "task_id": task_id,
+                "account_id": account["id"],
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+            },
         )
     elif task_mode == "shadow_run":
         await audit_event(
@@ -704,10 +762,13 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "mode": task_mode,
             "raw_url": lottery["raw_url"],
             "action_plan": parse_json_field(lottery["action_plan"]) or {},
+            "decision_id": decision_id,
+            "policy_version": policy_version,
         },
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=(task_mode == "real_run"),
     )
     await record_event(
         aggregate="lottery",
@@ -717,8 +778,17 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=(task_mode == "real_run"),
     )
-    return {"status": "queued", "task_id": task_id, "account_id": account["id"], "lottery_id": lottery_id, "mode": task_mode}
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "account_id": account["id"],
+        "lottery_id": lottery_id,
+        "mode": task_mode,
+        "decision_id": decision_id,
+        "policy_version": policy_version,
+    }
 
 
 @router.get("/{lottery_id}/action-plan/suggest")

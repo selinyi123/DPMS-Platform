@@ -1,8 +1,22 @@
 import base64
+import os
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.config import settings
+
+
+# Must match core/app/utils/crypto.py: the worker decrypts account credentials
+# that core encrypted (and vice versa via login_broker), so the purpose AAD has
+# to be byte-identical across both services (P2-2).
+CREDENTIAL_AAD = "dpms:account-credential"
+
+
+def _aad_bytes(aad: str | bytes | None) -> bytes | None:
+    if aad is None:
+        return None
+    return aad.encode("utf-8") if isinstance(aad, str) else aad
 
 
 class CookieVault:
@@ -12,18 +26,23 @@ class CookieVault:
             raise ValueError("ENCRYPTION_KEY must be 32 bytes base64 encoded")
         self._aesgcm = AESGCM(key)
 
-    def encrypt(self, plaintext: str) -> bytes:
-        import os
-
+    def encrypt(self, plaintext: str, *, aad: str | bytes | None = None) -> bytes:
         nonce = os.urandom(12)
-        ct = self._aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+        ct = self._aesgcm.encrypt(nonce, plaintext.encode("utf-8"), _aad_bytes(aad))
         return nonce + ct
 
-    def decrypt(self, ciphertext: bytes | str) -> str:
+    def decrypt(self, ciphertext: bytes | str, *, aad: str | bytes | None = None) -> str:
         if isinstance(ciphertext, str):
             ciphertext = ciphertext.encode("utf-8")
         nonce, ct = ciphertext[:12], ciphertext[12:]
-        return self._aesgcm.decrypt(nonce, ct, None).decode()
+        aad_b = _aad_bytes(aad)
+        try:
+            return self._aesgcm.decrypt(nonce, ct, aad_b).decode()
+        except InvalidTag:
+            # Legacy ciphertext written before AAD binding has no AAD.
+            if aad_b is None:
+                raise
+            return self._aesgcm.decrypt(nonce, ct, None).decode()
 
 
 cookie_vault = CookieVault()

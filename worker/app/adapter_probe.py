@@ -8,7 +8,7 @@ from app.db import database, redis
 from app.event_store.service import record_event
 from app.safety import detect_page_risk
 from app.utils.cookies import inject_account_cookies
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 from app.utils.log import structured_log
 
 
@@ -133,7 +133,7 @@ async def inject_probe_cookies(ctx, account_id: int, platform: str):
         raise ValueError(f"Account {account_id} has no imported login Cookie")
     credential_blob = row["encrypted_credential"]
     try:
-        credential = cookie_vault.decrypt(credential_blob)
+        credential = cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
     except Exception:
         credential = credential_blob.decode("utf-8") if isinstance(credential_blob, bytes) else str(credential_blob)
     await inject_account_cookies(ctx, platform, credential)

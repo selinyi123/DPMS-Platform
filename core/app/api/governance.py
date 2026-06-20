@@ -35,6 +35,7 @@ from app.security import (
     require_confirmation,
     require_min_role,
 )
+from app.services.real_run_gate import gate_inputs, load_active_policy, record_policy_decision
 from app.transition.engine import classify_transition, impact_scope, validate_transition
 
 
@@ -43,7 +44,7 @@ router = APIRouter()
 
 @router.get("/policy")
 async def active_policy(policy_key: str = REAL_RUN_GATE_POLICY_KEY):
-    return await _load_active_policy(policy_key)
+    return await load_active_policy(policy_key)
 
 
 @router.get("/policies")
@@ -86,7 +87,7 @@ async def publish_policy_version(data: PolicyPublishRequest, request: Request):
     if to_policy.get("policy_key") != data.policy_key:
         raise HTTPException(400, detail={"message": "policy_key mismatch between request and definition"})
 
-    from_policy = await _load_active_policy(data.policy_key)
+    from_policy = await load_active_policy(data.policy_key)
     valid, errors = validate_transition(
         from_policy=from_policy,
         to_policy=to_policy,
@@ -240,6 +241,7 @@ async def activate_policy_version(version: int, data: PolicyActivateRequest, req
         payload={"version": version, "previous_version": previous_version, "note": data.note},
         actor_type="operator",
         actor_id=actor["actor_id"],
+        critical=True,
     )
     return {"status": "activated", "policy_key": policy_key, "version": version, "previous_version": previous_version}
 
@@ -250,13 +252,13 @@ async def evaluate_real_run_policy(lottery_id: int, record: bool = True):
     if not lottery:
         raise HTTPException(404, detail="Lottery not found")
 
-    policy = await _load_active_policy(REAL_RUN_GATE_POLICY_KEY)
+    policy = await load_active_policy(REAL_RUN_GATE_POLICY_KEY)
     selector_config = await load_runtime_selector_config()
     real_run_enabled = await is_real_run_enabled()
     gate = await real_run_gate_status(lottery, selector_config=selector_config, real_run_enabled=real_run_enabled)
     breaker_allowed, _ = await circuit_breaker_allows(lottery["platform"])
 
-    inputs = _gate_inputs(gate, breaker_allowed=breaker_allowed)
+    inputs = gate_inputs(gate, breaker_allowed=breaker_allowed)
     decision = build_decision_record(
         policy=policy, inputs=inputs, subject_type="lottery", subject_id=str(lottery_id)
     )
@@ -264,19 +266,12 @@ async def evaluate_real_run_policy(lottery_id: int, record: bool = True):
     decision_id = None
     if record:
         decision_id = str(uuid.uuid4())
-        await database.execute(
-            """INSERT INTO policy_decisions
-                 (decision_id, policy_key, policy_version, subject_type, subject_id, inputs, outcome, reasons)
-               VALUES (:decision_id, :policy_key, :policy_version, 'lottery', :subject_id, :inputs, :outcome, :reasons)""",
-            {
-                "decision_id": decision_id,
-                "policy_key": policy["policy_key"],
-                "policy_version": policy["version"],
-                "subject_id": str(lottery_id),
-                "inputs": json.dumps(inputs, ensure_ascii=False),
-                "outcome": decision["outcome"],
-                "reasons": json.dumps(decision["reasons"], ensure_ascii=False),
-            },
+        await record_policy_decision(
+            decision_id=decision_id,
+            policy=policy,
+            inputs=inputs,
+            decision=decision,
+            subject_id=str(lottery_id),
         )
     return {"decision_id": decision_id, "policy_version": policy["version"], **decision}
 
@@ -311,7 +306,7 @@ async def replay_recorded_decision(decision_id: str):
         raise HTTPException(404, detail="Decision not found")
     record = dict(row)
     record["inputs"] = parse_json_field(record.get("inputs")) or {}
-    policy = await _load_active_policy(record["policy_key"])
+    policy = await load_active_policy(record["policy_key"])
     result = replay_decision(policy=policy, record=record)
     return {
         "decision_id": decision_id,
@@ -320,32 +315,3 @@ async def replay_recorded_decision(decision_id: str):
     }
 
 
-def _gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
-    """Map the existing real-run gate status onto policy gate codes."""
-    blockers = set(gate.get("blockers") or [])
-    return {
-        "global_real_run_enabled": bool(gate.get("real_run_enabled")),
-        "circuit_breaker_closed": bool(breaker_allowed),
-        "valid_lottery_target": bool(gate.get("target_valid")),
-        "action_plan_reviewed": bool(gate.get("action_plan_ready")),
-        "calibrated_account_available": int(gate.get("safe_accounts") or 0) > 0,
-        "real_adapter_enabled": bool(gate.get("adapter_enabled")),
-        "recent_complete_probe": bool(gate.get("probe_ready")),
-        "recent_shadow_run": bool(gate.get("shadow_ready")),
-        "no_recent_account_risk": "recent_account_risk_event" not in blockers,
-    }
-
-
-async def _load_active_policy(policy_key: str) -> dict:
-    """Load the active policy version from the DB, falling back to the default."""
-    row = await database.fetch_one(
-        "SELECT definition FROM policy_versions WHERE policy_key = :pk AND active = 1 ORDER BY version DESC LIMIT 1",
-        {"pk": policy_key},
-    )
-    if row and row["definition"]:
-        definition = parse_json_field(row["definition"])
-        if isinstance(definition, dict):
-            return definition
-    if policy_key == REAL_RUN_GATE_POLICY_KEY:
-        return DEFAULT_REAL_RUN_POLICY
-    raise HTTPException(404, detail="Policy not found")

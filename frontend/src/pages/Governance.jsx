@@ -4,7 +4,7 @@ import { fetchJSON, postJSON } from '../api';
 import { useUi } from '../uiContext';
 
 export default function Governance() {
-  const { t, notify } = useUi();
+  const { t, notify, navigate } = useUi();
   const [policy, setPolicy] = useState(null);
   const [versions, setVersions] = useState([]);
   const [decisions, setDecisions] = useState([]);
@@ -203,6 +203,14 @@ export default function Governance() {
               </>
             )}
             <div className="kv-row"><span>{t('governance.nextAction')}</span><span className="small-text">{remediationLabel(evalResult.next_action)}</span></div>
+            <div className="toolbar">
+              <button
+                className="btn-ghost"
+                onClick={() => navigate('semantic', { subjectId: parseInt(lotteryId, 10) })}
+              >
+                {t('governance.viewSemanticTrace')}
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -232,6 +240,14 @@ export default function Governance() {
                       <td className="small-text muted-text">{d.created_at || '-'}</td>
                       <td>
                         <button className="btn-ghost" onClick={() => replayDecision(d.decision_id)}>{t('governance.replay')}</button>
+                        {d.subject_type === 'lottery' && d.subject_id != null && (
+                          <button
+                            className="btn-ghost"
+                            onClick={() => navigate('semantic', { subjectId: d.subject_id })}
+                          >
+                            {t('governance.viewSemanticTrace')}
+                          </button>
+                        )}
                         {replay && (
                           <div className="small-text muted-text">
                             {replay.matches ? t('governance.replayMatch') : t('governance.replayMismatch')}

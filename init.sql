@@ -191,6 +191,10 @@ CREATE TABLE IF NOT EXISTS `task_runs` (
 
   `task_mode` VARCHAR(32) DEFAULT 'dry_run',
 
+  `decision_id` CHAR(36) NULL COMMENT 'real-run gate decision that authorised this task',
+
+  `policy_version` INT NULL COMMENT 'active policy version at dispatch time',
+
   `error_message` TEXT NULL,
 
   `screenshot_path` VARCHAR(512) NULL,

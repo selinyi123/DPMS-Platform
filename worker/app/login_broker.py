@@ -6,7 +6,7 @@ from app.db import database, redis
 from app.event_store.service import record_event
 from app.platforms import get_platform
 from app.utils.cookies import serialize_cookies
-from app.utils.crypto import cookie_vault
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 from app.utils.log import structured_log
 
 
@@ -150,7 +150,7 @@ async def handle_login_session(pool, session: dict):
 
 
 async def create_account_from_cookies(platform: str, cookies: list[dict]) -> dict:
-    credential = cookie_vault.encrypt(serialize_cookies(platform, cookies))
+    credential = cookie_vault.encrypt(serialize_cookies(platform, cookies), aad=CREDENTIAL_AAD)
     fingerprint_id = await ensure_default_fingerprint(platform)
     account_id = await database.execute(
         """INSERT INTO accounts (platform, fingerprint_id, encrypted_credential, status)

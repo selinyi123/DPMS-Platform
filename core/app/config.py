@@ -17,6 +17,10 @@ class Settings(BaseSettings):
 
     real_run_enabled: bool = False
 
+    # "dev" (default) only warns about weak secrets; "production" refuses to
+    # start when ADMIN_TOKEN / UPDATE_SECRET / ENCRYPTION_KEY are default/unset.
+    deployment_mode: str = "dev"
+
     serverchan_key: str = ""
 
     feishu_webhook: str = ""

@@ -2,15 +2,39 @@ from datetime import datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from app.db import database
+from app.event_store.service import record_event
 from app.models.schemas import ProxyCheckRequest, ProxyCooldownRequest, ProxyCreate, ProxyStatusUpdate
+from app.platforms import PLATFORMS
+from app.security import audit_event, require_confirmation, require_min_role
 
 
 router = APIRouter()
 
 VALID_PROXY_STATUSES = {"active", "degraded", "dead"}
+
+
+def _platform_check_domains() -> set[str]:
+    domains = set()
+    for cfg in PLATFORMS.values():
+        domain = (cfg.get("cookie_domain") or "").lstrip(".").lower()
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+# Proxy health checks may probe these platform domains without extra
+# confirmation (P1-5). Any other target is treated as an operator-directed
+# probe of an arbitrary host/port via the proxy (SSRF / internal-network
+# scanning risk) and requires admin role + explicit confirmation.
+ALLOWED_CHECK_DOMAINS = _platform_check_domains()
+
+
+def _is_allowed_check_host(hostname: str | None) -> bool:
+    host = (hostname or "").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in ALLOWED_CHECK_DOMAINS)
 
 
 @router.get("/")
@@ -55,7 +79,8 @@ async def proxy_summary():
 
 
 @router.post("/")
-async def create_proxy(data: ProxyCreate):
+async def create_proxy(data: ProxyCreate, request: Request):
+    actor = require_min_role(request, "operator")
     validate_proxy_url(data.proxy_url)
     proxy_type = (data.proxy_type or "socks5").lower()
     if proxy_type not in {"socks5", "http", "https"}:
@@ -70,11 +95,34 @@ async def create_proxy(data: ProxyCreate):
             "country": data.country,
         },
     )
+    await audit_event(
+        request,
+        action="proxy.create",
+        resource_type="proxy",
+        resource_id=proxy_id,
+        result="created",
+        risk_level="medium",
+        detail={
+            "proxy_type": proxy_type,
+            "provider": data.provider,
+            "country": data.country,
+            "proxy_url": mask_proxy_url(data.proxy_url),
+        },
+    )
+    await record_event(
+        aggregate="proxy",
+        aggregate_id=proxy_id,
+        event_type="ProxyCreated",
+        payload={"proxy_type": proxy_type, "provider": data.provider, "country": data.country},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
     return {"status": "created", "id": proxy_id}
 
 
 @router.put("/{proxy_id}/cooldown")
-async def cool_proxy(proxy_id: int, data: ProxyCooldownRequest):
+async def cool_proxy(proxy_id: int, data: ProxyCooldownRequest, request: Request):
+    actor = require_min_role(request, "operator")
     minutes = max(1, min(int(data.minutes), 1440))
     row = await database.fetch_one("SELECT id FROM proxies WHERE id = :id", {"id": proxy_id})
     if not row:
@@ -89,12 +137,33 @@ async def cool_proxy(proxy_id: int, data: ProxyCooldownRequest):
            WHERE id = :id""",
         {"id": proxy_id, "cooldown_until": cooldown_until},
     )
+    await audit_event(
+        request,
+        action="proxy.cooldown",
+        resource_type="proxy",
+        resource_id=proxy_id,
+        result="cooling",
+        risk_level="low",
+        detail={"minutes": minutes, "reason": data.reason},
+    )
+    await record_event(
+        aggregate="proxy",
+        aggregate_id=proxy_id,
+        event_type="ProxyCooldownSet",
+        payload={"minutes": minutes, "reason": data.reason},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
     return {"status": "cooling", "id": proxy_id, "minutes": minutes, "reason": data.reason}
 
 
 @router.post("/{proxy_id}/check")
-async def check_proxy(proxy_id: int, data: ProxyCheckRequest = ProxyCheckRequest()):
+async def check_proxy(proxy_id: int, request: Request, data: ProxyCheckRequest = ProxyCheckRequest()):
+    actor = require_min_role(request, "operator")
     target_url = validate_check_url(data.target_url)
+    if not _is_allowed_check_host(urlsplit(target_url).hostname):
+        require_min_role(request, "admin")
+        require_confirmation(request)
     timeout_seconds = max(2.0, min(float(data.timeout_seconds or 8.0), 20.0))
     row = await database.fetch_one("SELECT id, proxy_url, proxy_type FROM proxies WHERE id = :id", {"id": proxy_id})
     if not row:
@@ -127,6 +196,48 @@ async def check_proxy(proxy_id: int, data: ProxyCheckRequest = ProxyCheckRequest
                WHERE id = :id""",
             {"id": proxy_id},
         )
+        proxy_status = "active"
+    else:
+        await database.execute(
+            """UPDATE proxies
+               SET status = CASE WHEN status = 'dead' THEN 'dead' ELSE 'degraded' END,
+                   health_score = GREATEST(health_score - 25, 0),
+                   last_check_at = NOW()
+               WHERE id = :id""",
+            {"id": proxy_id},
+        )
+        proxy_status = "degraded"
+
+    await audit_event(
+        request,
+        action="proxy.check",
+        resource_type="proxy",
+        resource_id=proxy_id,
+        result="ok" if ok else "failed",
+        risk_level="low",
+        detail={
+            "target_url": target_url,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "error": error_message,
+        },
+    )
+    await record_event(
+        aggregate="proxy",
+        aggregate_id=proxy_id,
+        event_type="ProxyCheckCompleted",
+        payload={
+            "ok": ok,
+            "target_url": target_url,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
+            "proxy_status": proxy_status,
+        },
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+
+    if ok:
         return {
             "status": "ok",
             "id": proxy_id,
@@ -136,14 +247,6 @@ async def check_proxy(proxy_id: int, data: ProxyCheckRequest = ProxyCheckRequest
             "latency_ms": latency_ms,
         }
 
-    await database.execute(
-        """UPDATE proxies
-           SET status = CASE WHEN status = 'dead' THEN 'dead' ELSE 'degraded' END,
-               health_score = GREATEST(health_score - 25, 0),
-               last_check_at = NOW()
-           WHERE id = :id""",
-        {"id": proxy_id},
-    )
     return {
         "status": "failed",
         "id": proxy_id,
@@ -156,11 +259,12 @@ async def check_proxy(proxy_id: int, data: ProxyCheckRequest = ProxyCheckRequest
 
 
 @router.put("/{proxy_id}/status")
-async def update_proxy_status(proxy_id: int, data: ProxyStatusUpdate):
+async def update_proxy_status(proxy_id: int, data: ProxyStatusUpdate, request: Request):
+    actor = require_min_role(request, "operator")
     status = (data.status or "").lower()
     if status not in VALID_PROXY_STATUSES:
         raise HTTPException(400, detail="status must be active, degraded, or dead")
-    row = await database.fetch_one("SELECT id FROM proxies WHERE id = :id", {"id": proxy_id})
+    row = await database.fetch_one("SELECT id, status FROM proxies WHERE id = :id", {"id": proxy_id})
     if not row:
         raise HTTPException(404, detail="Proxy not found")
     await database.execute(
@@ -170,6 +274,23 @@ async def update_proxy_status(proxy_id: int, data: ProxyStatusUpdate):
                last_check_at = NOW()
            WHERE id = :id""",
         {"id": proxy_id, "status": status},
+    )
+    await audit_event(
+        request,
+        action="proxy.status_update",
+        resource_type="proxy",
+        resource_id=proxy_id,
+        result="updated",
+        risk_level="medium",
+        detail={"from": row["status"], "to": status},
+    )
+    await record_event(
+        aggregate="proxy",
+        aggregate_id=proxy_id,
+        event_type="ProxyStatusChanged",
+        payload={"from": row["status"], "to": status},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
     )
     return {"status": "updated", "id": proxy_id, "proxy_status": status}
 
