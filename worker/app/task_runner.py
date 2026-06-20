@@ -17,8 +17,13 @@ STREAM_KEY = "lottery_tasks"
 GROUP_NAME = "workers"
 CONSUMER_NAME = f"worker-{uuid.uuid4().hex[:6]}"
 PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
+TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 SCREENSHOT_DIR = Path("/profiles/task-failures")
 SHADOW_SCREENSHOT_DIR = Path("/profiles/shadow-runs")
+
+
+class TaskAlreadyTerminal(Exception):
+    pass
 
 
 async def get_latest_phase(task_id: str) -> str:
@@ -47,22 +52,28 @@ async def save_phase(task_id: str, account_id: int, lottery_id: int, phase: str)
 
 
 async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task_mode: str):
-    # P1-3: the three state tables move together or not at all, so a crash
-    # mid-update can't leave task_runs=running with the lottery still claimed or
-    # the account counter un-incremented.
     async with database.transaction():
+        row = await database.fetch_one(
+            "SELECT status FROM task_runs WHERE task_id = :task_id FOR UPDATE",
+            {"task_id": task_id},
+        )
+        if not row:
+            raise RuntimeError(f"Task row not found: {task_id}")
+        status = str(row["status"] or "")
+        if status in TERMINAL_TASK_STATUSES:
+            raise TaskAlreadyTerminal(f"Task {task_id} is already terminal: {status}")
         await database.execute(
-            "UPDATE task_runs SET status = 'running', task_mode = :task_mode, started_at = NOW() WHERE task_id = :task_id",
+            "UPDATE task_runs SET status = 'running', task_mode = :task_mode, started_at = COALESCE(started_at, NOW()) WHERE task_id = :task_id",
             {"task_id": task_id, "task_mode": task_mode},
         )
         await database.execute(
-            "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id",
-            {"lottery_id": lottery_id},
+            "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id AND execution_lock = :task_id",
+            {"lottery_id": lottery_id, "task_id": task_id},
         )
         await database.execute(
             """UPDATE accounts
                SET status = 'executing', daily_task_count = daily_task_count + 1, last_active_at = NOW()
-               WHERE id = :account_id""",
+               WHERE id = :account_id AND status <> 'executing'""",
             {"account_id": account_id},
         )
     await record_event(
@@ -91,11 +102,13 @@ async def mark_task_finished(
     screenshot_path: str | None = None,
 ):
     lottery_status = "participated" if success and task_mode == "real_run" else "pending"
-    # P1-3: terminal state across task_runs / lotteries / accounts plus the
-    # notify_logs row commit atomically. The lottery lock is released only if the
-    # whole transaction succeeds, preventing "task succeeded but lottery still
-    # running / lock stuck" drift. Redis notify is emitted after commit.
     async with database.transaction():
+        row = await database.fetch_one(
+            "SELECT status FROM task_runs WHERE task_id = :task_id FOR UPDATE",
+            {"task_id": task_id},
+        )
+        if row and str(row["status"] or "") in TERMINAL_TASK_STATUSES:
+            return
         await database.execute(
             """UPDATE task_runs
                SET status = :status, error_message = :error, screenshot_path = :screenshot_path, finished_at = NOW()
@@ -108,8 +121,8 @@ async def mark_task_finished(
             },
         )
         await database.execute(
-            "UPDATE lotteries SET status = :status, execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id",
-            {"lottery_id": lottery_id, "status": lottery_status},
+            "UPDATE lotteries SET status = :status, execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id AND execution_lock = :task_id",
+            {"lottery_id": lottery_id, "status": lottery_status, "task_id": task_id},
         )
         await database.execute(
             "UPDATE accounts SET status = 'ready', updated_at = NOW() WHERE id = :account_id AND status = 'executing'",
@@ -128,14 +141,7 @@ async def mark_task_finished(
         aggregate="task",
         aggregate_id=task_id,
         event_type="TaskFinished" if success else "TaskFailed",
-        payload={
-            "account_id": account_id,
-            "lottery_id": lottery_id,
-            "success": success,
-            "mode": task_mode,
-            "error": error,
-            "screenshot_path": screenshot_path,
-        },
+        payload={"account_id": account_id, "lottery_id": lottery_id, "success": success, "mode": task_mode, "error": error, "screenshot_path": screenshot_path},
         correlation_id=task_id,
     )
     await record_event(
@@ -145,19 +151,22 @@ async def mark_task_finished(
         payload={"task_id": task_id, "lottery_id": lottery_id, "success": success, "mode": task_mode},
         correlation_id=task_id,
     )
-    await redis.xadd(
-        "notify_events",
-        {
-            "title": f"Task {task_id[:8]} {task_mode} {'succeeded' if success else 'failed'}",
-            "content": error or f"Lottery {lottery_id} handled by account {account_id} in {task_mode}",
-            "task_id": task_id,
-            "account_id": str(account_id),
-            "lottery_id": str(lottery_id),
-            "status": "succeeded" if success else "failed",
-            "mode": task_mode,
-            "channels": "all",
-        },
-    )
+    try:
+        await redis.xadd(
+            "notify_events",
+            {
+                "title": f"Task {task_id[:8]} {task_mode} {'succeeded' if success else 'failed'}",
+                "content": error or f"Lottery {lottery_id} handled by account {account_id} in {task_mode}",
+                "task_id": task_id,
+                "account_id": str(account_id),
+                "lottery_id": str(lottery_id),
+                "status": "succeeded" if success else "failed",
+                "mode": task_mode,
+                "channels": "all",
+            },
+        )
+    except Exception as exc:
+        structured_log("warning", "notify_enqueue_failed", task_id=task_id, error=str(exc))
 
 
 async def execute_dry_run(task_id: str, account_id: int, lottery_id: int, phases: list[str]):
@@ -184,36 +193,20 @@ async def execute_shadow_run(task: dict, adapter, pool):
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id, platform)
-
         visible_phases = {}
         selector_probes = getattr(adapter, "SELECTOR_PROBES", {}) or {}
         for phase_name in phases:
             visible_phases[phase_name] = await first_visible_selector(page, selector_probes.get(phase_name, []))
-
         screenshot_path = await capture_shadow_screenshot(page, task_id, account_id, lottery_id, visible_phases)
         await save_phase(task_id, account_id, lottery_id, "completed")
         await record_event(
             aggregate="task",
             aggregate_id=task_id,
             event_type="TaskShadowRunObserved",
-            payload={
-                "account_id": account_id,
-                "lottery_id": lottery_id,
-                "platform": platform,
-                "visible_phases": visible_phases,
-                "screenshot_path": screenshot_path,
-                "side_effects": False,
-            },
+            payload={"account_id": account_id, "lottery_id": lottery_id, "platform": platform, "visible_phases": visible_phases, "screenshot_path": screenshot_path, "side_effects": False},
             correlation_id=task_id,
         )
-        structured_log(
-            "info",
-            "shadow_run_task_completed",
-            task_id=task_id,
-            account_id=account_id,
-            lottery_id=lottery_id,
-            visible_phase_count=sum(1 for value in visible_phases.values() if value),
-        )
+        structured_log("info", "shadow_run_task_completed", task_id=task_id, account_id=account_id, lottery_id=lottery_id, visible_phase_count=sum(1 for value in visible_phases.values() if value))
     except Exception:
         await capture_failure_screenshot(page, task_id)
         raise
@@ -238,18 +231,15 @@ async def execute_real_task(task: dict, adapter, pool):
     lottery_id = int(task.get("lottery_id"))
     lottery_url = task.get("raw_url") or task.get("canonical_url")
     phases = requested_phases(task, require_plan=True)
-
     current_phase = await get_latest_phase(task_id) or "init"
     if current_phase not in PHASE_ORDER and current_phase != "init":
         return
-
     phase_fn = {
         "followed": adapter._follow,
         "liked": adapter._like,
         "commented": adapter._comment,
         "reposted": adapter._repost,
     }
-
     platform = task.get("platform", "bilibili")
     profile_dir = task.get("profile_dir", f"/profiles/{platform}/account_{account_id}")
     proxy = task.get("proxy")
@@ -260,7 +250,6 @@ async def execute_real_task(task: dict, adapter, pool):
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id, platform)
-
         if current_phase == "init":
             remaining_phases = phases
         else:
@@ -271,7 +260,6 @@ async def execute_real_task(task: dict, adapter, pool):
             await phase_fn[phase_name](page)
             await detect_page_risk(page, account_id, platform)
             await save_phase(task_id, account_id, lottery_id, phase_name)
-
         await save_phase(task_id, account_id, lottery_id, "completed")
     except Exception:
         await capture_failure_screenshot(page, task_id)
@@ -286,36 +274,18 @@ async def capture_failure_screenshot(page, task_id: str) -> str | None:
         path = SCREENSHOT_DIR / f"{task_id}.png"
         await page.screenshot(path=str(path), full_page=True)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        await database.execute(
-            "UPDATE task_runs SET screenshot_path = :path WHERE task_id = :task_id",
-            {"path": str(path), "task_id": task_id},
-        )
-        row = await database.fetch_one(
-            "SELECT account_id, lottery_id FROM task_runs WHERE task_id = :task_id",
-            {"task_id": task_id},
-        )
+        await database.execute("UPDATE task_runs SET screenshot_path = :path WHERE task_id = :task_id", {"path": str(path), "task_id": task_id})
+        row = await database.fetch_one("SELECT account_id, lottery_id FROM task_runs WHERE task_id = :task_id", {"task_id": task_id})
         await database.execute(
             """INSERT INTO evidence_files (evidence_type, task_id, account_id, lottery_id, file_path, sha256)
                VALUES ('task_failure_screenshot', :task_id, :account_id, :lottery_id, :file_path, :sha256)""",
-            {
-                "task_id": task_id,
-                "account_id": row["account_id"] if row else None,
-                "lottery_id": row["lottery_id"] if row else None,
-                "file_path": str(path),
-                "sha256": digest,
-            },
+            {"task_id": task_id, "account_id": row["account_id"] if row else None, "lottery_id": row["lottery_id"] if row else None, "file_path": str(path), "sha256": digest},
         )
         await record_event(
             aggregate="task",
             aggregate_id=task_id,
             event_type="EvidenceCaptured",
-            payload={
-                "evidence_type": "task_failure_screenshot",
-                "account_id": row["account_id"] if row else None,
-                "lottery_id": row["lottery_id"] if row else None,
-                "file_path": str(path),
-                "sha256": digest,
-            },
+            payload={"evidence_type": "task_failure_screenshot", "account_id": row["account_id"] if row else None, "lottery_id": row["lottery_id"] if row else None, "file_path": str(path), "sha256": digest},
             correlation_id=task_id,
         )
         return str(path)
@@ -330,33 +300,17 @@ async def capture_shadow_screenshot(page, task_id: str, account_id: int, lottery
         path = SHADOW_SCREENSHOT_DIR / f"{task_id}.png"
         await page.screenshot(path=str(path), full_page=True)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        await database.execute(
-            "UPDATE task_runs SET screenshot_path = :path WHERE task_id = :task_id",
-            {"path": str(path), "task_id": task_id},
-        )
+        await database.execute("UPDATE task_runs SET screenshot_path = :path WHERE task_id = :task_id", {"path": str(path), "task_id": task_id})
         await database.execute(
             """INSERT INTO evidence_files (evidence_type, task_id, account_id, lottery_id, file_path, sha256)
                VALUES ('shadow_run_screenshot', :task_id, :account_id, :lottery_id, :file_path, :sha256)""",
-            {
-                "task_id": task_id,
-                "account_id": account_id,
-                "lottery_id": lottery_id,
-                "file_path": str(path),
-                "sha256": digest,
-            },
+            {"task_id": task_id, "account_id": account_id, "lottery_id": lottery_id, "file_path": str(path), "sha256": digest},
         )
         await record_event(
             aggregate="task",
             aggregate_id=task_id,
             event_type="EvidenceCaptured",
-            payload={
-                "evidence_type": "shadow_run_screenshot",
-                "account_id": account_id,
-                "lottery_id": lottery_id,
-                "file_path": str(path),
-                "sha256": digest,
-                "visible_phases": visible_phases,
-            },
+            payload={"evidence_type": "shadow_run_screenshot", "account_id": account_id, "lottery_id": lottery_id, "file_path": str(path), "sha256": digest, "visible_phases": visible_phases},
             correlation_id=task_id,
         )
         return str(path)
@@ -366,22 +320,14 @@ async def capture_shadow_screenshot(page, task_id: str, account_id: int, lottery
 
 
 async def prepare_account_login(ctx, account_id: int, platform: str):
-    row = await database.fetch_one(
-        "SELECT encrypted_credential FROM accounts WHERE id = :id",
-        {"id": account_id},
-    )
+    row = await database.fetch_one("SELECT encrypted_credential FROM accounts WHERE id = :id", {"id": account_id})
     if not row or not row["encrypted_credential"]:
         raise ValueError(f"Account {account_id} has no imported login Cookie")
-
     credential_blob = row["encrypted_credential"]
     try:
         credential = cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
     except Exception:
-        if isinstance(credential_blob, bytes):
-            credential = credential_blob.decode("utf-8")
-        else:
-            credential = str(credential_blob)
-
+        credential = credential_blob.decode("utf-8") if isinstance(credential_blob, bytes) else str(credential_blob)
     await inject_account_cookies(ctx, platform, credential)
 
 
@@ -390,7 +336,6 @@ async def execute_task_with_phases(task: dict, adapter, pool):
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
     task_mode = normalize_task_mode(task)
-
     try:
         if task_mode == "real_run" and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
@@ -404,20 +349,12 @@ async def execute_task_with_phases(task: dict, adapter, pool):
             await execute_real_task(task, adapter, pool)
         await mark_task_finished(task_id, account_id, lottery_id, task_mode, True)
         return True
+    except TaskAlreadyTerminal as e:
+        structured_log("info", "task_already_terminal_ack", task_id=task_id, reason=str(e))
+        return True
     except Exception as e:
-        screenshot_row = await database.fetch_one(
-            "SELECT screenshot_path FROM task_runs WHERE task_id = :task_id",
-            {"task_id": task_id},
-        )
-        await mark_task_finished(
-            task_id,
-            account_id,
-            lottery_id,
-            task_mode,
-            False,
-            str(e),
-            screenshot_row["screenshot_path"] if screenshot_row else None,
-        )
+        screenshot_row = await database.fetch_one("SELECT screenshot_path FROM task_runs WHERE task_id = :task_id", {"task_id": task_id})
+        await mark_task_finished(task_id, account_id, lottery_id, task_mode, False, str(e), screenshot_row["screenshot_path"] if screenshot_row else None)
         structured_log("error", "task_execution_failed", task_id=task_id, exception=e)
         return False
 
@@ -427,16 +364,11 @@ async def task_loop(pool: BrowserPool, shutdown_event: asyncio.Event):
         await redis.xgroup_create(STREAM_KEY, GROUP_NAME, id="0", mkstream=True)
     except Exception:
         pass
-
     while not shutdown_event.is_set():
         try:
-            msgs = await asyncio.wait_for(
-                redis.xreadgroup(GROUP_NAME, CONSUMER_NAME, {STREAM_KEY: ">"}, count=1, block=5000),
-                timeout=1,
-            )
+            msgs = await asyncio.wait_for(redis.xreadgroup(GROUP_NAME, CONSUMER_NAME, {STREAM_KEY: ">"}, count=1, block=5000), timeout=1)
             if not msgs:
                 continue
-
             for msg_id, data in msgs[0][1]:
                 task = {k: v for k, v in data.items()}
                 structured_log("info", "task_received", task_id=task.get("task_id"))
@@ -461,7 +393,6 @@ def parse_json_field(value):
         value = value.decode("utf-8", errors="replace")
     try:
         import json
-
         return json.loads(value)
     except Exception:
         return None
