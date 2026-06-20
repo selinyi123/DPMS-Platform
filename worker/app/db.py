@@ -4,6 +4,7 @@ import databases
 import redis.asyncio as aioredis
 
 from app.config import settings
+from app.utils.log import structured_log
 
 
 
@@ -40,6 +41,28 @@ class RedisClient:
         if self._conn:
 
             await self._conn.close()
+
+
+
+    async def xadd(self, name, fields, *args, **kwargs):
+
+        if self._conn is None:
+
+            raise RuntimeError("Redis client is not initialized")
+
+        try:
+
+            return await self._conn.xadd(name, fields, *args, **kwargs)
+
+        except Exception as exc:
+
+            if name == "notify_events":
+
+                structured_log("warning", "notify_enqueue_failed", stream=name, error=str(exc))
+
+                return None
+
+            raise
 
 
 
