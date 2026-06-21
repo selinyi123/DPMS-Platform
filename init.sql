@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS `accounts` (
 
   `last_active_at` TIMESTAMP NULL,
 
+  `deleted_at` TIMESTAMP NULL,
+
+  `deleted_by` VARCHAR(128) NULL,
+
+  `delete_reason` VARCHAR(255) NULL,
+
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -79,7 +85,9 @@ CREATE TABLE IF NOT EXISTS `accounts` (
 
   FOREIGN KEY (`proxy_id`) REFERENCES `proxies`(`id`),
 
-  INDEX `idx_status` (`platform`, `status`)
+  INDEX `idx_status` (`platform`, `status`),
+
+  INDEX `idx_accounts_deleted` (`deleted_at`, `status`)
 
 ) ENGINE=InnoDB;
 

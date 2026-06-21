@@ -75,7 +75,7 @@ def _forecast_row(row: dict) -> dict:
 
 
 async def _account_risk_rows(account_id: int | None = None, limit: int = 100) -> list[dict]:
-    account_filter = "WHERE a.id = :account_id" if account_id is not None else ""
+    account_filter = "WHERE a.id = :account_id AND a.deleted_at IS NULL" if account_id is not None else "WHERE a.deleted_at IS NULL"
     values: dict = {"hard_regex": HARD_RISK_REGEX}
     if account_id is not None:
         values["account_id"] = account_id

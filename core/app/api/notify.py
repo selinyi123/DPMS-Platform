@@ -8,6 +8,7 @@ from app.event_store.service import record_event
 from app.models.schemas import NotifyRequest, NotifySecretBundleUpdate, NotifySecretUpdate
 from app.security import audit_event, require_confirmation, require_min_role
 from app.utils.crypto import cookie_vault, notification_secret_aad
+from app.utils.network_safety import assert_public_http_url
 
 
 router = APIRouter()
@@ -25,6 +26,7 @@ SECRET_ATTRS = {
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "TELEGRAM_CHAT_ID": "telegram_chat_id",
 }
+VALID_NOTIFICATION_CHANNELS = set(CHANNEL_SECRET_KEYS)
 
 
 @router.get("/channels")
@@ -116,6 +118,7 @@ async def save_notification_secrets(channel: str, payload: NotifySecretUpdate, r
         if env_name in allowed and attr in data:
             value = (data[attr] or "").strip()
             if value:
+                validate_secret_value(env_name, value)
                 updates[env_name] = value
     if not updates:
         raise HTTPException(400, detail="No secret value was provided for this channel")
@@ -156,6 +159,7 @@ async def save_notification_secret_bundle(payload: NotifySecretBundleUpdate, req
         raise HTTPException(400, detail="No supported notification secret was found")
 
     for env_name, value in parsed.items():
+        validate_secret_value(env_name, value)
         await save_secret(env_name, value)
 
     channel_states = {}
@@ -256,6 +260,7 @@ async def notification_status():
 
 @router.get("/logs")
 async def list_notify_logs(limit: int = 50):
+    limit = min(max(int(limit or 50), 1), 200)
     rows = await database.fetch_all(
         "SELECT * FROM notify_logs ORDER BY id DESC LIMIT :limit",
         {"limit": limit},
@@ -266,6 +271,8 @@ async def list_notify_logs(limit: int = 50):
 @router.post("/send")
 async def send_notification(payload: NotifyRequest, background_tasks: BackgroundTasks, request: Request):
     actor = require_min_role(request, "operator")
+    if payload.channel not in VALID_NOTIFICATION_CHANNELS:
+        raise HTTPException(400, detail="Unsupported notification channel")
     log_id = await database.execute(
         "INSERT INTO notify_logs (channel, title, content, success) VALUES (:ch, :t, :c, 0)",
         {"ch": payload.channel, "t": payload.title, "c": payload.content},
@@ -338,6 +345,7 @@ async def send_webhook(title: str, content: str):
     generic_webhook_url = await secret_value("GENERIC_WEBHOOK_URL")
     if not generic_webhook_url:
         raise ValueError("GENERIC_WEBHOOK_URL is not configured")
+    validate_secret_value("GENERIC_WEBHOOK_URL", generic_webhook_url)
     async with httpx.AsyncClient() as client:
         response = await client.post(generic_webhook_url, json={"title": title, "content": content}, timeout=10)
         response.raise_for_status()
@@ -440,6 +448,16 @@ async def secret_value(key_name: str) -> str:
 
 async def secret_configured(key_name: str) -> bool:
     return bool(await secret_value(key_name))
+
+
+def validate_secret_value(key_name: str, value: str) -> None:
+    if key_name == "GENERIC_WEBHOOK_URL":
+        try:
+            assert_public_http_url(value, require_https=True, resolve_dns=True)
+        except ValueError as exc:
+            raise HTTPException(400, detail=f"Invalid GENERIC_WEBHOOK_URL: {exc}") from exc
+    if len(value.encode("utf-8")) > 4096:
+        raise HTTPException(400, detail=f"{key_name} is too large")
 
 
 async def channel_configured(channel: str) -> bool:
