@@ -202,7 +202,7 @@ async def _deliver_notify(stream_key: str | None, payload: dict[str, Any]) -> No
     if not stream_key:
         raise RuntimeError("notify stream key is required")
     message = {k: "" if v is None else str(v) for k, v in payload.items()}
-    msg_id = await redis.xadd(stream_key, message)
+    msg_id = await redis.xadd(stream_key, message, _from_task_outbox=True)
     if not msg_id:
         raise RuntimeError("notify xadd returned no id")
 
