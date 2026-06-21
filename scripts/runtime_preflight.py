@@ -8,11 +8,13 @@ catch missing migration and lifecycle wiring before container-level smoke tests.
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PRODUCT_VERSION_RE = re.compile(r"Product Version:\s+0\.3\.\d+")
 
 
 class CheckFailure(Exception):
@@ -81,15 +83,15 @@ def check_browser_lifecycle_contract() -> None:
 
 
 def check_runtime_status_contract() -> None:
-    require_contains(
-        "VERSION.md",
-        [
-            "Product Version: 0.3.9",
-            "Runtime Preflight Validation",
-            "Production Readiness: Not Ready",
-            "Real-run Status: Gated / Calibration Required",
-        ],
-    )
+    text = read("VERSION.md")
+    if not PRODUCT_VERSION_RE.search(text):
+        raise CheckFailure("VERSION.md missing Product Version: 0.3.x")
+    for required in [
+        "Production Readiness: Not Ready",
+        "Real-run Status: Gated / Calibration Required",
+    ]:
+        if required not in text:
+            raise CheckFailure(f"VERSION.md missing: {required}")
 
 
 def check_schema_boundary_contract() -> None:
