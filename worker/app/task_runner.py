@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import json
+import os
 import uuid
 from pathlib import Path
 
@@ -15,14 +17,20 @@ from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 
 STREAM_KEY = "lottery_tasks"
 GROUP_NAME = "workers"
-CONSUMER_NAME = f"worker-{uuid.uuid4().hex[:6]}"
+WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
+CONSUMER_NAME = WORKER_ID
 PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
 TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
+TASK_LEASE_SECONDS = 900
 SCREENSHOT_DIR = Path("/profiles/task-failures")
 SHADOW_SCREENSHOT_DIR = Path("/profiles/shadow-runs")
 
 
 class TaskAlreadyTerminal(Exception):
+    pass
+
+
+class InvalidTaskMessage(Exception):
     pass
 
 
@@ -34,7 +42,17 @@ async def get_latest_phase(task_id: str) -> str:
     return row["phase"] if row else "init"
 
 
+async def refresh_task_lease(task_id: str):
+    await database.execute(
+        """UPDATE task_runs
+           SET lease_expires_at = DATE_ADD(NOW(), INTERVAL :seconds SECOND)
+           WHERE task_id = :task_id AND status = 'running' AND worker_id = :worker_id""",
+        {"task_id": task_id, "worker_id": WORKER_ID, "seconds": TASK_LEASE_SECONDS},
+    )
+
+
 async def save_phase(task_id: str, account_id: int, lottery_id: int, phase: str):
+    await refresh_task_lease(task_id)
     await database.execute(
         """INSERT INTO task_phases (task_id, account_id, lottery_id, phase)
            VALUES (:tid, :aid, :lid, :phase)
@@ -51,7 +69,7 @@ async def save_phase(task_id: str, account_id: int, lottery_id: int, phase: str)
     structured_log("info", "phase_saved", task_id=task_id, phase=phase)
 
 
-async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task_mode: str):
+async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task_mode: str, stream_message_id: str | None = None):
     async with database.transaction():
         row = await database.fetch_one(
             "SELECT status FROM task_runs WHERE task_id = :task_id FOR UPDATE",
@@ -63,8 +81,20 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
         if status in TERMINAL_TASK_STATUSES:
             raise TaskAlreadyTerminal(f"Task {task_id} is already terminal: {status}")
         await database.execute(
-            "UPDATE task_runs SET status = 'running', task_mode = :task_mode, started_at = COALESCE(started_at, NOW()) WHERE task_id = :task_id",
-            {"task_id": task_id, "task_mode": task_mode},
+            """UPDATE task_runs
+               SET status = 'running', task_mode = :task_mode,
+                   started_at = COALESCE(started_at, NOW()),
+                   worker_id = :worker_id,
+                   stream_message_id = :stream_message_id,
+                   lease_expires_at = DATE_ADD(NOW(), INTERVAL :lease_seconds SECOND)
+               WHERE task_id = :task_id""",
+            {
+                "task_id": task_id,
+                "task_mode": task_mode,
+                "worker_id": WORKER_ID,
+                "stream_message_id": stream_message_id,
+                "lease_seconds": TASK_LEASE_SECONDS,
+            },
         )
         await database.execute(
             "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id AND execution_lock = :task_id",
@@ -80,7 +110,7 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
         aggregate="task",
         aggregate_id=task_id,
         event_type="TaskStarted",
-        payload={"account_id": account_id, "lottery_id": lottery_id, "mode": task_mode},
+        payload={"account_id": account_id, "lottery_id": lottery_id, "mode": task_mode, "worker_id": WORKER_ID},
         correlation_id=task_id,
     )
     await record_event(
@@ -111,7 +141,8 @@ async def mark_task_finished(
             return
         await database.execute(
             """UPDATE task_runs
-               SET status = :status, error_message = :error, screenshot_path = :screenshot_path, finished_at = NOW()
+               SET status = :status, error_message = :error, screenshot_path = :screenshot_path,
+                   finished_at = NOW(), worker_id = NULL, stream_message_id = NULL, lease_expires_at = NULL
                WHERE task_id = :task_id""",
             {
                 "task_id": task_id,
@@ -141,7 +172,15 @@ async def mark_task_finished(
         aggregate="task",
         aggregate_id=task_id,
         event_type="TaskFinished" if success else "TaskFailed",
-        payload={"account_id": account_id, "lottery_id": lottery_id, "success": success, "mode": task_mode, "error": error, "screenshot_path": screenshot_path},
+        payload={
+            "account_id": account_id,
+            "lottery_id": lottery_id,
+            "success": success,
+            "mode": task_mode,
+            "error": error,
+            "screenshot_path": screenshot_path,
+            "worker_id": WORKER_ID,
+        },
         correlation_id=task_id,
     )
     await record_event(
@@ -191,22 +230,38 @@ async def execute_shadow_run(task: dict, adapter, pool):
     page = await ctx.new_page()
     try:
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
+        await refresh_task_lease(task_id)
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id, platform)
         visible_phases = {}
         selector_probes = getattr(adapter, "SELECTOR_PROBES", {}) or {}
         for phase_name in phases:
             visible_phases[phase_name] = await first_visible_selector(page, selector_probes.get(phase_name, []))
+            await refresh_task_lease(task_id)
         screenshot_path = await capture_shadow_screenshot(page, task_id, account_id, lottery_id, visible_phases)
         await save_phase(task_id, account_id, lottery_id, "completed")
         await record_event(
             aggregate="task",
             aggregate_id=task_id,
             event_type="TaskShadowRunObserved",
-            payload={"account_id": account_id, "lottery_id": lottery_id, "platform": platform, "visible_phases": visible_phases, "screenshot_path": screenshot_path, "side_effects": False},
+            payload={
+                "account_id": account_id,
+                "lottery_id": lottery_id,
+                "platform": platform,
+                "visible_phases": visible_phases,
+                "screenshot_path": screenshot_path,
+                "side_effects": False,
+            },
             correlation_id=task_id,
         )
-        structured_log("info", "shadow_run_task_completed", task_id=task_id, account_id=account_id, lottery_id=lottery_id, visible_phase_count=sum(1 for value in visible_phases.values() if value))
+        structured_log(
+            "info",
+            "shadow_run_task_completed",
+            task_id=task_id,
+            account_id=account_id,
+            lottery_id=lottery_id,
+            visible_phase_count=sum(1 for value in visible_phases.values() if value),
+        )
     except Exception:
         await capture_failure_screenshot(page, task_id)
         raise
@@ -248,6 +303,7 @@ async def execute_real_task(task: dict, adapter, pool):
     page = await ctx.new_page()
     try:
         await page.goto(lottery_url, wait_until="domcontentloaded", timeout=30000)
+        await refresh_task_lease(task_id)
         await page.wait_for_timeout(2000)
         await detect_page_risk(page, account_id, platform)
         if current_phase == "init":
@@ -256,6 +312,7 @@ async def execute_real_task(task: dict, adapter, pool):
             completed_index = PHASE_ORDER.index(current_phase)
             remaining_phases = [phase for phase in phases if PHASE_ORDER.index(phase) > completed_index]
         for phase_name in remaining_phases:
+            await refresh_task_lease(task_id)
             await detect_page_risk(page, account_id, platform)
             await phase_fn[phase_name](page)
             await detect_page_risk(page, account_id, platform)
@@ -331,7 +388,51 @@ async def prepare_account_login(ctx, account_id: int, platform: str):
     await inject_account_cookies(ctx, platform, credential)
 
 
-async def execute_task_with_phases(task: dict, adapter, pool):
+def _require_int(task: dict, field: str) -> int:
+    value = task.get(field)
+    try:
+        return int(value)
+    except Exception as exc:
+        raise InvalidTaskMessage(f"{field} must be an integer") from exc
+
+
+def validate_task_message(task: dict) -> dict:
+    task_id = str(task.get("task_id") or "").strip()
+    if not task_id:
+        raise InvalidTaskMessage("task_id is required")
+    account_id = _require_int(task, "account_id")
+    lottery_id = _require_int(task, "lottery_id")
+    platform = str(task.get("platform") or "bilibili").strip() or "bilibili"
+    mode = normalize_task_mode(task)
+    task["task_id"] = task_id
+    task["account_id"] = str(account_id)
+    task["lottery_id"] = str(lottery_id)
+    task["platform"] = platform
+    task["mode"] = mode
+    return task
+
+
+async def dead_letter_message(msg_id: str, task: dict, reason: str):
+    task_id = str(task.get("task_id") or "") or None
+    payload = json.dumps(task, ensure_ascii=False)
+    try:
+        await database.execute(
+            """INSERT INTO failed_task_messages (stream_key, message_id, task_id, reason, payload)
+               VALUES (:stream_key, :message_id, :task_id, :reason, :payload)""",
+            {"stream_key": STREAM_KEY, "message_id": str(msg_id), "task_id": task_id, "reason": reason[:255], "payload": payload},
+        )
+    except Exception as exc:
+        structured_log("error", "dead_letter_db_failed", message_id=msg_id, task_id=task_id, error=str(exc))
+    try:
+        await redis.xadd(
+            "failed_task_messages",
+            {"stream_key": STREAM_KEY, "message_id": str(msg_id), "task_id": task_id or "", "reason": reason[:255], "payload": payload},
+        )
+    except Exception as exc:
+        structured_log("error", "dead_letter_stream_failed", message_id=msg_id, task_id=task_id, error=str(exc))
+
+
+async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id: str | None = None):
     task_id = task.get("task_id")
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
@@ -340,7 +441,7 @@ async def execute_task_with_phases(task: dict, adapter, pool):
         if task_mode == "real_run" and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
         await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
-        await mark_task_started(task_id, account_id, lottery_id, task_mode)
+        await mark_task_started(task_id, account_id, lottery_id, task_mode, stream_message_id)
         if task_mode == "dry_run":
             await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))
         elif task_mode == "shadow_run":
@@ -371,9 +472,16 @@ async def task_loop(pool: BrowserPool, shutdown_event: asyncio.Event):
                 continue
             for msg_id, data in msgs[0][1]:
                 task = {k: v for k, v in data.items()}
-                structured_log("info", "task_received", task_id=task.get("task_id"))
+                structured_log("info", "task_received", task_id=task.get("task_id"), message_id=msg_id)
+                try:
+                    task = validate_task_message(task)
+                except InvalidTaskMessage as exc:
+                    await dead_letter_message(msg_id, task, str(exc))
+                    await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
+                    structured_log("error", "task_message_dead_lettered", message_id=msg_id, reason=str(exc))
+                    continue
                 selector_config = parse_json_field(task.get("selector_config")) or {}
-                success = await execute_task_with_phases(task, get_adapter(task.get("platform", "bilibili"), selector_config), pool)
+                success = await execute_task_with_phases(task, get_adapter(task.get("platform", "bilibili"), selector_config), pool, str(msg_id))
                 await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
                 if not success:
                     structured_log("error", "task_failed", task_id=task.get("task_id"))
@@ -392,7 +500,6 @@ def parse_json_field(value):
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="replace")
     try:
-        import json
         return json.loads(value)
     except Exception:
         return None
