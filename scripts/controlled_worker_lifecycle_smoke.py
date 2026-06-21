@@ -2,7 +2,8 @@
 """Controlled DPMS worker lifecycle smoke harness.
 
 Default mode is dry-run. It prints the exact Docker Compose commands and safety
-contract without starting containers. Pass --execute to run the smoke.
+contract without requiring Docker or starting containers. Pass --execute to run
+the smoke.
 
 The execute mode uses an isolated Compose project name and removes project
 volumes on shutdown. It does not create accounts, login accounts, enqueue tasks,
@@ -46,6 +47,10 @@ def docker_compose_cmd() -> list[str]:
     raise SmokeFailure("Docker Compose is not installed")
 
 
+def display_compose_cmd() -> list[str]:
+    return ["docker", "compose"]
+
+
 def run(cmd: list[str], *, timeout: int = 120, check: bool = True, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run(
         cmd,
@@ -66,6 +71,10 @@ def run(cmd: list[str], *, timeout: int = 120, check: bool = True, env: dict[str
 
 def compose_base(project_name: str) -> list[str]:
     return docker_compose_cmd() + ["-p", project_name, "-f", str(COMPOSE_FILE)]
+
+
+def display_compose_base(project_name: str) -> list[str]:
+    return display_compose_cmd() + ["-p", project_name, "-f", str(COMPOSE_FILE)]
 
 
 def assert_repo_contract() -> None:
@@ -151,7 +160,7 @@ def docker_down(project_name: str, env: dict[str, str]) -> None:
 
 
 def dry_run(project_name: str, timeout_seconds: int) -> int:
-    base = compose_base(project_name)
+    base = display_compose_base(project_name)
     print("Controlled worker lifecycle smoke dry-run")
     print(f"project: {project_name}")
     print(f"services: {' '.join(SERVICES)}")
