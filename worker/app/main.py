@@ -105,6 +105,12 @@ async def main():
     loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
     loop.add_signal_handler(signal.SIGINT, handle_sigterm)
 
+    context_reaper_task = asyncio.create_task(
+        pool.context_reaper_loop(
+            shutdown_event,
+            interval_seconds=int(os.getenv("WORKER_CONTEXT_REAPER_INTERVAL_SECONDS", "60")),
+        )
+    )
     heartbeat_task = asyncio.create_task(heartbeat_loop(shutdown_event))
     reload_signal_task = asyncio.create_task(reload_signal_loop(shutdown_event))
     task_outbox_task = asyncio.create_task(start_task_outbox_dispatcher(shutdown_event))
@@ -115,9 +121,10 @@ async def main():
     await shutdown_event.wait()
     structured_log("info", "shutdown_started")
 
-    for task in (worker_task, probe_task, calibration_task, login_task, task_outbox_task, reload_signal_task, heartbeat_task):
+    tasks = (worker_task, probe_task, calibration_task, login_task, task_outbox_task, context_reaper_task, reload_signal_task, heartbeat_task)
+    for task in tasks:
         task.cancel()
-    for task in (worker_task, probe_task, calibration_task, login_task, task_outbox_task, reload_signal_task, heartbeat_task):
+    for task in tasks:
         try:
             await task
         except asyncio.CancelledError:
@@ -126,7 +133,7 @@ async def main():
     for bid in list(pool._browsers.keys()):
         await pool.close_browser(bid)
     for account_id in list(pool._persistent_contexts.keys()):
-        await pool.close_account_context(account_id)
+        await pool.close_account_context(account_id, reason="worker_shutdown")
     await pool._playwright.stop()
 
     await record_event(
