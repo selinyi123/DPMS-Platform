@@ -45,9 +45,9 @@ async def get_latest_phase(task_id: str) -> str:
 async def refresh_task_lease(task_id: str):
     await database.execute(
         """UPDATE task_runs
-           SET lease_expires_at = DATE_ADD(NOW(), INTERVAL :seconds SECOND)
+           SET lease_expires_at = DATE_ADD(NOW(), INTERVAL 900 SECOND)
            WHERE task_id = :task_id AND status = 'running' AND worker_id = :worker_id""",
-        {"task_id": task_id, "worker_id": WORKER_ID, "seconds": TASK_LEASE_SECONDS},
+        {"task_id": task_id, "worker_id": WORKER_ID},
     )
 
 
@@ -86,14 +86,13 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
                    started_at = COALESCE(started_at, NOW()),
                    worker_id = :worker_id,
                    stream_message_id = :stream_message_id,
-                   lease_expires_at = DATE_ADD(NOW(), INTERVAL :lease_seconds SECOND)
+                   lease_expires_at = DATE_ADD(NOW(), INTERVAL 900 SECOND)
                WHERE task_id = :task_id""",
             {
                 "task_id": task_id,
                 "task_mode": task_mode,
                 "worker_id": WORKER_ID,
                 "stream_message_id": stream_message_id,
-                "lease_seconds": TASK_LEASE_SECONDS,
             },
         )
         await database.execute(
