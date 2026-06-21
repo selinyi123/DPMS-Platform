@@ -260,7 +260,17 @@ class BrowserPool:
 
             total = 0
 
-            for pid in self._browser_pids.values():
+            seen_pids = set()
+
+            all_pids = list(self._browser_pids.values()) + list(self._persistent_pids.values())
+
+            for pid in all_pids:
+
+                if not pid or pid in seen_pids:
+
+                    continue
+
+                seen_pids.add(pid)
 
                 try:
 
@@ -270,9 +280,7 @@ class BrowserPool:
 
                     for child in parent.children(recursive=True):
 
-                        if 'chromium' in child.name().lower():
-
-                            total += child.memory_info().rss
+                        total += child.memory_info().rss
 
                 except psutil.NoSuchProcess:
 
