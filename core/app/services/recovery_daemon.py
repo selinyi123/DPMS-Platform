@@ -71,9 +71,9 @@ async def start_recovery_daemon():
                 current_count = int(await redis.get(recovery_key) or 0)
                 if current_count >= MAX_RECOVERY_COUNT:
                     structured_log("error", "task_permanent_failure", task_id=task_id, recovery_count=current_count)
+                    await _mark_recovery_exhausted(task_id)
                     await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                     await redis.delete(recovery_key)
-                    await _mark_recovery_exhausted(task_id)
                     continue
 
                 payload = await _rebuild_task_payload(task_id)
@@ -147,13 +147,28 @@ async def _worker_heartbeat_fresh(worker_id: str) -> bool:
 
 async def _mark_recovery_exhausted(task_id: str) -> None:
     try:
-        await database.execute(
-            """UPDATE task_runs
-               SET status = 'failed', error_message = 'recovery exhausted', finished_at = NOW(),
-                   worker_id = NULL, stream_message_id = NULL, lease_expires_at = NULL
-               WHERE task_id = :task_id AND status NOT IN ('succeeded', 'failed')""",
+        row = await database.fetch_one(
+            "SELECT account_id, lottery_id FROM task_runs WHERE task_id = :task_id",
             {"task_id": task_id},
         )
+        if not row:
+            return
+        async with database.transaction():
+            await database.execute(
+                """UPDATE task_runs
+                   SET status = 'failed', error_message = 'recovery exhausted', finished_at = NOW(),
+                       worker_id = NULL, stream_message_id = NULL, lease_expires_at = NULL
+                   WHERE task_id = :task_id AND status NOT IN ('succeeded', 'failed')""",
+                {"task_id": task_id},
+            )
+            await database.execute(
+                "UPDATE lotteries SET status = 'pending', execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id AND execution_lock = :task_id",
+                {"lottery_id": row["lottery_id"], "task_id": task_id},
+            )
+            await database.execute(
+                "UPDATE accounts SET status = 'ready', updated_at = NOW() WHERE id = :account_id AND status = 'executing'",
+                {"account_id": row["account_id"]},
+            )
     except Exception as exc:
         structured_log("error", "recovery_exhausted_mark_failed_failed", task_id=task_id, error=str(exc))
 
