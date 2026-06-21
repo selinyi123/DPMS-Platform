@@ -14,6 +14,7 @@ from app.config import settings
 from app.db import database, redis as redis_client
 from app.event_store.service import ensure_event_schema, record_event
 from app.login_broker import login_loop
+from app.services.task_outbox import start_task_outbox_dispatcher
 from app.task_runner import task_loop
 from app.utils.log import structured_log
 
@@ -106,6 +107,7 @@ async def main():
 
     heartbeat_task = asyncio.create_task(heartbeat_loop(shutdown_event))
     reload_signal_task = asyncio.create_task(reload_signal_loop(shutdown_event))
+    task_outbox_task = asyncio.create_task(start_task_outbox_dispatcher(shutdown_event))
     login_task = asyncio.create_task(login_loop(pool, shutdown_event))
     calibration_task = asyncio.create_task(calibration_loop(pool, shutdown_event))
     probe_task = asyncio.create_task(probe_loop(pool, shutdown_event))
@@ -113,13 +115,9 @@ async def main():
     await shutdown_event.wait()
     structured_log("info", "shutdown_started")
 
-    worker_task.cancel()
-    probe_task.cancel()
-    calibration_task.cancel()
-    login_task.cancel()
-    reload_signal_task.cancel()
-    heartbeat_task.cancel()
-    for task in (worker_task, probe_task, calibration_task, login_task, reload_signal_task, heartbeat_task):
+    for task in (worker_task, probe_task, calibration_task, login_task, task_outbox_task, reload_signal_task, heartbeat_task):
+        task.cancel()
+    for task in (worker_task, probe_task, calibration_task, login_task, task_outbox_task, reload_signal_task, heartbeat_task):
         try:
             await task
         except asyncio.CancelledError:
