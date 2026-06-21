@@ -3,9 +3,9 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.8
-Architecture Stage: S10 / Browser Context Lifecycle
-Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool
+Product Version: 0.3.9
+Architecture Stage: S11 / Runtime Preflight Validation
+Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate
 Real-run Status: Gated / Calibration Required
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -24,6 +24,7 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 7. Record evidence, events, notifications, audit logs, policy decisions, transition history, recovery state, dead-letter state, and terminal outbox events.
 8. Enforce production schema changes through versioned migrations rather than startup self-heal DDL.
 9. Manage persistent browser contexts with TTL, idle eviction, capacity control, and per-account memory attribution.
+10. Run static runtime preflight before container/browser smoke tests.
 
 Real-run is intentionally not treated as production-ready until the Bilibili selector calibration and evidence gates pass in controlled small-scale validation.
 
@@ -46,10 +47,16 @@ WORKER_MAX_PERSISTENT_CONTEXTS=20
 WORKER_CONTEXT_REAPER_INTERVAL_SECONDS=60
 ```
 
+## Preflight Command
+
+```bash
+python scripts/runtime_preflight.py
+```
+
 ## Next Key Node
 
 ```text
-Product Version: 0.3.9
-Target: Runtime Preflight Validation Node
-Scope: migration smoke, browser lifecycle smoke, worker startup/shutdown smoke, and controlled shadow-run readiness checks
+Product Version: 0.3.10
+Target: Container Runtime Smoke Node
+Scope: docker compose config validation, service healthcheck readiness, worker startup/shutdown smoke, and browser lifecycle smoke in controlled environment
 ```
