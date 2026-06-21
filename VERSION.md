@@ -3,9 +3,9 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.4
-Architecture Stage: S8 / Runtime Reliability Hardening
-Runtime Stage: Shadow-run Closed Loop + Reliability Baseline
+Product Version: 0.3.7
+Architecture Stage: S9 / Runtime Schema Boundary
+Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline
 Real-run Status: Gated / Calibration Required
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -21,7 +21,8 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 4. Parse and review action plans.
 5. Run dry-run and shadow-run with evidence capture.
 6. Gate real-run behind selector calibration, policy decisions, circuit breakers, confirmation, and runtime settings.
-7. Record evidence, events, notifications, audit logs, policy decisions, and transition history.
+7. Record evidence, events, notifications, audit logs, policy decisions, transition history, recovery state, dead-letter state, and terminal outbox events.
+8. Enforce production schema changes through versioned migrations rather than startup self-heal DDL.
 
 Real-run is intentionally not treated as production-ready until the Bilibili selector calibration and evidence gates pass in controlled small-scale validation.
 
@@ -38,7 +39,7 @@ Real-run is intentionally not treated as production-ready until the Bilibili sel
 ## Next Key Node
 
 ```text
-Product Version: 0.3.5
-Target: Bilibili controlled validation node
-Scope: one-platform evidence-driven dry/shadow/real gate validation, no new platform expansion
+Product Version: 0.3.8
+Target: Browser Context Lifecycle Node
+Scope: persistent context TTL, idle eviction, per-account browser memory attribution, migration smoke validation before controlled runtime tests
 ```
