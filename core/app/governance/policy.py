@@ -97,6 +97,31 @@ def evaluate_policy(*, policy: dict, inputs: dict) -> dict:
     }
 
 
+def gate_codes_from_reasons(reasons) -> list[str]:
+    """The gate codes blocking a decision, from its ``reasons`` list.
+
+    ``reasons`` is the structured ``{"code", "remediation"}`` shape that
+    ``evaluate_policy`` produces; bare string codes are also accepted so
+    callers reading older/external decision records don't have to special
+    case them. Anything else is skipped rather than raising, since this feeds
+    operator-facing summaries (real-run gate response, semantic trace
+    narrative) where a malformed entry should degrade, not 500.
+
+    The single source for "which gates failed" from a persisted decision:
+    ``build_decision_record`` only carries ``reasons`` (not ``evaluate_policy``'s
+    flat ``failed`` list), and the ``policy_decisions`` table persists the same
+    ``reasons`` column, so every consumer reading a decision back out derives
+    the codes here.
+    """
+    codes = []
+    for reason in reasons or []:
+        if isinstance(reason, dict) and reason.get("code"):
+            codes.append(reason["code"])
+        elif isinstance(reason, str):
+            codes.append(reason)
+    return codes
+
+
 def build_decision_record(*, policy: dict, inputs: dict, subject_type: str, subject_id: str | None) -> dict:
     """Build a replayable decision record (the API adds an id and timestamp)."""
     decision = evaluate_policy(policy=policy, inputs=inputs)

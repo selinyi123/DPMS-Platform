@@ -7,8 +7,6 @@ PLATFORMS = {
         "cookie_domain": ".bilibili.com",
         "qr_login": True,
         "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "gray",
     },
     "weibo": {
         "label": "Weibo",
@@ -18,8 +16,6 @@ PLATFORMS = {
         "cookie_domain": ".weibo.com",
         "qr_login": True,
         "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
     },
     "douyin": {
         "label": "Douyin",
@@ -29,8 +25,6 @@ PLATFORMS = {
         "cookie_domain": ".douyin.com",
         "qr_login": True,
         "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
     },
     "xiaohongshu": {
         "label": "Xiaohongshu",
@@ -40,8 +34,6 @@ PLATFORMS = {
         "cookie_domain": ".xiaohongshu.com",
         "qr_login": True,
         "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
     },
 }
 

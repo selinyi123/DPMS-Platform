@@ -1,19 +1,21 @@
 """Guards the Bilibili lottery task's first end-to-end path (dry-run).
 
 Drives a real Bilibili task through the genuine worker executor
-(`execute_task_with_phases` in dry-run mode) with an in-memory DB and a fake
-Redis, asserting the adapter is selected, real actions are enabled by the
-shipped example selectors, every phase runs in order, and the task completes.
+(`execute_task_with_phases` in dry-run mode), asserting the adapter is
+selected, real actions are enabled by the shipped example selectors, every
+phase runs in order, and the task completes.
 
-This is the regression net behind tools/smoke_bilibili_dry_run.py.
+Shares its fake DB and dispatch-message builder with
+tools/smoke_bilibili_dry_run.py via tools/bilibili_dry_run_harness.py, so the
+two can't quietly drift apart. Redis is faked here (unlike the manual
+script, which talks to a real local Redis) so this suite never depends on a
+running Redis.
 """
 
 import asyncio
 import base64
-import json
 import os
 import sys
-import types
 import unittest
 import uuid
 from pathlib import Path
@@ -24,46 +26,17 @@ os.environ.setdefault("ENCRYPTION_KEY", base64.b64encode(b"0" * 32).decode())
 os.environ.setdefault("DATABASE_URL", "mysql+aiomysql://u:p@localhost:3306/lottery")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
-# browser_pool imports playwright at module load; dry-run never opens a browser.
-_pw = types.ModuleType("playwright")
-_aio = types.ModuleType("playwright.async_api")
-_aio.Page = object
-_aio.async_playwright = lambda *a, **k: None
-_pw.async_api = _aio
-sys.modules.setdefault("playwright", _pw)
-sys.modules.setdefault("playwright.async_api", _aio)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-CORE = Path(__file__).resolve().parents[2] / "core"
-PHASES = ["followed", "liked", "commented", "reposted", "completed"]
+from bilibili_dry_run_harness import (  # noqa: E402
+    COMPLETED_PHASES,
+    FakeDatabase,
+    build_task_message,
+    load_bilibili_example_selectors,
+    stub_playwright,
+)
 
-
-class FakeDatabase:
-    def __init__(self):
-        self.phases = []
-
-    async def fetch_one(self, query, values=None):
-        if "FROM accounts" in query:
-            return {"status": "ready", "daily_task_count": 0, "encrypted_credential": "[]"}
-        if "FROM task_runs" in query:
-            return {"screenshot_path": None}
-        return None
-
-    async def fetch_all(self, query, values=None):
-        return []
-
-    async def execute(self, query, values=None):
-        if "INSERT INTO task_phases" in query and values:
-            self.phases.append(values.get("phase"))
-
-    def transaction(self):
-        class _Tx:
-            async def __aenter__(self_):
-                return self
-
-            async def __aexit__(self_, *exc):
-                return False
-
-        return _Tx()
+stub_playwright()
 
 
 class FakePipeline:
@@ -104,21 +77,22 @@ class BilibiliDryRunSmokeTests(unittest.TestCase):
 
         from app.adapters.registry import get_adapter
 
-        selectors = json.loads((CORE / "adapter_selectors.example.json").read_text())["bilibili"]
-        message = {
-            "task_id": str(uuid.uuid4()),
-            "account_id": "9001",
-            "lottery_id": "7001",
-            "platform": "bilibili",
-            "raw_url": "https://t.bilibili.com/123456789",
-            "canonical_url": "https://t.bilibili.com/123456789",
-            "dry_run": "1",
-            "mode": "dry_run",
-            "selector_config": json.dumps(selectors, ensure_ascii=False),
-            "action_plan": json.dumps({"required_actions": PHASES[:-1]}),
-        }
+        selectors = load_bilibili_example_selectors()
+        message = build_task_message(
+            task_id=str(uuid.uuid4()),
+            account_id=9001,
+            lottery_id=7001,
+            platform="bilibili",
+            raw_url="https://t.bilibili.com/123456789",
+            canonical_url="https://t.bilibili.com/123456789",
+            task_mode="dry_run",
+            dry_run=True,
+            platform_selectors=selectors,
+            action_plan={"required_actions": COMPLETED_PHASES[:-1]},
+        )
 
-        adapter = get_adapter("bilibili", json.loads(message["selector_config"]))
+        selector_config = task_runner.parse_json_field(message["selector_config"])
+        adapter = get_adapter("bilibili", selector_config)
         self.assertEqual(type(adapter).__name__, "BilibiliAdapter")
         self.assertTrue(adapter.REAL_ACTIONS)
         self.assertEqual(adapter.STATUS, "configured")
@@ -126,7 +100,7 @@ class BilibiliDryRunSmokeTests(unittest.TestCase):
         ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool=None))
 
         self.assertTrue(ok)
-        self.assertEqual(fake_db.phases, PHASES)
+        self.assertEqual(fake_db.phases, COMPLETED_PHASES)
 
 
 if __name__ == "__main__":

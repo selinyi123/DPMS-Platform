@@ -11,6 +11,7 @@ from app.adapter_config import (
     STRUCTURED_SELECTOR_PLATFORMS,
     click_selectors,
     load_runtime_selector_config,
+    recommended_config_from_probe,
     selector_config_complete,
     selector_values,
 )
@@ -935,6 +936,63 @@ async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, requ
         actor_id=actor["actor_id"],
     )
     return {"status": "queued", "probe_id": probe_id, "account_id": account["id"]}
+
+
+@router.post("/probes/{probe_id}/apply-config")
+async def apply_probe_recommended_config(probe_id: str, request: Request):
+    """Apply a succeeded probe's recommended selector config to the runtime.
+
+    Closes the last manual step: instead of copy-pasting ``_recommended_config``
+    from a probe result into ``PUT /adapters/config``, an admin confirms here and
+    the platform's recommendation is saved through the same path with the same
+    completeness bar. This only *configures* the adapter — every other real-run
+    gate (global switch, calibrated account, recent shadow-run, reviewed plan,
+    no recent risk) still applies, so it can never by itself enable a real run.
+    """
+    actor = require_min_role(request, "admin")
+    require_confirmation(request)
+    probe = await database.fetch_one(
+        "SELECT probe_id, platform, status, result FROM adapter_calibrations WHERE probe_id = :probe_id",
+        {"probe_id": probe_id},
+    )
+    if not probe:
+        raise HTTPException(404, detail="Probe not found")
+    if probe["status"] != "succeeded":
+        raise HTTPException(409, detail=f"Probe is not succeeded (status: {probe['status']})")
+
+    platform = probe["platform"]
+    recommended = recommended_config_from_probe(probe["result"], platform)
+    if not recommended:
+        raise HTTPException(409, detail="Probe has no recommended selector config to apply")
+    if not selector_config_complete(platform, recommended):
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Recommended config is incomplete; re-probe or finish it by hand before applying",
+                "phases": {phase: phase_configured(platform, recommended, phase) for phase in ADAPTER_PHASES},
+            },
+        )
+
+    await save_platform_selector_config(platform, recommended)
+    phase_status = {phase: phase_configured(platform, recommended, phase) for phase in ADAPTER_PHASES}
+    await audit_event(
+        request,
+        action="adapter_selector_config.apply_probe",
+        resource_type="adapter_selector_config",
+        resource_id=platform,
+        result="saved",
+        risk_level="high",
+        detail={"probe_id": probe_id, "platform": platform, "phases": phase_status},
+    )
+    await record_event(
+        aggregate="platform",
+        aggregate_id=platform,
+        event_type="AdapterSelectorConfigSaved",
+        payload={"configured": True, "phases": phase_status, "source": "probe", "probe_id": probe_id},
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "saved", "platform": platform, "probe_id": probe_id, "configured": True, "phases": phase_status}
 
 
 @router.get("/probes/{probe_id}/screenshot")
