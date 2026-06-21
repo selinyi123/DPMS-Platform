@@ -22,7 +22,6 @@ GROUP_NAME = "workers"
 RECOVERY_CONSUMER = "recovery-daemon"
 MAX_RECOVERY_COUNT = 3
 IDLE_THRESHOLD_MS = 120_000
-WORKER_HEARTBEAT_STALE_SECONDS = 90
 TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 
 
@@ -47,13 +46,7 @@ async def start_recovery_daemon():
 
                 decision = await _recovery_decision(task_id)
                 if decision == "skip_owned_running_task":
-                    structured_log(
-                        "info",
-                        "recovery_skipped_owned_running_task",
-                        task_id=task_id,
-                        message_id=message_id,
-                        idle_ms=idle_ms,
-                    )
+                    structured_log("info", "recovery_skipped_owned_running_task", task_id=task_id, message_id=message_id, idle_ms=idle_ms)
                     continue
                 if decision == "ack_terminal_task":
                     structured_log("info", "recovery_ack_terminal_task", task_id=task_id, message_id=message_id)
@@ -96,13 +89,7 @@ async def start_recovery_daemon():
                 payload["resume_from_phase"] = "latest"
                 payload["recovery_generation"] = str(new_count)
 
-                structured_log(
-                    "warning",
-                    "recovered_pending_task",
-                    task_id=task_id,
-                    recovery_count=new_count,
-                    mode=payload.get("mode"),
-                )
+                structured_log("warning", "recovered_pending_task", task_id=task_id, recovery_count=new_count, mode=payload.get("mode"))
                 retry_msg_id = await redis.xadd(STREAM_KEY, payload)
                 if retry_msg_id:
                     await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
@@ -152,8 +139,8 @@ async def _worker_heartbeat_fresh(worker_id: str) -> bool:
            FROM worker_heartbeats
            WHERE worker_id = :worker_id
              AND status = 'ok'
-             AND last_seen_at >= (NOW() - INTERVAL :seconds SECOND)""",
-        {"worker_id": worker_id, "seconds": WORKER_HEARTBEAT_STALE_SECONDS},
+             AND last_seen_at >= (NOW() - INTERVAL 90 SECOND)""",
+        {"worker_id": worker_id},
     )
     return bool(row and int(row["cnt"] or 0) > 0)
 
