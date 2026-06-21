@@ -1,5 +1,5 @@
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from enum import StrEnum
 
@@ -47,12 +47,12 @@ class AccountCreate(BaseModel):
 
     proxy_id: Optional[int] = None
 
-    encrypted_credential: str = ""
+    encrypted_credential: str = Field(default="", max_length=200_000)
 
 
 class AccountCredentialUpdate(BaseModel):
 
-    encrypted_credential: str
+    encrypted_credential: str = Field(min_length=1, max_length=200_000)
 
 
 class AccountProxyUpdate(BaseModel):
@@ -82,27 +82,27 @@ class AccountHealthRecheckRequest(BaseModel):
 
 class ProxyCreate(BaseModel):
 
-    proxy_url: str
+    proxy_url: str = Field(min_length=8, max_length=2048)
 
-    proxy_type: str = "socks5"
+    proxy_type: str = Field(default="socks5", max_length=16)
 
-    provider: Optional[str] = None
+    provider: Optional[str] = Field(default=None, max_length=64)
 
-    country: Optional[str] = None
+    country: Optional[str] = Field(default=None, max_length=64)
 
 
 class ProxyCooldownRequest(BaseModel):
 
-    minutes: int = 30
+    minutes: int = Field(default=30, ge=1, le=1440)
 
-    reason: Optional[str] = None
+    reason: Optional[str] = Field(default=None, max_length=255)
 
 
 class ProxyCheckRequest(BaseModel):
 
-    target_url: str = "https://www.bilibili.com"
+    target_url: str = Field(default="https://www.bilibili.com", max_length=2048)
 
-    timeout_seconds: float = 8.0
+    timeout_seconds: float = Field(default=8.0, ge=2.0, le=20.0)
 
 
 class ProxyStatusUpdate(BaseModel):
@@ -146,29 +146,29 @@ class LotteryResponse(BaseModel):
 
 class NotifyRequest(BaseModel):
 
-    title: str
+    title: str = Field(min_length=1, max_length=200)
 
-    content: str
+    content: str = Field(min_length=1, max_length=5000)
 
-    channel: str = "serverchan"
+    channel: str = Field(default="serverchan", max_length=32)
 
 
 class NotifySecretUpdate(BaseModel):
 
-    serverchan_key: Optional[str] = None
+    serverchan_key: Optional[str] = Field(default=None, max_length=512)
 
-    feishu_webhook: Optional[str] = None
+    feishu_webhook: Optional[str] = Field(default=None, max_length=2048)
 
-    generic_webhook_url: Optional[str] = None
+    generic_webhook_url: Optional[str] = Field(default=None, max_length=2048)
 
-    telegram_bot_token: Optional[str] = None
+    telegram_bot_token: Optional[str] = Field(default=None, max_length=512)
 
-    telegram_chat_id: Optional[str] = None
+    telegram_chat_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class NotifySecretBundleUpdate(BaseModel):
 
-    content: str
+    content: str = Field(min_length=1, max_length=10_000)
 
 
 class LotteryCreate(BaseModel):
@@ -179,11 +179,11 @@ class LotteryCreate(BaseModel):
 
     source_id: Optional[str] = None
 
-    raw_url: str
+    raw_url: str = Field(min_length=8, max_length=2048)
 
     canonical_url: Optional[str] = None
 
-    value_score: int = 0
+    value_score: int = Field(default=0, ge=0, le=100)
 
     expires_at: Optional[datetime] = None
 
@@ -205,9 +205,9 @@ class LotteryTargetImport(BaseModel):
 
     source_id: Optional[str] = None
 
-    content: str
+    content: str = Field(min_length=1, max_length=200_000)
 
-    value_score: int = 50
+    value_score: int = Field(default=50, ge=0, le=100)
 
 
 class TrackedSourceCreate(BaseModel):
@@ -216,9 +216,9 @@ class TrackedSourceCreate(BaseModel):
 
     source_type: str = "url_list"
 
-    source_value: str
+    source_value: str = Field(min_length=1, max_length=2048)
 
-    scan_interval_minutes: int = 30
+    scan_interval_minutes: int = Field(default=30, ge=1, le=1440)
 
 
 class DispatchTaskRequest(BaseModel):

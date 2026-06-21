@@ -106,6 +106,7 @@ async def list_accounts():
                     LIMIT 1
                   ) AS latest_task_run
            FROM accounts a
+           WHERE a.deleted_at IS NULL
            ORDER BY a.id DESC"""
     )
     result = []
@@ -490,40 +491,41 @@ async def update_account_proxy(account_id: int, data: AccountProxyUpdate, reques
 async def delete_account(account_id: int, request: Request):
     actor = require_min_role(request, "admin")
     require_confirmation(request)
-    row = await database.fetch_one("SELECT id, status FROM accounts WHERE id = :id", {"id": account_id})
+    row = await database.fetch_one("SELECT id, status, deleted_at FROM accounts WHERE id = :id", {"id": account_id})
     if not row:
         raise HTTPException(404, detail="Account not found")
+    if row["deleted_at"]:
+        return {"status": "already_deleted", "id": account_id}
     if row["status"] == "executing":
         raise HTTPException(409, detail="Cannot delete an account while it is executing")
 
-    for statement in [
-        "DELETE FROM task_phases WHERE account_id = :id",
-        "DELETE FROM task_runs WHERE account_id = :id",
-        "DELETE FROM adapter_calibrations WHERE account_id = :id",
-        "DELETE FROM account_calibrations WHERE account_id = :id",
-        "DELETE FROM risk_events WHERE account_id = :id",
-        "UPDATE login_sessions SET account_id = NULL WHERE account_id = :id",
-        "DELETE FROM accounts WHERE id = :id",
-    ]:
-        await database.execute(statement, {"id": account_id})
+    await database.execute(
+        """UPDATE accounts
+           SET status = 'frozen', encrypted_credential = '', proxy_id = NULL,
+               deleted_at = NOW(), deleted_by = :deleted_by,
+               delete_reason = 'operator soft delete', updated_at = NOW(), version = version + 1
+           WHERE id = :id""",
+        {"id": account_id, "deleted_by": actor["actor_id"]},
+    )
+    await database.execute("UPDATE login_sessions SET account_id = NULL WHERE account_id = :id", {"id": account_id})
     await audit_event(
         request,
         action="account.delete",
         resource_type="account",
         resource_id=account_id,
-        result="deleted",
-        risk_level="critical",
-        detail={"previous_status": row["status"]},
+        result="soft_deleted",
+        risk_level="high",
+        detail={"previous_status": row["status"], "credential_removed": True},
     )
     await record_event(
         aggregate="account",
         aggregate_id=account_id,
-        event_type="AccountDeleted",
-        payload={"previous_status": row["status"]},
+        event_type="AccountSoftDeleted",
+        payload={"previous_status": row["status"], "credential_removed": True},
         actor_type="operator",
         actor_id=actor["actor_id"],
     )
-    return {"status": "deleted", "id": account_id}
+    return {"status": "soft_deleted", "id": account_id}
 
 
 @router.post("/health/recheck")

@@ -129,7 +129,7 @@ async def audit_event(
     detail: dict[str, Any] | None = None,
 ) -> None:
     actor = current_actor(request)
-    client_host = request.client.host if request.client else None
+    client_host = client_ip(request)
     await database.execute(
         """INSERT INTO audit_logs
            (actor_id, actor_role, action, resource_type, resource_id, result, risk_level, detail, ip_address, user_agent)
@@ -147,6 +147,18 @@ async def audit_event(
             "user_agent": (request.headers.get("user-agent") or "")[:255],
         },
     )
+
+
+def client_ip(request: Request) -> str | None:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        first = forwarded_for.split(",", 1)[0].strip()
+        if first:
+            return first[:64]
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip[:64]
+    return request.client.host if request.client else None
 
 
 def redact_detail(value: Any) -> Any:
