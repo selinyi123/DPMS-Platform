@@ -7,6 +7,7 @@ import databases
 import redis.asyncio as aioredis
 
 from app.config import settings
+from app.utils.log import structured_log
 
 
 _schema_write_allowed = contextvars.ContextVar("schema_write_allowed", default=False)
@@ -48,10 +49,12 @@ class GuardedDatabase:
     async def execute(self, query, values=None, *args, **kwargs):
         if production_mode() and not _schema_write_allowed.get() and _is_runtime_schema_write(query):
             text = _query_text(query).strip().splitlines()[0][:160]
-            raise RuntimeError(
-                "Runtime schema writes are disabled in production; apply versioned migrations instead: "
-                f"{text}"
+            structured_log(
+                "warning",
+                "runtime_schema_write_skipped_in_production",
+                statement=text,
             )
+            return None
         return await self._inner.execute(query, values=values, *args, **kwargs)
 
     def __getattr__(self, name):
