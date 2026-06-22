@@ -118,6 +118,13 @@ STRATEGY_TARGET_METRICS_SQL = """(
                   ) AS latest_probe_result"""
 
 
+MAX_IMPORT_TARGET_LINES = 1000
+
+
+def clamp_limit(value: int, minimum: int = 1, maximum: int = 200) -> int:
+    return min(max(int(value or minimum), minimum), maximum)
+
+
 @router.get("/adapters")
 async def list_adapters():
     selector_config = await load_runtime_selector_config()
@@ -232,6 +239,7 @@ async def clear_adapter_config(platform: str, request: Request):
 
 @router.get("/")
 async def list_lotteries(status: str = None, limit: int = 50):
+    limit = clamp_limit(limit)
     query = "SELECT * FROM lotteries"
     values = {"limit": limit}
     if status:
@@ -443,6 +451,8 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
     rows = parse_target_lines(data.content, data.platform, data.value_score)
     if not rows:
         raise HTTPException(400, detail="No valid target lines found")
+    if len(rows) > MAX_IMPORT_TARGET_LINES:
+        raise HTTPException(413, detail=f"Too many target lines; max={MAX_IMPORT_TARGET_LINES}")
 
     import_id = str(uuid.uuid4())
     created = []
@@ -860,6 +870,7 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
 
 @router.get("/tasks/runs")
 async def list_task_runs(limit: int = 50):
+    limit = clamp_limit(limit)
     rows = await database.fetch_all(
         """SELECT tr.*, l.raw_url, l.platform
            FROM task_runs tr
@@ -872,6 +883,7 @@ async def list_task_runs(limit: int = 50):
 
 @router.get("/probes")
 async def list_adapter_probes(limit: int = 50):
+    limit = clamp_limit(limit)
     rows = await database.fetch_all(
         """SELECT ac.*, l.raw_url
            FROM adapter_calibrations ac

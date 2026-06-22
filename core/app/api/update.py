@@ -28,6 +28,7 @@ UPLOAD_DIR = RELEASES_DIR / "_uploads"
 
 APP_CURRENT = Path("/app/app")
 
+MAX_UPDATE_ZIP_BYTES = 50 * 1024 * 1024
 RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -132,9 +133,27 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     upload_path = UPLOAD_DIR / "update.zip"
 
+    total = 0
+
     with open(upload_path, "wb") as f:
 
-        f.write(await file.read())
+        while True:
+
+            chunk = await file.read(1024 * 1024)
+
+            if not chunk:
+
+                break
+
+            total += len(chunk)
+
+            if total > MAX_UPDATE_ZIP_BYTES:
+
+                upload_path.unlink(missing_ok=True)
+
+                raise HTTPException(413, f"Update archive is too large; max={MAX_UPDATE_ZIP_BYTES} bytes")
+
+            f.write(chunk)
 
     try:
 

@@ -9,6 +9,7 @@ from app.event_store.service import record_event
 from app.models.schemas import ProxyCheckRequest, ProxyCooldownRequest, ProxyCreate, ProxyStatusUpdate
 from app.platforms import PLATFORMS
 from app.security import audit_event, require_confirmation, require_min_role
+from app.utils.network_safety import assert_public_http_url
 
 
 router = APIRouter()
@@ -304,11 +305,12 @@ def validate_proxy_url(value: str):
 
 
 def validate_check_url(value: str):
-    parsed = urlsplit(value or "")
-    if parsed.scheme not in {"http", "https"}:
-        raise HTTPException(400, detail="target_url must start with http:// or https://")
-    if not parsed.hostname:
-        raise HTTPException(400, detail="target_url must include a host")
+    try:
+        # Do not DNS-resolve here: proxy checks may intentionally route through a
+        # proxy resolver. Still block literal localhost/private IP targets.
+        assert_public_http_url(value, require_https=False, resolve_dns=False)
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
     return value
 
 

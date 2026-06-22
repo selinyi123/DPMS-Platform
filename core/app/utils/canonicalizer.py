@@ -37,11 +37,15 @@ class BilibiliCanonicalizer:
 
     async def canonicalize(raw_url: str) -> CanonicalURL:
 
-        if 'b23.tv' in raw_url:
+        parsed = urlparse(raw_url)
+
+        host = parsed.netloc.lower().split(":", 1)[0]
+
+        if host == 'b23.tv':
 
             import httpx
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(timeout=5.0, max_redirects=5) as client:
 
                 resp = await client.head(raw_url, follow_redirects=True)
 
@@ -139,7 +143,7 @@ async def resolve_short_link(raw_url: str, short_host: str) -> str:
         return raw_url
     import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=5.0, max_redirects=5) as client:
         resp = await client.head(raw_url, follow_redirects=True)
         return str(resp.url)
 

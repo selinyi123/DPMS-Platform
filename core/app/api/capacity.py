@@ -34,7 +34,7 @@ async def capacity_overview():
 
     # Augment with observed current daily usage so headroom is visible.
     usage = await database.fetch_all(
-        "SELECT platform, COALESCE(SUM(daily_task_count), 0) AS used FROM accounts GROUP BY platform"
+        "SELECT platform, COALESCE(SUM(daily_task_count), 0) AS used FROM accounts WHERE deleted_at IS NULL GROUP BY platform"
     )
     used_by_platform = {row["platform"]: int(row["used"] or 0) for row in usage}
     for platform, bucket in capacity["per_platform"].items():
@@ -57,7 +57,7 @@ async def capacity_bindings():
 
 async def _load_accounts() -> list[dict]:
     rows = await database.fetch_all(
-        "SELECT id, platform, status, proxy_id, fingerprint_id FROM accounts"
+        "SELECT id, platform, status, proxy_id, fingerprint_id FROM accounts WHERE deleted_at IS NULL"
     )
     return [
         {

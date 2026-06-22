@@ -71,7 +71,7 @@ async def scheduling_plan(window_minutes: int = 240, platform: str | None = None
 
 async def _load_dispatchable_accounts(platform: str | None) -> list[dict]:
     """Ready accounts with their remaining daily quota and readiness offset."""
-    where = "status = :status"
+    where = "status = :status AND deleted_at IS NULL"
     values: dict = {"status": DISPATCHABLE_STATUS}
     if platform:
         where += " AND platform = :platform"
