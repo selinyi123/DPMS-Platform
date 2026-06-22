@@ -35,6 +35,12 @@ def require_contains(path: str, needles: list[str]) -> None:
         raise CheckFailure(f"{path} missing: {', '.join(missing)}")
 
 
+def require_files(paths: list[str]) -> None:
+    for path in paths:
+        if not (ROOT / path).exists():
+            raise CheckFailure(f"required file missing: {path}")
+
+
 def run_migration_smoke() -> None:
     script = ROOT / "scripts" / "migration_smoke.py"
     if not script.exists():
@@ -45,15 +51,39 @@ def run_migration_smoke() -> None:
 
 
 def check_migration_contract() -> None:
-    required = [
-        "core/migrations/0002_worker_lease_deadletter.sql",
-        "core/migrations/0003_task_event_outbox.sql",
-        "core/migrations/0004_task_terminal_outbox_trigger.sql",
-        "core/migrations/0005_terminal_notify_outbox_trigger.sql",
-    ]
-    for path in required:
-        if not (ROOT / path).exists():
-            raise CheckFailure(f"required migration missing: {path}")
+    require_files(
+        [
+            "core/migrations/0002_worker_lease_deadletter.sql",
+            "core/migrations/0003_task_event_outbox.sql",
+            "core/migrations/0004_task_terminal_outbox_trigger.sql",
+            "core/migrations/0005_terminal_notify_outbox_trigger.sql",
+        ]
+    )
+
+
+def check_smoke_script_contract() -> None:
+    require_files(
+        [
+            "scripts/container_runtime_smoke.py",
+            "scripts/controlled_worker_lifecycle_smoke.py",
+            "scripts/controlled_browser_lifecycle_smoke.py",
+        ]
+    )
+    require_contains(
+        "scripts/controlled_browser_lifecycle_smoke.py",
+        [
+            "Default mode is dry-run",
+            "--execute",
+            "chromium.launch",
+            "browser.new_context",
+            "context.close",
+            "browser.close",
+            "no account login",
+            "no task enqueue",
+            "no platform page open",
+            "no platform action",
+        ],
+    )
 
 
 def check_browser_lifecycle_contract() -> None:
@@ -117,6 +147,7 @@ def main() -> int:
     checks = [
         ("migration_smoke", run_migration_smoke),
         ("migration_contract", check_migration_contract),
+        ("smoke_script_contract", check_smoke_script_contract),
         ("schema_boundary_contract", check_schema_boundary_contract),
         ("browser_lifecycle_contract", check_browser_lifecycle_contract),
         ("runtime_status_contract", check_runtime_status_contract),

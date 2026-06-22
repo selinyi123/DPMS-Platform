@@ -3,9 +3,9 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.11
-Architecture Stage: S13 / Controlled Worker Lifecycle Smoke
-Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness
+Product Version: 0.3.12
+Architecture Stage: S14 / Controlled Browser Lifecycle Smoke
+Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness
 Real-run Status: Gated / Calibration Required
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -27,6 +27,7 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 10. Run static runtime preflight before container/browser smoke tests.
 11. Validate Compose service healthcheck, dependency, worker security, and profile volume contracts before runtime smoke.
 12. Provide an explicit controlled worker lifecycle smoke harness with dry-run default and isolated project cleanup.
+13. Provide an explicit controlled browser lifecycle smoke harness with Chromium launch/context/close verification inside the worker container.
 
 Real-run is intentionally not treated as production-ready until the Bilibili selector calibration and evidence gates pass in controlled small-scale validation.
 
@@ -55,18 +56,19 @@ WORKER_CONTEXT_REAPER_INTERVAL_SECONDS=60
 python scripts/runtime_preflight.py
 python scripts/container_runtime_smoke.py
 python scripts/controlled_worker_lifecycle_smoke.py
+python scripts/controlled_browser_lifecycle_smoke.py
 ```
 
-Controlled execution requires explicit opt-in:
+Controlled browser execution requires explicit opt-in:
 
 ```bash
-python scripts/controlled_worker_lifecycle_smoke.py --execute --project-name dpms-worker-smoke
+python scripts/controlled_browser_lifecycle_smoke.py --execute --project-name dpms-browser-smoke
 ```
 
 ## Next Key Node
 
 ```text
-Product Version: 0.3.12
-Target: Controlled Browser Lifecycle Smoke Node
-Scope: browser launch/close smoke inside worker container, no account login, no platform page, no task dispatch
+Product Version: 0.3.13
+Target: Controlled Shadow-Run Readiness Node
+Scope: database seed-free readiness, task queue idle checks, selector calibration prerequisites, no account login, no platform action
 ```
