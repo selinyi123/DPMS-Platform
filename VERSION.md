@@ -3,9 +3,9 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.12
-Architecture Stage: S14 / Controlled Browser Lifecycle Smoke
-Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness
+Product Version: 0.3.13
+Architecture Stage: S15 / Controlled Runtime Readiness Contract
+Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
 Real-run Status: Gated / Calibration Required
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -28,6 +28,7 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 11. Validate Compose service healthcheck, dependency, worker security, and profile volume contracts before runtime smoke.
 12. Provide an explicit controlled worker lifecycle smoke harness with dry-run default and isolated project cleanup.
 13. Provide an explicit controlled browser lifecycle smoke harness with Chromium launch/context/close verification inside the worker container.
+14. Provide a static runtime readiness contract gate for stream, worker lease, outbox, and dead-letter readiness anchors.
 
 Real-run is intentionally not treated as production-ready until the Bilibili selector calibration and evidence gates pass in controlled small-scale validation.
 
@@ -57,18 +58,13 @@ python scripts/runtime_preflight.py
 python scripts/container_runtime_smoke.py
 python scripts/controlled_worker_lifecycle_smoke.py
 python scripts/controlled_browser_lifecycle_smoke.py
-```
-
-Controlled browser execution requires explicit opt-in:
-
-```bash
-python scripts/controlled_browser_lifecycle_smoke.py --execute --project-name dpms-browser-smoke
+python scripts/runtime_readiness_contract.py
 ```
 
 ## Next Key Node
 
 ```text
-Product Version: 0.3.13
-Target: Controlled Shadow-Run Readiness Node
-Scope: database seed-free readiness, task queue idle checks, selector calibration prerequisites, no account login, no platform action
+Product Version: 0.3.14
+Target: Controlled Runtime Readiness Execution Node
+Scope: opt-in read-only DB/Redis readiness checks, queue idle checks, worker heartbeat check, no account login, no page navigation, no task dispatch
 ```
