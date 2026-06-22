@@ -1,17 +1,11 @@
 """Recovery daemon: re-dispatch tasks whose stream message went stale.
 
-When a worker claims a ``lottery_tasks`` message but dies before acking it, the
-message lingers in the consumer group's pending list. This daemon reclaims such
-messages after an idle threshold and re-enqueues them.
-
-Safety / correctness (P0-2): the re-enqueued message must be a *complete* task
-payload — the same field set the original dispatch produced — rebuilt from the
-authoritative database rows (``task_runs`` + ``lotteries``), not a stub. A stub
-carrying only ``task_id`` made the worker fail immediately (``int(None)`` on the
-missing ``account_id``), which then looped back into recovery until the task was
-permanently failed. We reuse the *recorded* account/lottery/mode so recovery
-never re-selects an account or changes the execution mode; the worker still
-re-validates the account and the real-run gate at execution time.
+A Redis pending entry only says a message has not been acknowledged; it does not
+identify whether the owning worker is still making progress. Recovery therefore
+uses the authoritative task row: terminal tasks are acked, running tasks are
+skipped only while their owning worker heartbeat is fresh and their lease has not
+expired, and all other stale messages are rebuilt from database state before
+being re-enqueued.
 """
 
 import asyncio
@@ -28,16 +22,10 @@ GROUP_NAME = "workers"
 RECOVERY_CONSUMER = "recovery-daemon"
 MAX_RECOVERY_COUNT = 3
 IDLE_THRESHOLD_MS = 120_000
+TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 
 
 def pending_idle_ms(entry: dict) -> int:
-    """Idle time (ms) for a redis ``xpending_range`` entry.
-
-    redis-py parses each pending entry with the keys ``message_id``,
-    ``consumer``, ``time_since_delivered`` and ``times_delivered`` — there is no
-    ``idle`` key, and ``time_since_delivered`` is already the elapsed
-    milliseconds since the message was last delivered to a consumer.
-    """
     return int(entry.get("time_since_delivered") or 0)
 
 
@@ -52,34 +40,46 @@ async def start_recovery_daemon():
                 if idle_ms < IDLE_THRESHOLD_MS:
                     continue
 
+                message_id = msg["message_id"]
+                fields = await _read_stream_fields(message_id)
+                task_id = fields.get("task_id", message_id)
+
+                decision = await _recovery_decision(task_id)
+                if decision == "skip_owned_running_task":
+                    structured_log("info", "recovery_skipped_owned_running_task", task_id=task_id, message_id=message_id, idle_ms=idle_ms)
+                    continue
+                if decision == "ack_terminal_task":
+                    structured_log("info", "recovery_ack_terminal_task", task_id=task_id, message_id=message_id)
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await redis.delete(f"recovery_count:{task_id}")
+                    continue
+
                 claimed = await redis.xclaim(
-                    STREAM_KEY, GROUP_NAME, RECOVERY_CONSUMER,
+                    STREAM_KEY,
+                    GROUP_NAME,
+                    RECOVERY_CONSUMER,
                     min_idle_time=IDLE_THRESHOLD_MS,
-                    message_ids=[msg["message_id"]],
+                    message_ids=[message_id],
                 )
                 if not claimed:
                     continue
 
-                message_id, fields = claimed[0]
-                task_id = fields.get("task_id", message_id)
+                _claimed_id, claimed_fields = claimed[0]
+                task_id = claimed_fields.get("task_id", task_id)
 
                 recovery_key = f"recovery_count:{task_id}"
                 current_count = int(await redis.get(recovery_key) or 0)
-
                 if current_count >= MAX_RECOVERY_COUNT:
-                    structured_log("error", "task_permanent_failure",
-                                   task_id=task_id, recovery_count=current_count)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    structured_log("error", "task_permanent_failure", task_id=task_id, recovery_count=current_count)
+                    await _mark_recovery_exhausted(task_id)
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                     await redis.delete(recovery_key)
                     continue
 
                 payload = await _rebuild_task_payload(task_id)
                 if payload is None:
-                    # No authoritative task row to rebuild from — re-enqueueing a
-                    # stub would only fail again. Drop it and log, rather than
-                    # loop until MAX_RECOVERY_COUNT.
                     structured_log("error", "recovery_task_row_missing", task_id=task_id)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                     await redis.delete(recovery_key)
                     continue
 
@@ -89,13 +89,10 @@ async def start_recovery_daemon():
                 payload["resume_from_phase"] = "latest"
                 payload["recovery_generation"] = str(new_count)
 
-                structured_log("warning", "recovered_pending_task",
-                               task_id=task_id, recovery_count=new_count,
-                               mode=payload.get("mode"))
-
+                structured_log("warning", "recovered_pending_task", task_id=task_id, recovery_count=new_count, mode=payload.get("mode"))
                 retry_msg_id = await redis.xadd(STREAM_KEY, payload)
                 if retry_msg_id:
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg["message_id"])
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
                 else:
                     structured_log("error", "recovery_enqueue_failed", task_id=task_id)
 
@@ -104,13 +101,79 @@ async def start_recovery_daemon():
         await asyncio.sleep(60)
 
 
-async def _rebuild_task_payload(task_id: str) -> dict | None:
-    """Rebuild the full dispatch message for ``task_id`` from the database.
+async def _read_stream_fields(message_id) -> dict:
+    try:
+        rows = await redis.xrange(STREAM_KEY, min=message_id, max=message_id, count=1)
+    except Exception as exc:
+        structured_log("warning", "recovery_read_stream_fields_failed", message_id=message_id, error=str(exc))
+        return {}
+    if not rows:
+        return {}
+    _mid, fields = rows[0]
+    return dict(fields or {})
 
-    Mirrors the field set produced by ``dispatch_lottery`` so the worker has
-    everything it needs (account, lottery, platform, urls, mode, selector
-    config, action plan). Returns ``None`` if no task row exists.
-    """
+
+async def _recovery_decision(task_id: str) -> str:
+    row = await database.fetch_one(
+        """SELECT status, worker_id,
+                  CASE WHEN lease_expires_at IS NOT NULL AND lease_expires_at > NOW() THEN 1 ELSE 0 END AS lease_active
+           FROM task_runs
+           WHERE task_id = :task_id""",
+        {"task_id": task_id},
+    )
+    if not row:
+        return "recover"
+    status = str(row["status"] or "")
+    if status in TERMINAL_TASK_STATUSES:
+        return "ack_terminal_task"
+    worker_id = row["worker_id"]
+    lease_active = int(row["lease_active"] or 0) == 1
+    if status == "running" and worker_id and lease_active and await _worker_heartbeat_fresh(worker_id):
+        return "skip_owned_running_task"
+    return "recover"
+
+
+async def _worker_heartbeat_fresh(worker_id: str) -> bool:
+    row = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM worker_heartbeats
+           WHERE worker_id = :worker_id
+             AND status = 'ok'
+             AND last_seen_at >= (NOW() - INTERVAL 90 SECOND)""",
+        {"worker_id": worker_id},
+    )
+    return bool(row and int(row["cnt"] or 0) > 0)
+
+
+async def _mark_recovery_exhausted(task_id: str) -> None:
+    try:
+        row = await database.fetch_one(
+            "SELECT account_id, lottery_id FROM task_runs WHERE task_id = :task_id",
+            {"task_id": task_id},
+        )
+        if not row:
+            return
+        async with database.transaction():
+            await database.execute(
+                """UPDATE task_runs
+                   SET status = 'failed', error_message = 'recovery exhausted', finished_at = NOW(),
+                       worker_id = NULL, stream_message_id = NULL, lease_expires_at = NULL
+                   WHERE task_id = :task_id AND status NOT IN ('succeeded', 'failed')""",
+                {"task_id": task_id},
+            )
+            await database.execute(
+                "UPDATE lotteries SET status = 'pending', execution_lock = NULL, locked_at = NULL WHERE id = :lottery_id AND execution_lock = :task_id",
+                {"lottery_id": row["lottery_id"], "task_id": task_id},
+            )
+            await database.execute(
+                "UPDATE accounts SET status = 'ready', updated_at = NOW() WHERE id = :account_id AND status = 'executing'",
+                {"account_id": row["account_id"]},
+            )
+    except Exception as exc:
+        structured_log("error", "recovery_exhausted_mark_failed_failed", task_id=task_id, error=str(exc))
+
+
+async def _rebuild_task_payload(task_id: str) -> dict | None:
     row = await database.fetch_one(
         """SELECT tr.account_id, tr.lottery_id, tr.task_mode, tr.dry_run,
                   l.platform, l.raw_url, l.canonical_url, l.action_plan
@@ -123,15 +186,12 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
         return None
 
     platform = row["platform"]
-    # task_mode can be NULL on legacy rows; fall back to the dry_run flag.
     task_mode = row["task_mode"] or ("dry_run" if row["dry_run"] else "real_run")
     dry_run = task_mode != "real_run"
 
     selector_config = await load_runtime_selector_config()
     platform_selectors = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
 
-    # Reuse the canonical dispatch builder so a recovered message has exactly the
-    # same field set the worker expects (no drift between dispatch and recovery).
     return build_lottery_task_message(
         task_id=task_id,
         account_id=row["account_id"],
@@ -147,7 +207,6 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
 
 
 def _parse_action_plan(value):
-    """Normalise an action_plan column value to a dict/list for the builder."""
     if value is None:
         return {}
     if isinstance(value, (dict, list)):

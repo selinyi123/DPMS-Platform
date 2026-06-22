@@ -1,5 +1,4 @@
-
-import hashlib, hmac, json, shutil, stat, zipfile
+import hashlib, hmac, json, re, shutil, stat, zipfile
 
 from pathlib import Path
 
@@ -30,6 +29,7 @@ UPLOAD_DIR = RELEASES_DIR / "_uploads"
 APP_CURRENT = Path("/app/app")
 
 MAX_UPDATE_ZIP_BYTES = 50 * 1024 * 1024
+RELEASE_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 
@@ -38,6 +38,42 @@ def verify_signature(manifest_bytes: bytes, signature_hex: str) -> bool:
     expected = hmac.new(settings.update_secret.encode(), manifest_bytes, hashlib.sha256).hexdigest()
 
     return hmac.compare_digest(expected, signature_hex)
+
+
+def validate_release_version(value) -> str:
+    """Return a safe release version segment from the signed manifest."""
+    version = str(value or "").strip()
+    if not RELEASE_VERSION_RE.fullmatch(version):
+        raise ValueError("Invalid release version")
+    return version
+
+
+def release_dir_for(version: str) -> Path:
+    """Resolve a release directory and prove it stays under RELEASES_DIR."""
+    root = RELEASES_DIR.resolve()
+    target = (root / f"v{version}").resolve()
+    if target != root and not target.is_relative_to(root):
+        raise ValueError("Release path escapes releases directory")
+    return target
+
+
+def require_managed_app_symlink() -> Path:
+    """Hot-update may only retarget a managed symlink, never delete /app/app.
+
+    In the docker-compose development layout, /app/app is a bind mount from
+    ./core/app. The previous implementation removed this path when it was not a
+    symlink, which could delete the host source tree. Refuse to deploy until the
+    runtime is changed to a managed symlink layout such as /app/runtime/current.
+    """
+    if not APP_CURRENT.is_symlink():
+        raise RuntimeError(
+            "Hot update refused: /app/app is not a managed symlink. "
+            "Current docker-compose bind-mounts source code at this path; refusing to delete it."
+        )
+    current_target = APP_CURRENT.resolve()
+    if not current_target.exists() or not current_target.is_dir():
+        raise RuntimeError("Hot update refused: current app symlink target is missing")
+    return current_target
 
 
 def _is_symlink_member(member: zipfile.ZipInfo) -> bool:
@@ -81,6 +117,19 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
     require_min_role(request, "owner")
     require_confirmation(request)
 
+    try:
+        old_target = require_managed_app_symlink()
+    except Exception as exc:
+        await audit_event(
+            request,
+            action="update.upload",
+            resource_type="system_version",
+            result="blocked",
+            risk_level="critical",
+            detail={"reason": str(exc)},
+        )
+        raise HTTPException(409, str(exc))
+
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     upload_path = UPLOAD_DIR / "update.zip"
 
@@ -117,6 +166,7 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
                 raise ValueError("Invalid signature")
 
             manifest = json.loads(manifest_data)
+            version = validate_release_version(manifest.get("version"))
 
             for fname, expected_hash in manifest["files_sha256"].items():
 
@@ -126,7 +176,7 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
 
                     raise ValueError(f"Hash mismatch: {fname}")
 
-            version_dir = RELEASES_DIR / f"v{manifest.get('version')}"
+            version_dir = release_dir_for(version)
 
             if version_dir.exists():
 
@@ -137,23 +187,11 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
 
 
 
-        if APP_CURRENT.is_symlink():
+        backup_ver = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            old_target = APP_CURRENT.resolve()
+        shutil.copytree(old_target, BACKUPS_DIR / backup_ver, dirs_exist_ok=True)
 
-            backup_ver = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            shutil.copytree(old_target, BACKUPS_DIR / backup_ver, dirs_exist_ok=True)
-
-
-
-        if APP_CURRENT.is_symlink():
-
-            APP_CURRENT.unlink()
-
-        else:
-
-            shutil.rmtree(str(APP_CURRENT))
+        APP_CURRENT.unlink()
 
         APP_CURRENT.symlink_to(version_dir, target_is_directory=True)
 
@@ -165,7 +203,7 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
 
             VALUES (:ver, :desc, :hash)
 
-        """, {"ver": manifest.get("version"), "desc": manifest.get("description", ""), "hash": hashlib.sha256(manifest_data).hexdigest()})
+        """, {"ver": version, "desc": manifest.get("description", ""), "hash": hashlib.sha256(manifest_data).hexdigest()})
 
 
 
@@ -176,13 +214,13 @@ async def upload_update(request: Request, file: UploadFile = File(...), signatur
             request,
             action="update.upload",
             resource_type="system_version",
-            resource_id=manifest.get("version"),
+            resource_id=version,
             result="deployed",
             risk_level="critical",
-            detail={"version": manifest.get("version"), "description": manifest.get("description", "")},
+            detail={"version": version, "description": manifest.get("description", "")},
         )
 
-        return {"status": "deployed", "version": manifest.get("version")}
+        return {"status": "deployed", "version": version}
 
     except Exception as e:
 
@@ -206,6 +244,19 @@ async def rollback(request: Request):
     require_min_role(request, "owner")
     require_confirmation(request)
 
+    try:
+        old_target = require_managed_app_symlink()
+    except Exception as exc:
+        await audit_event(
+            request,
+            action="update.rollback",
+            resource_type="system_version",
+            result="blocked",
+            risk_level="critical",
+            detail={"reason": str(exc)},
+        )
+        raise HTTPException(409, str(exc))
+
     backups = sorted(BACKUPS_DIR.glob("*"), reverse=True)
 
     if not backups:
@@ -214,17 +265,11 @@ async def rollback(request: Request):
 
     latest_backup = backups[0]
 
-    shutil.copytree(APP_CURRENT.resolve(), BACKUPS_DIR / f"pre_rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}", dirs_exist_ok=True)
+    shutil.copytree(old_target, BACKUPS_DIR / f"pre_rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}", dirs_exist_ok=True)
 
-    if APP_CURRENT.is_symlink():
+    APP_CURRENT.unlink()
 
-        APP_CURRENT.unlink()
-
-    else:
-
-        shutil.rmtree(str(APP_CURRENT))
-
-    shutil.copytree(latest_backup, str(APP_CURRENT), dirs_exist_ok=True)
+    APP_CURRENT.symlink_to(latest_backup, target_is_directory=True)
 
     await redis.set("update_signal", "rollback")
 

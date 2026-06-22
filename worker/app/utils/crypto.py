@@ -7,9 +7,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from app.config import settings
 
 
-# Must match core/app/utils/crypto.py: the worker decrypts account credentials
-# that core encrypted (and vice versa via login_broker), so the purpose AAD has
-# to be byte-identical across both services (P2-2).
 CREDENTIAL_AAD = "dpms:account-credential"
 
 
@@ -39,10 +36,25 @@ class CookieVault:
         try:
             return self._aesgcm.decrypt(nonce, ct, aad_b).decode()
         except InvalidTag:
-            # Legacy ciphertext written before AAD binding has no AAD.
             if aad_b is None:
                 raise
             return self._aesgcm.decrypt(nonce, ct, None).decode()
 
 
-cookie_vault = CookieVault()
+class LazyCookieVault:
+    def __init__(self):
+        self._vault: CookieVault | None = None
+
+    def _get(self) -> CookieVault:
+        if self._vault is None:
+            self._vault = CookieVault()
+        return self._vault
+
+    def encrypt(self, *args, **kwargs):
+        return self._get().encrypt(*args, **kwargs)
+
+    def decrypt(self, *args, **kwargs):
+        return self._get().decrypt(*args, **kwargs)
+
+
+cookie_vault = LazyCookieVault()

@@ -6,6 +6,9 @@ from app.db import database
 from app.utils.log import structured_log
 
 
+TERMINAL_OUTBOX_EVENT_TYPES = {"TaskFinished", "TaskFailed", "AccountExecutionFinished"}
+
+
 async def ensure_event_schema() -> None:
     await database.execute(
         """CREATE TABLE IF NOT EXISTS events (
@@ -39,6 +42,16 @@ async def record_event(
     actor_id: Any | None = None,
     source_service: str = "worker",
 ) -> str | None:
+    if source_service == "worker" and event_type in TERMINAL_OUTBOX_EVENT_TYPES:
+        structured_log(
+            "info",
+            "terminal_event_direct_write_skipped",
+            aggregate=aggregate,
+            aggregate_id=aggregate_id,
+            event_type=event_type,
+        )
+        return None
+
     event_id = str(uuid.uuid4())
     try:
         await database.execute(
