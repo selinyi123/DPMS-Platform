@@ -1,0 +1,132 @@
+@media (max-width: 920px) {
+  .app-shell {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    flex-basis: auto;
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .nav-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+    overflow: visible;
+    padding-bottom: 4px;
+  }
+
+  .nav-button {
+    width: auto;
+    min-width: 92px;
+    flex: 1 1 92px;
+    text-align: center;
+  }
+
+  .settings-panel {
+    padding: 8px 6px;
+  }
+
+  .settings-summary {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--sidebar-muted);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    list-style: none;
+  }
+
+  .settings-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .settings-auth-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--sidebar-muted);
+  }
+
+  .settings-auth-dot.auth-verified {
+    background: var(--success-text);
+  }
+
+  .settings-auth-dot.auth-failed {
+    background: var(--danger-text);
+  }
+
+  .main-pane {
+    padding: 16px;
+  }
+
+  .page-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .compact-input {
+    width: 100%;
+  }
+
+  .segmented {
+    width: 100%;
+  }
+
+  .segmented button {
+    flex: 1;
+  }
+
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .knowledge-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .readiness-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .two-columns,
+  .three-columns,
+  .account-form,
+  .lottery-form,
+  .target-import-form,
+  .discovery-form,
+  .proxy-form,
+  .event-filter-form,
+  .form-row,
+  .action-plan-row,
+  .production-check-row,
+  .credential-row {
+    grid-template-columns: 1fr;
+  }
+
+  .config-status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .notify-health-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .notify-guide-grid,
+  .ops-checklist,
+  .bilibili-readiness-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .bilibili-workflow-bar {
+    grid-template-columns: 1fr;
+  }
+}

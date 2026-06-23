@@ -15,14 +15,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = ROOT / "core" / "migrations"
+BOOTSTRAP_FILE = ROOT / "docker" / "mysql" / "001-bootstrap.sql"
 VERSION_RE = re.compile(r"^(\d{4})_.+\.sql$")
 
 
 def split_statements(sql: str) -> list[str]:
     statements: list[str] = []
-    for chunk in sql.split(";"):
-        lines = [line for line in chunk.splitlines() if not line.strip().startswith("--")]
-        cleaned = "\n".join(lines).strip()
+    uncommented = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
+    for chunk in uncommented.split(";"):
+        cleaned = chunk.strip()
         if cleaned:
             statements.append(cleaned)
     return statements
@@ -32,9 +33,18 @@ def main() -> int:
     if not MIGRATIONS_DIR.is_dir():
         print(f"missing migrations dir: {MIGRATIONS_DIR}", file=sys.stderr)
         return 1
+    if not BOOTSTRAP_FILE.exists():
+        print(f"missing bootstrap SQL: {BOOTSTRAP_FILE}", file=sys.stderr)
+        return 1
 
     seen: set[str] = set()
     errors: list[str] = []
+    bootstrap_sql = BOOTSTRAP_FILE.read_text(encoding="utf-8")
+    if not split_statements(bootstrap_sql):
+        errors.append(f"empty bootstrap SQL: {BOOTSTRAP_FILE.name}")
+    for required in ("CREATE TABLE IF NOT EXISTS accounts", "CREATE TABLE IF NOT EXISTS lotteries", "CREATE TABLE IF NOT EXISTS task_runs"):
+        if required not in bootstrap_sql:
+            errors.append(f"bootstrap SQL missing: {required}")
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
         match = VERSION_RE.match(path.name)
         if not match:

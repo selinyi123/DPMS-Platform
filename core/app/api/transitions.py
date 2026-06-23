@@ -9,7 +9,7 @@ reads the resulting lineage.
 
 from fastapi import APIRouter
 
-from app.api.lotteries import parse_json_field
+from app.services.real_run_readiness import parse_json_field
 from app.db import database
 from app.governance.policy import REAL_RUN_GATE_POLICY_KEY
 

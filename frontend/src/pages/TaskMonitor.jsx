@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { apiPath } from '../api';
+import { authenticatedApiPath } from '../api';
 import { useUi } from '../uiContext';
 
 export default function TaskMonitor() {
@@ -11,7 +11,7 @@ export default function TaskMonitor() {
   const lastErrorRef = useRef('');
 
   useEffect(() => {
-    const source = new EventSource(apiPath('/metrics/stream'));
+    const source = new EventSource(authenticatedApiPath('/metrics/stream'));
     source.onopen = () => {
       setConnection('connected');
       lastErrorRef.current = '';

@@ -34,6 +34,17 @@ class InvalidTaskMessage(Exception):
     pass
 
 
+def row_get(row, key: str, default=None):
+    if row is None:
+        return default
+    if hasattr(row, "get"):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        return default
+
+
 async def get_latest_phase(task_id: str) -> str:
     row = await database.fetch_one(
         "SELECT phase FROM task_phases WHERE task_id = :tid ORDER BY id DESC LIMIT 1",
@@ -77,7 +88,7 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
         )
         if not row:
             raise RuntimeError(f"Task row not found: {task_id}")
-        status = str(row["status"] or "")
+        status = str(row_get(row, "status", "") or "")
         if status in TERMINAL_TASK_STATUSES:
             raise TaskAlreadyTerminal(f"Task {task_id} is already terminal: {status}")
         await database.execute(
@@ -136,7 +147,7 @@ async def mark_task_finished(
             "SELECT status FROM task_runs WHERE task_id = :task_id FOR UPDATE",
             {"task_id": task_id},
         )
-        if row and str(row["status"] or "") in TERMINAL_TASK_STATUSES:
+        if row and str(row_get(row, "status", "") or "") in TERMINAL_TASK_STATUSES:
             return
         await database.execute(
             """UPDATE task_runs

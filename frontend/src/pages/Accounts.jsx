@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
 
-import { apiPath, deleteJSON, fetchJSON, postJSON, putJSON } from '../api';
+import { authenticatedApiPath, deleteJSON, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
 import { useUi } from '../uiContext';
 
@@ -253,7 +253,7 @@ export default function Accounts() {
         {calibration.screenshot_path && calibration.calibration_id && (
           <a
             className="badge badge-info evidence-link"
-            href={apiPath(`/accounts/calibrations/${calibration.calibration_id}/screenshot`)}
+            href={authenticatedApiPath(`/accounts/calibrations/${calibration.calibration_id}/screenshot`)}
             target="_blank"
             rel="noreferrer"
           >
@@ -335,7 +335,7 @@ export default function Accounts() {
                     {!imageReady && <div className="qr-empty">{t('accounts.qrOpening')}</div>}
                     <img
                       alt="QR login screen"
-                      src={apiPath(`/accounts/login/qr/${loginSession.session_id}/image?ts=${loginSession.updated_at || Date.now()}`)}
+                      src={authenticatedApiPath(`/accounts/login/qr/${loginSession.session_id}/image?ts=${loginSession.updated_at || Date.now()}`)}
                       style={{ display: imageReady ? 'block' : 'none' }}
                       onLoad={() => setImageReady(true)}
                       onError={() => setImageReady(false)}

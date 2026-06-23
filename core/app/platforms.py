@@ -1,52 +1,27 @@
+import json
+from pathlib import Path
+
 from app.adapter_config import platform_has_real_adapter
 
 
-PLATFORMS = {
-    "bilibili": {
-        "label": "Bilibili",
-        "login_url": "https://passport.bilibili.com/login",
-        "account_check_url": "https://space.bilibili.com/",
-        "required_cookies": ["SESSDATA", "DedeUserID"],
-        "cookie_domain": ".bilibili.com",
-        "qr_login": True,
-        "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
-    },
-    "weibo": {
-        "label": "Weibo",
-        "login_url": "https://passport.weibo.cn/signin/login",
-        "account_check_url": "https://weibo.com/",
-        "required_cookies": ["SUB"],
-        "cookie_domain": ".weibo.com",
-        "qr_login": True,
-        "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
-    },
-    "douyin": {
-        "label": "Douyin",
-        "login_url": "https://www.douyin.com/passport/web/login/",
-        "account_check_url": "https://www.douyin.com/",
-        "required_cookies": ["sessionid"],
-        "cookie_domain": ".douyin.com",
-        "qr_login": True,
-        "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
-    },
-    "xiaohongshu": {
-        "label": "Xiaohongshu",
-        "login_url": "https://www.xiaohongshu.com/login",
-        "account_check_url": "https://www.xiaohongshu.com/explore",
-        "required_cookies": ["web_session"],
-        "cookie_domain": ".xiaohongshu.com",
-        "qr_login": True,
-        "cookie_login": True,
-        "action_adapter": False,
-        "adapter_status": "calibration_required",
-    },
-}
+def _manifest_candidates() -> list[Path]:
+    current = Path(__file__).resolve()
+    return [
+        current.parents[1] / "shared" / "platforms.json",  # Docker: /app/shared
+        current.parents[2] / "shared" / "platforms.json",  # local repo root/shared
+    ]
+
+
+def _load_platform_manifest() -> dict:
+    for path in _manifest_candidates():
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)["platforms"]
+    searched = ", ".join(str(path) for path in _manifest_candidates())
+    raise RuntimeError(f"Platform manifest not found; searched: {searched}")
+
+
+PLATFORMS = _load_platform_manifest()
 
 
 def get_platform(platform: str) -> dict | None:
@@ -54,6 +29,8 @@ def get_platform(platform: str) -> dict | None:
     if not cfg:
         return None
     output = dict(cfg)
+    output["action_adapter"] = False
+    output["adapter_status"] = "calibration_required"
     # A platform's real-action adapter turns on only when a complete, reviewed
     # selector config exists for it (selector_config_complete). Bilibili is a
     # first-class structured platform and follows the same selector-driven path

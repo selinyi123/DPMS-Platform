@@ -10,9 +10,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl default-mysql-client \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /tmp/requirements.txt
+COPY worker/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY app /app/app
+COPY shared /app/shared
+COPY worker/app /app/app
 
 CMD ["python", "-m", "app.main"]

@@ -33,6 +33,7 @@ from app.governance.policy import (
     gate_codes_from_reasons,
 )
 from app.security import circuit_breaker_allows, is_real_run_enabled
+from app.services.real_run_readiness import real_run_gate_status
 
 
 def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
@@ -122,9 +123,6 @@ async def evaluate_real_run_decision(lottery, *, account_id: int | None, record:
     Returns ``allowed``, the recorded ``decision_id`` / ``policy_version``, the
     raw ``outcome`` and the gate ``blockers`` (for operator-facing messaging).
     """
-    # Lazy import to avoid an import cycle (lotteries imports this module).
-    from app.api.lotteries import real_run_gate_status
-
     selector_config = await load_runtime_selector_config()
     real_run_enabled = await is_real_run_enabled()
     gate = await real_run_gate_status(

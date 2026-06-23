@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { fetchJSON, postJSON, putJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
 import StatusBadge from '../components/StatusBadge';
+import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
 export default function RiskCenter() {
@@ -216,8 +217,4 @@ export default function RiskCenter() {
       </div>
     </section>
   );
-}
-
-function formatText(template, values) {
-  return Object.entries(values).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, value), template);
 }

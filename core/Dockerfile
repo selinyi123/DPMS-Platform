@@ -10,11 +10,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl default-mysql-client \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /tmp/requirements.txt
+COPY core/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY app /app/app
-COPY migrations /app/migrations
+COPY VERSION.md /app/VERSION.md
+COPY shared /app/shared
+COPY core/app /app/app
+COPY core/migrations /app/migrations
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,286 @@
+/* Strategy & Knowledge console (S2 decision explainability) */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  justify-content: flex-end;
+  z-index: 60;
+}
+
+.drawer-panel {
+  width: min(480px, 100%);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--panel-bg, #fff);
+  box-shadow: -12px 0 40px rgba(15, 23, 42, 0.25);
+  padding: 20px 22px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+:root[data-theme="dark"] .drawer-panel {
+  background: #131c2b;
+}
+
+.drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.drawer-header h2 {
+  margin: 2px 0 0;
+  font-size: 1.15rem;
+}
+
+.drawer-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.panel-subtle {
+  border: 1px solid var(--panel-border, #e2e8f0);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+:root[data-theme="dark"] .panel-subtle {
+  border-color: #29364c;
+}
+
+.kv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.86rem;
+}
+
+.kv-row.total-row {
+  border-top: 1px dashed var(--panel-border, #e2e8f0);
+  margin-top: 4px;
+  padding-top: 8px;
+  font-weight: 600;
+}
+
+.negative-value {
+  color: #dc2626;
+}
+
+.reason-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reason-chip {
+  margin: 2px 4px 2px 0;
+  display: inline-block;
+}
+
+.transition-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.transition-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.transition-edge-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 16px;
+  border-left: 2px dashed var(--panel-border, #e2e8f0);
+}
+
+.transition-edge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  justify-content: flex-start;
+}
+
+:root[data-theme="dark"] .transition-edge-group {
+  border-left-color: #29364c;
+}
+
+.ellipsis-cell {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.confidence-bar {
+  position: relative;
+  width: 120px;
+  height: 16px;
+  border-radius: 8px;
+  background: var(--badge-muted-bg);
+  overflow: hidden;
+}
+
+.confidence-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 8px;
+}
+
+.confidence-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  color: var(--badge-muted-text);
+  mix-blend-mode: normal;
+}
+
+.gap-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.gap-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.gap-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 920px) {
+  .drawer-panel {
+    width: 100%;
+  }
+}
+
+/* Semantic Runtime (V9 / S8): five-layer trace cards + narrative list. */
+.alert-warn {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.alert-ok {
+  margin-top: 8px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  background: rgba(5, 150, 105, 0.12);
+  color: #047857;
+}
+
+.reason-list-block {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.semantic-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.semantic-card {
+  border-top: 4px solid var(--accent);
+}
+
+@media (max-width: 920px) {
+  .semantic-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Unified auth guard (Phase 4): the main pane is blocked until the admin token
+   verifies, so unauthenticated users see a clear sign-in prompt instead of
+   pages that would all 401. */
+.auth-gate {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  padding: 24px;
+}
+
+.auth-gate-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 28px;
+  background: var(--surface-bg);
+  border: 1px solid var(--surface-border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  text-align: center;
+}
+
+.auth-gate-card h2 {
+  margin: 0 0 8px;
+  color: var(--text-primary);
+}
+
+.auth-gate-card p {
+  margin: 0 0 18px;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.auth-gate-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 10px;
+  background: var(--control-bg);
+  color: var(--control-text);
+  box-sizing: border-box;
+}
+
+.auth-gate-card button {
+  width: 100%;
+  min-height: 40px;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auth-gate-card button:hover {
+  background: var(--accent-hover);
+}
+
+.auth-gate-error {
+  margin-top: 12px;
+  color: var(--warning-text);
+  font-size: 13px;
+}

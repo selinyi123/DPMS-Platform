@@ -11,6 +11,7 @@ lottery tasks. Use this before a real container startup smoke.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -38,20 +39,19 @@ def read_compose() -> str:
 
 
 def service_block(text: str, service: str) -> str:
-    marker = f"  {service}:\n"
-    start = text.find(marker)
-    if start < 0:
+    match = re.search(rf"(?m)^  {re.escape(service)}:\n", text)
+    if match is None:
         raise SmokeFailure(f"service missing: {service}")
+    start = match.start()
     next_start = len(text)
     for other in REQUIRED_SERVICES - {service}:
-        idx = text.find(f"  {other}:\n", start + len(marker))
-        if idx >= 0:
-            next_start = min(next_start, idx)
-    network_idx = text.find("networks:\n", start + len(marker))
-    volume_idx = text.find("volumes:\n", start + len(marker))
-    for idx in (network_idx, volume_idx):
-        if idx >= 0:
-            next_start = min(next_start, idx)
+        other_match = re.search(rf"(?m)^  {re.escape(other)}:\n", text[start + 1 :])
+        if other_match is not None:
+            next_start = min(next_start, start + 1 + other_match.start())
+    for top_level in ("networks", "volumes"):
+        top_match = re.search(rf"(?m)^{top_level}:\n", text[start + 1 :])
+        if top_match is not None:
+            next_start = min(next_start, start + 1 + top_match.start())
     return text[start:next_start]
 
 
@@ -87,19 +87,33 @@ def check_depends_on_health(text: str) -> None:
 
 def check_worker_container_contract(text: str) -> None:
     block = service_block(text, "worker")
+    active_block = "\n".join(line for line in block.splitlines() if not line.lstrip().startswith("#"))
     require("shm_size:" in block, "worker missing shm_size for Chromium stability")
-    require("no-new-privileges:true" in block, "worker missing no-new-privileges security option")
-    require("privileged: true" not in block, "worker must not run privileged")
-    require("SYS_ADMIN" not in block, "worker must not add SYS_ADMIN capability")
+    require("no-new-privileges:true" in active_block, "worker missing no-new-privileges security option")
+    require("privileged: true" not in active_block, "worker must not run privileged")
+    require("SYS_ADMIN" not in active_block, "worker must not add SYS_ADMIN capability")
 
 
 def check_volume_contract(text: str) -> None:
     core = service_block(text, "core-api")
     worker = service_block(text, "worker")
+    mysql = service_block(text, "mysql")
     require("./browser-profiles:/profiles" in core, "core-api must mount browser profiles")
     require("./browser-profiles:/profiles" in worker, "worker must mount browser profiles")
     require("./releases:/app/releases" in core, "core-api must mount releases for managed updates")
     require("./core/app:/app/app" in core, "core-api dev bind mount changed; hot-update guard depends on this boundary")
+    require(
+        "./docker/mysql/001-bootstrap.sql:/docker-entrypoint-initdb.d/001-bootstrap.sql:ro" in mysql,
+        "mysql must mount the empty-database bootstrap SQL",
+    )
+
+
+def check_build_context_contract() -> None:
+    dockerignore = ROOT / ".dockerignore"
+    require(dockerignore.exists(), ".dockerignore is required when services build from repo root")
+    text = dockerignore.read_text(encoding="utf-8")
+    for pattern in [".env", ".venv/", "frontend/node_modules/", "browser-profiles/", "logs/"]:
+        require(pattern in text, f".dockerignore missing {pattern}")
 
 
 def docker_compose_cmd() -> list[str] | None:
@@ -144,6 +158,8 @@ def main() -> int:
         print("ok: worker container contract")
         check_volume_contract(text)
         print("ok: volume contract")
+        check_build_context_contract()
+        print("ok: build context contract")
         compose_status = run_compose_config(args.skip_docker)
         print(f"ok: compose config: {compose_status}")
     except Exception as exc:

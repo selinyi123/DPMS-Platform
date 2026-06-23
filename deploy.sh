@@ -73,7 +73,7 @@ sleep 10
 
 echo "==> 初始化表结构..."
 
-docker compose exec -T mysql mysql -u"${MYSQL_USER:-user}" -p"${MYSQL_PASSWORD:-password}" "${MYSQL_DATABASE:-lottery}" < init.sql
+docker compose exec -T mysql mysql -u"${MYSQL_USER:-user}" -p"${MYSQL_PASSWORD:-password}" "${MYSQL_DATABASE:-lottery}" < docker/mysql/001-bootstrap.sql
 
 
 

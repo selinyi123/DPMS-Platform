@@ -21,6 +21,28 @@ from app.utils.log import structured_log
 
 HEALTH_FILE = Path("/tmp/worker-health")
 WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
+STARTUP_CONNECT_ATTEMPTS = int(os.getenv("WORKER_STARTUP_CONNECT_ATTEMPTS", "30"))
+STARTUP_CONNECT_DELAY_SECONDS = float(os.getenv("WORKER_STARTUP_CONNECT_DELAY_SECONDS", "2"))
+
+
+async def connect_with_retry(name: str, connect_call) -> None:
+    for attempt in range(1, STARTUP_CONNECT_ATTEMPTS + 1):
+        try:
+            await connect_call()
+            return
+        except Exception as exc:
+            if attempt >= STARTUP_CONNECT_ATTEMPTS:
+                structured_log("error", f"{name}_connect_failed", attempt=attempt, exception=exc)
+                raise
+            structured_log(
+                "warning",
+                f"{name}_connect_retry",
+                attempt=attempt,
+                max_attempts=STARTUP_CONNECT_ATTEMPTS,
+                delay_seconds=STARTUP_CONNECT_DELAY_SECONDS,
+                error=str(exc),
+            )
+            await asyncio.sleep(STARTUP_CONNECT_DELAY_SECONDS)
 
 
 async def heartbeat_loop(shutdown_event: asyncio.Event):
@@ -79,8 +101,8 @@ async def reload_signal_loop(shutdown_event: asyncio.Event):
 
 
 async def main():
-    await database.connect()
-    await redis_client.initialize()
+    await connect_with_retry("worker_db", database.connect)
+    await connect_with_retry("worker_redis", redis_client.initialize)
     await ensure_event_schema()
     structured_log("info", "worker_db_connected")
     await record_event(

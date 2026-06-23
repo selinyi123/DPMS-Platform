@@ -22,7 +22,9 @@ services:
     restart: unless-stopped
 
   core-api:
-    build: ./core
+    build:
+      context: .
+      dockerfile: core/Dockerfile
     volumes:
       - ./core/app:/app/app
       - ./releases:/app/releases
@@ -55,7 +57,9 @@ services:
     restart: unless-stopped
 
   worker:
-    build: ./worker
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
     volumes:
       - ./worker/app:/app/app
       - ./browser-profiles:/profiles
@@ -95,6 +99,7 @@ services:
     image: mysql:8.0
     volumes:
       - mysql-data:/var/lib/mysql
+      - ./docker/mysql/001-bootstrap.sql:/docker-entrypoint-initdb.d/001-bootstrap.sql:ro
     env_file:
       - .env
     environment:
@@ -118,7 +123,7 @@ services:
           cpus: "0.5"
           memory: 1200M
     restart: unless-stopped
-    command: --default-authentication-plugin=mysql_native_password
+    command: --default-authentication-plugin=mysql_native_password --log-bin-trust-function-creators=1
 
   redis:
     image: redis:7-alpine

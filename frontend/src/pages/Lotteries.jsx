@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 
-import { apiPath, fetchJSON, postJSON, putJSON } from '../api';
+import { authenticatedApiPath, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
+import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
 export default function Lotteries() {
@@ -579,7 +580,7 @@ export default function Lotteries() {
                       {item.screenshot_path ? (
                         <a
                           className="badge badge-warn evidence-link"
-                          href={apiPath(`/lotteries/probes/${item.probe_id}/screenshot`)}
+                          href={authenticatedApiPath(`/lotteries/probes/${item.probe_id}/screenshot`)}
                           target="_blank"
                           rel="noreferrer"
                         >
@@ -615,7 +616,7 @@ export default function Lotteries() {
                     {run.screenshot_path ? (
                       <a
                         className="badge badge-warn evidence-link"
-                        href={apiPath(`/lotteries/tasks/runs/${run.task_id}/screenshot`)}
+                        href={authenticatedApiPath(`/lotteries/tasks/runs/${run.task_id}/screenshot`)}
                         target="_blank"
                         rel="noreferrer"
                       >
@@ -640,10 +641,6 @@ function safeJson(value) {
   } catch {
     return null;
   }
-}
-
-function formatText(template, values) {
-  return String(template).replace(/\{(\w+)\}/g, (_, key) => values?.[key] ?? '');
 }
 
 function modeLabel(run, t) {

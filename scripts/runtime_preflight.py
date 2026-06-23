@@ -57,6 +57,10 @@ def check_migration_contract() -> None:
             "core/migrations/0003_task_event_outbox.sql",
             "core/migrations/0004_task_terminal_outbox_trigger.sql",
             "core/migrations/0005_terminal_notify_outbox_trigger.sql",
+            "core/migrations/0006_account_soft_delete.sql",
+            "core/migrations/0007_worker_lease_contract_repair.sql",
+            "docker/mysql/001-bootstrap.sql",
+            ".dockerignore",
         ]
     )
 

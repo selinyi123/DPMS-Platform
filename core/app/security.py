@@ -35,12 +35,18 @@ def parse_bool(value: Any) -> bool:
 
 def actor_from_request(request: Request) -> dict[str, str] | None:
     provided = request.headers.get("x-admin-token", "")
+    auth_type = "x-admin-token"
+    if not provided and request.method in {"GET", "HEAD"}:
+        # Browser-native EventSource, <img>, and normal links cannot attach
+        # custom headers. Restrict query-token auth to read-only requests.
+        provided = request.query_params.get("admin_token", "")
+        auth_type = "admin_token_query"
     if settings.admin_token and provided and hmac.compare_digest(provided, settings.admin_token):
         return {
             "actor_id": "admin-token",
             "actor_name": "Admin token",
             "role": "owner",
-            "auth_type": "x-admin-token",
+            "auth_type": auth_type,
         }
     return None
 

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 
 import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
+import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
 export default function Deploy() {
   const { notify: toast, t } = useUi();
-  const [version] = useState('v3.0.2-local');
+  const version = `v${import.meta.env.VITE_DPMS_VERSION || '0.3.13'}`;
   const [message, setMessage] = useState('');
   const [reloadArmed, setReloadArmed] = useState(false);
   const [uploadSignature, setUploadSignature] = useState('');
@@ -901,10 +902,6 @@ function safeJson(value) {
 function hasSelectorDraft(value, platform) {
   const parsed = safeJson(value);
   return Boolean(parsed?.[platform] && Object.keys(parsed[platform]).length);
-}
-
-function formatText(template, values) {
-  return Object.entries(values).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, value), template);
 }
 
 const secretFieldByEnv = {

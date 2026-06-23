@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { fetchJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
 import StatusBadge from '../components/StatusBadge';
+import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
 export default function Dashboard() {
@@ -401,10 +402,6 @@ export default function Dashboard() {
       </div>
     </section>
   );
-}
-
-function formatText(template, values) {
-  return Object.entries(values).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, value), template);
 }
 
 function platformLabel(platforms = [], id) {

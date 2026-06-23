@@ -1,5 +1,6 @@
 import json
 import uuid
+import warnings
 from typing import Any
 
 from app.db import database
@@ -10,24 +11,26 @@ TERMINAL_OUTBOX_EVENT_TYPES = {"TaskFinished", "TaskFailed", "AccountExecutionFi
 
 
 async def ensure_event_schema() -> None:
-    await database.execute(
-        """CREATE TABLE IF NOT EXISTS events (
-          id CHAR(36) PRIMARY KEY,
-          aggregate VARCHAR(64) NOT NULL,
-          aggregate_id VARCHAR(128) NOT NULL,
-          event_type VARCHAR(128) NOT NULL,
-          payload JSON NULL,
-          correlation_id VARCHAR(128) NULL,
-          causation_id VARCHAR(128) NULL,
-          actor_type VARCHAR(32) NOT NULL DEFAULT 'system',
-          actor_id VARCHAR(128) NULL,
-          source_service VARCHAR(64) NOT NULL DEFAULT 'worker',
-          occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_events_aggregate (aggregate, aggregate_id, occurred_at),
-          INDEX idx_events_type_created (event_type, occurred_at),
-          INDEX idx_events_correlation (correlation_id, occurred_at)
-        ) ENGINE=InnoDB"""
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
+        await database.execute(
+            """CREATE TABLE IF NOT EXISTS events (
+              id CHAR(36) PRIMARY KEY,
+              aggregate VARCHAR(64) NOT NULL,
+              aggregate_id VARCHAR(128) NOT NULL,
+              event_type VARCHAR(128) NOT NULL,
+              payload JSON NULL,
+              correlation_id VARCHAR(128) NULL,
+              causation_id VARCHAR(128) NULL,
+              actor_type VARCHAR(32) NOT NULL DEFAULT 'system',
+              actor_id VARCHAR(128) NULL,
+              source_service VARCHAR(64) NOT NULL DEFAULT 'worker',
+              occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              INDEX idx_events_aggregate (aggregate, aggregate_id, occurred_at),
+              INDEX idx_events_type_created (event_type, occurred_at),
+              INDEX idx_events_correlation (correlation_id, occurred_at)
+            ) ENGINE=InnoDB"""
+        )
 
 
 async def record_event(

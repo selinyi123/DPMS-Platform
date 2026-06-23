@@ -19,6 +19,14 @@ export function apiPath(path) {
   return `${normalizedBase}${normalizedPath}`;
 }
 
+export function authenticatedApiPath(path) {
+  const token = localStorage.getItem('dpms_admin_token') || '';
+  const url = apiPath(path);
+  if (!token) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}admin_token=${encodeURIComponent(token)}`;
+}
+
 async function parseResponse(res) {
   const text = await res.text();
   const contentType = res.headers.get('content-type') || '';

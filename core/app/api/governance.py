@@ -16,7 +16,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 
 from app.adapter_config import load_runtime_selector_config
-from app.api.lotteries import parse_json_field, real_run_gate_status
+from app.services.real_run_readiness import parse_json_field, real_run_gate_status
 from app.db import database
 from app.event_store.service import record_event
 from app.governance.policy import (

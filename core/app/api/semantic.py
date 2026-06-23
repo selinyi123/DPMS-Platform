@@ -18,7 +18,8 @@ from fastapi import APIRouter, HTTPException
 
 from app.services.real_run_gate import load_active_policy
 from app.api.learning import target_predictions
-from app.api.lotteries import explain_lottery_strategy, parse_json_field
+from app.api.lotteries import explain_lottery_strategy
+from app.services.real_run_readiness import parse_json_field
 from app.api.risk_intel import account_risk_intelligence
 from app.api.transitions import policy_lineage
 from app.db import database

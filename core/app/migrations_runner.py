@@ -93,9 +93,9 @@ def split_statements(sql: str) -> list[str]:
     is sufficient and keeps the runner dependency-free.
     """
     statements: list[str] = []
-    for chunk in sql.split(";"):
-        lines = [line for line in chunk.splitlines() if not line.strip().startswith("--")]
-        cleaned = "\n".join(lines).strip()
+    uncommented = "\n".join(line for line in sql.splitlines() if not line.strip().startswith("--"))
+    for chunk in uncommented.split(";"):
+        cleaned = chunk.strip()
         if cleaned:
             statements.append(cleaned)
     return statements

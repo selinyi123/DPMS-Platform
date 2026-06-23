@@ -22,12 +22,12 @@ from app.services.outbox import start_outbox_dispatcher
 
 from app.services.scheduler import scheduler_loop
 
-from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic, scheduling, capacity, orchestration, throughput
-
 from app.config import settings
 from app.governance.policy import DEFAULT_REAL_RUN_POLICY
+from app.routers import include_api_routers
 from app.security_posture import format_posture_problems, secret_posture
 from app.migrations_runner import run_migrations
+from app.version import API_TITLE, PRODUCT_VERSION
 
 from app.utils.log import structured_log
 from app.security import authenticate_request
@@ -44,15 +44,16 @@ async def lifespan(app: FastAPI):
         warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
         await ensure_runtime_schema()
         # Versioned migrations run after the idempotent ensure_* safety net so
-        # every referenced table is present. Non-fatal: a migration failure is
-        # logged but does not block startup (the ensure_* hooks still hold the
-        # baseline schema).
+        # every referenced table is present. Development logs migration
+        # failures for diagnosis; production fails closed.
         try:
             applied = await run_migrations()
             if applied:
                 structured_log("info", "migrations_applied", versions=",".join(applied))
         except Exception as exc:
             structured_log("error", "migrations_failed", exception=exc)
+            if settings.deployment_mode == "production":
+                raise
 
     # Production secret-posture guard (Phase 4): never run a real deployment on
     # the shipped default ADMIN_TOKEN / UPDATE_SECRET or an unset ENCRYPTION_KEY.
@@ -386,20 +387,22 @@ async def ensure_consistency_schema():
     # lottery_id only while the task is queued/running (NULL once terminal),
     # plus a unique index, so the database itself refuses a second live task per
     # lottery even if the in-transaction FOR UPDATE guard is somehow bypassed.
-    # Both ALTERs are best-effort/idempotent: skipped if already present or if
-    # legacy data already violates the constraint.
-    try:
-        await database.execute(
-            """ALTER TABLE task_runs
-               ADD COLUMN active_lottery_lock BIGINT
-               GENERATED ALWAYS AS (CASE WHEN status IN ('queued','running') THEN lottery_id END) VIRTUAL"""
-        )
-    except Exception as exc:
-        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD active_lottery_lock", error=str(exc))
-    try:
-        await database.execute("ALTER TABLE task_runs ADD UNIQUE KEY uk_active_task_per_lottery (active_lottery_lock)")
-    except Exception as exc:
-        structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD uk_active_task_per_lottery", error=str(exc))
+    # Both ALTERs are guarded by information_schema checks so a migrated
+    # database does not log duplicate-column/index warnings on every boot.
+    if not await column_exists("task_runs", "active_lottery_lock"):
+        try:
+            await database.execute(
+                """ALTER TABLE task_runs
+                   ADD COLUMN active_lottery_lock BIGINT
+                   GENERATED ALWAYS AS (CASE WHEN status IN ('queued','running') THEN lottery_id END) VIRTUAL"""
+            )
+        except Exception as exc:
+            structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD active_lottery_lock", error=str(exc))
+    if not await index_exists("task_runs", "uk_active_task_per_lottery"):
+        try:
+            await database.execute("ALTER TABLE task_runs ADD UNIQUE KEY uk_active_task_per_lottery (active_lottery_lock)")
+        except Exception as exc:
+            structured_log("warning", "runtime_schema_alter_skipped", statement="ALTER task_runs ADD uk_active_task_per_lottery", error=str(exc))
 
 
 async def ensure_orchestration_schema():
@@ -546,7 +549,7 @@ async def ensure_governance_schema():
     )
 
 
-async def ensure_column(table: str, column: str, definition: str, after: str | None = None) -> None:
+async def column_exists(table: str, column: str) -> bool:
     existing = await database.fetch_one(
         """SELECT 1
            FROM information_schema.COLUMNS
@@ -556,6 +559,24 @@ async def ensure_column(table: str, column: str, definition: str, after: str | N
            LIMIT 1""",
         {"table": table, "column": column},
     )
+    return bool(existing)
+
+
+async def index_exists(table: str, index_name: str) -> bool:
+    existing = await database.fetch_one(
+        """SELECT 1
+           FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = :table
+             AND INDEX_NAME = :index_name
+           LIMIT 1""",
+        {"table": table, "index_name": index_name},
+    )
+    return bool(existing)
+
+
+async def ensure_column(table: str, column: str, definition: str, after: str | None = None) -> None:
+    existing = await column_exists(table, column)
     if existing:
         return
     after_clause = f" AFTER `{after}`" if after else ""
@@ -563,7 +584,7 @@ async def ensure_column(table: str, column: str, definition: str, after: str | N
 
 
 
-app = FastAPI(title="Lottery System v3.0.2", version="0.3.2", lifespan=lifespan)
+app = FastAPI(title=API_TITLE, version=PRODUCT_VERSION, lifespan=lifespan)
 
 
 # Paths under /api that are intentionally unauthenticated. Keep this minimal:
@@ -656,41 +677,7 @@ async def global_exception_handler(request, exc):
 
 
 
-app.include_router(accounts.router, prefix="/api/accounts", tags=["accounts"])
-
-app.include_router(lotteries.router, prefix="/api/lotteries", tags=["lotteries"])
-
-app.include_router(update.router, prefix="/api/update", tags=["update"])
-
-app.include_router(notify.router, prefix="/api/notify", tags=["notify"])
-
-app.include_router(proxies.router, prefix="/api/proxies", tags=["proxies"])
-
-app.include_router(metrics.router, prefix="/api/metrics", tags=["metrics"])
-
-app.include_router(events.router, prefix="/api/events", tags=["events"])
-
-app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
-
-app.include_router(experiments.router, prefix="/api/experiments", tags=["experiments"])
-
-app.include_router(risk_intel.router, prefix="/api/risk", tags=["risk-intel"])
-
-app.include_router(learning.router, prefix="/api/learning", tags=["learning"])
-
-app.include_router(governance.router, prefix="/api/governance", tags=["governance"])
-
-app.include_router(transitions.router, prefix="/api/transitions", tags=["transitions"])
-
-app.include_router(semantic.router, prefix="/api/semantic", tags=["semantic"])
-
-app.include_router(scheduling.router, prefix="/api/scheduling", tags=["scheduling"])
-
-app.include_router(capacity.router, prefix="/api/capacity", tags=["capacity"])
-
-app.include_router(orchestration.router, prefix="/api/orchestration", tags=["orchestration"])
-
-app.include_router(throughput.router, prefix="/api/throughput", tags=["throughput"])
+include_api_routers(app)
 
 
 @app.get("/api/auth/me")
@@ -741,7 +728,7 @@ async def health():
 
         "status": "ok" if (db_ok and redis_ok) else "degraded",
 
-        "version": "0.3.2",
+        "version": PRODUCT_VERSION,
 
         "db": db_ok,
 

@@ -52,7 +52,7 @@ def stub_playwright() -> None:
 
 
 def load_bilibili_example_selectors() -> dict:
-    config = json.loads((CORE_ROOT / "adapter_selectors.example.json").read_text())
+    config = json.loads((CORE_ROOT / "adapter_selectors.example.json").read_text(encoding="utf-8"))
     return config["bilibili"]
 
 
