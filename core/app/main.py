@@ -21,6 +21,7 @@ from app.services.notification_dispatcher import start_notification_dispatcher
 from app.services.outbox import start_outbox_dispatcher
 
 from app.services.scheduler import scheduler_loop
+from app.services.auto_dispatch import start_auto_dispatch_loop
 
 from app.api import accounts, lotteries, update, notify, metrics, proxies, events, knowledge, experiments, risk_intel, learning, governance, transitions, semantic, scheduling, capacity, orchestration, throughput
 
@@ -104,6 +105,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(start_outbox_dispatcher())
 
     asyncio.create_task(scheduler_loop())
+
+    # Autonomous Bilibili API real-run dispatch. Inert unless DPMS_AUTO_DISPATCH_ENABLED
+    # + DPMS_BILIBILI_API_MODE + the global real-run switch are all on.
+    asyncio.create_task(start_auto_dispatch_loop())
 
     yield
 

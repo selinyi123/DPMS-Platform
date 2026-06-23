@@ -45,9 +45,19 @@ python worker/tools/bilibili_api_selftest.py \
 - 目标解析 `worker/app/bilibili/targets.py`（t.bilibili.com / `/opus/` / 纯数字 id；b23.tv 短链需先展开）。
 - **默认完全不生效**：不设 `DPMS_BILIBILI_API_MODE` 则行为与现状一致。**务必先用自测脚本实机验证引擎，再开此开关。**
 
-## Phase 2b — 无人值守（待实机验证 + 你确认后）
+## Phase 2b — 无人值守自动派发（本 PR 已含，三重门控，默认关）
 
-- **自动派发循环**：定时挑 pending 抽奖 + ready 账号自动派发 `real_run`。API 通道不需要 Playwright 的 probe/shadow 证据门，需为 API 路径放宽/改造 `core/app/services/real_run_gate.py`。
-- `daily_task_count` 每日重置（已在待合并 PR #22 `scheduler.py` 实现，避免账号几天后卡死在“今日上限”）。
-- 消费 `terminal` / `follow_capped`：永久受阻的抽奖（评论区关闭、关注上限）置终态不再无限重投；关注上限账号切到只转已关注 / 清理模式。
-- 下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。
+`core/app/services/auto_dispatch.py` —— core-api lifespan 里的单循环。**三个开关全开**才会真正派发，否则完全不动：
+
+```
+DPMS_AUTO_DISPATCH_ENABLED=1  +  全局 real-run 开关(is_real_run_enabled)  +  DPMS_BILIBILI_API_MODE=1
+```
+
+- 定时挑 pending bilibili 抽奖 + ready 账号，**绕过 Playwright probe/shadow 证据门**（对 API 通道无意义），改用 API 适配的轻量门：账号日上限 + 单账号间隔（`PLATFORM_RATE_LIMITS`：bilibili 8/天、45 分钟间隔）+ 每账号每轮最多 1 次 + 每轮全局上限（`DPMS_AUTO_DISPATCH_MAX_PER_CYCLE`，默认 3）+ 熔断器 + 账号 24h 内无 `risk_event` + 目标有效 + 动作计划已审 + 原子“单抽奖单任务”claim。
+- `daily_task_count` 每日重置：在循环内幂等执行（`runtime_settings` 标记），与待合并 PR #22 `scheduler.py` 的重置同 key、互不冲突。
+- 永久受阻的抽奖不再无限重投：靠**失败重试上限**（`DPMS_AUTO_DISPATCH_MAX_RETRIES`，默认失败 2 次后跳过该抽奖），比改 lottery 状态枚举更稳。
+- 纯判定（`account_eligible` / `lottery_eligible` / 开关短路）已离线测；DB 接线复用现有 `build_lottery_task_message` / `enqueue_outbox` / 原子 claim，端到端仅 Docker 内可验。
+
+> ⚠️ 此路径会**自主**对你的账号发起真实关注/转发，务必先用自测脚本在小号上验证引擎，再依次打开三个开关。
+
+**仍 TODO**：下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。
