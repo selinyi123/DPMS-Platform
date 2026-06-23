@@ -65,7 +65,13 @@ def _dig(d: Any, *path: str, default: Any = None) -> Any:
 
 
 def parse_dynamic_card(item: dict | None) -> DynamicCard:
-    """Parse a single dynamic ``item`` into a :class:`DynamicCard`."""
+    """Parse a single dynamic ``item`` into a :class:`DynamicCard`.
+
+    ``item`` is the **bare** dynamic object — an element of ``data.items`` (feed)
+    or ``data.item`` (detail), or the value of ``orig`` for a forward. Do NOT
+    pass a LotteryAutoScript-style ``{"item": {...}}`` wrapper; that yields an
+    empty card.
+    """
     obj = DynamicCard()
     if not isinstance(item, dict):
         return obj

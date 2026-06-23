@@ -9,6 +9,7 @@ Run:  python -m unittest worker.tests.test_bilibili_engine   (from worker/)
   or: python worker/tests/test_bilibili_engine.py
 """
 
+import hashlib
 import sys
 import unittest
 import urllib.parse
@@ -49,6 +50,16 @@ class WbiTests(unittest.TestCase):
         self.assertEqual(
             wbi.key_from_url("https://i0.hdslb.com/bfs/wbi/abc123.png"), "abc123"
         )
+
+    def test_sign_encodes_space_as_percent20(self):
+        # Bilibili signs with encodeURIComponent (space -> %20). If sign() ever
+        # regresses to quote_plus (space -> '+'), w_rid won't match this.
+        img, sub = "i" * 32, "s" * 32
+        signed = wbi.sign({"q": "a b"}, img, sub, wts=1700000000)
+        mixin = wbi.get_mixin_key(img, sub)
+        expected_query = "q=a%20b&wts=1700000000"  # sorted keys: q, wts
+        expected = hashlib.md5((expected_query + mixin).encode()).hexdigest()
+        self.assertEqual(signed["w_rid"], expected)
 
 
 class CookieAndErrorTests(unittest.TestCase):
@@ -264,7 +275,38 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         res = await self._exec(fake).participate(_card(), ["follow", "like", "comment"])
         self.assertTrue(res.aborted)
         self.assertFalse(res.success)
+        self.assertIs(res.abort_outcome, Outcome.RISK)  # routable to account cooldown
         self.assertEqual(fake.calls, ["follow"])  # like/comment never attempted
+
+    async def test_follow_cap_stops_and_flags(self):
+        fake = _FakeClient({"follow": [classify("follow", 22009)]})  # LIMIT (follow cap)
+        res = await self._exec(fake).participate(_card(), ["follow", "repost", "comment"])
+        self.assertFalse(res.success)
+        self.assertTrue(res.follow_capped)
+        self.assertTrue(res.terminal)
+        self.assertEqual(fake.calls, ["follow"])  # no wasted repost/comment
+
+    async def test_fatal_follow_stops_remaining(self):
+        fake = _FakeClient({"follow": [classify("follow", 777777)]})  # FATAL
+        res = await self._exec(fake).participate(_card(), ["follow", "like"])
+        self.assertFalse(res.success)
+        self.assertEqual(fake.calls, ["follow"])  # like skipped conservatively
+
+    async def test_forward_without_origin_aborts(self):
+        fake = _FakeClient({})
+        card = DynamicCard(uid=42, type=1, dynamic_id="fwd", origin=None)
+        res = await self._exec(fake).participate(card, ["follow", "repost"])
+        self.assertTrue(res.aborted)
+        self.assertIsNone(res.abort_outcome)  # pre-flight, not account risk
+        self.assertIn("无法解析源抽奖", res.abort_reason)
+        self.assertEqual(fake.calls, [])
+
+    async def test_uid_zero_aborts_when_follow_required(self):
+        fake = _FakeClient({})
+        card = DynamicCard(uid=0, type=2, dynamic_id="d", rid_str="r", chat_type=11)
+        res = await self._exec(fake).participate(card, ["follow", "like"])
+        self.assertTrue(res.aborted)
+        self.assertEqual(fake.calls, [])  # never calls follow(0)
 
     async def test_retry_then_success(self):
         fake = _FakeClient({"like": [classify("like", 1000001), classify("like", 0)]})  # RETRY then OK

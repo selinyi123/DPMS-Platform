@@ -70,6 +70,9 @@ def sign(
     for k in sorted(signed):
         v = "".join(c for c in str(signed[k]) if c not in _FILTER_CHARS)
         items.append((k, v))
-    query = urllib.parse.urlencode(items)
+    # Must match Bilibili's encodeURIComponent canonicalization: space -> %20,
+    # not '+'. urlencode defaults to quote_plus (space -> '+'), which would make
+    # w_rid wrong for any value containing a space; quote gives %20.
+    query = urllib.parse.urlencode(items, quote_via=urllib.parse.quote)
     signed["w_rid"] = hashlib.md5((query + mixin_key).encode("utf-8")).hexdigest()
     return signed

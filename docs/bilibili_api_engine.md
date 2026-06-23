@@ -42,5 +42,9 @@ python worker/tools/bilibili_api_selftest.py \
 1. 在 `worker/app/adapters/bilibili.py` 增加 “API 执行通道”，real_run 改用本引擎而非 Playwright 选择器。
 2. 真实凭据沿用现有路径：`accounts.encrypted_credential`（AES）→ worker 按 `account_id` 解密取 cookie。
 3. 复用现有可靠性底座（outbox/恢复租约/死信/心跳/配额）。
-4. **无人值守**：新增自动派发循环 + `daily_task_count` 每日重置（注意：该重置已在待合并的 PR #22 `scheduler.py` 里实现）。
-5. 用本引擎替换/下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。
+4. **消费 `ExecutionResult`**（对抗式复核要求，调用方必须接）：
+   - `aborted` 且 `abort_outcome ∈ {RISK, AUTH}` → 走与 Playwright `detect_page_risk` 相同的 `set_account_status(account_id,'cooling',…)`，**不要**只当普通 failed（否则刚 -352 的账号会继续被派发）。
+   - `terminal` 为真（成功 / 永久 SKIP 如评论区关闭 / 关注上限）→ 把该 lottery 置为终态，**不要**无限重投。
+   - `follow_capped` 为真 → 该账号切到关注清理 / 只转已关注模式。
+5. **无人值守**：新增自动派发循环 + `daily_task_count` 每日重置（注意：该重置已在待合并的 PR #22 `scheduler.py` 里实现）。
+6. 用本引擎替换/下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。

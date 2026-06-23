@@ -100,6 +100,7 @@ class BilibiliApiClient:
         )
         self._wbi_keys: Optional[tuple[str, str]] = None
         self._wbi_fetched_at: float = 0.0
+        self._wbi_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -127,16 +128,25 @@ class BilibiliApiClient:
                 await asyncio.sleep(self.config.http_retry_wait)
         raise BiliApiError(f"request failed after retries: {url}") from last
 
-    async def _get_json(self, url: str, params: dict | None = None, *, wbi_sign: bool = False) -> dict:
-        params = dict(params or {})
+    async def _get_json(
+        self, url: str, params: dict | None = None, *, wbi_sign: bool = False, _allow_resign: bool = True
+    ) -> dict:
+        query = dict(params or {})
         if wbi_sign:
             img_key, sub_key = await self._ensure_wbi_keys()
-            params = wbi.sign(params, img_key, sub_key)
-        resp = await self._request("GET", url, params=params)
+            query = wbi.sign(query, img_key, sub_key)
+        resp = await self._request("GET", url, params=query)
         try:
-            return resp.json()
+            data = resp.json()
         except Exception as exc:  # noqa: BLE001 - surface non-JSON as transport error
             raise BiliApiError(f"non-JSON response from {url}: {resp.text[:200]}") from exc
+        # wbi keys rotate; a -403/-352 on a signed read often just means the
+        # cached keys went stale. Invalidate and re-sign once with fresh keys
+        # before surfacing the failure.
+        if wbi_sign and _allow_resign and int(data.get("code", 0)) in (-352, -403):
+            self.invalidate_wbi_keys()
+            return await self._get_json(url, params, wbi_sign=True, _allow_resign=False)
+        return data
 
     async def _post_action(self, action: str, url: str, data: dict) -> CodeResult:
         body = dict(data)
@@ -162,19 +172,29 @@ class BilibiliApiClient:
 
     # ----- wbi keys -----
 
+    def invalidate_wbi_keys(self) -> None:
+        self._wbi_keys = None
+        self._wbi_fetched_at = 0.0
+
     async def _ensure_wbi_keys(self) -> tuple[str, str]:
         now = time.time()
         if self._wbi_keys and (now - self._wbi_fetched_at) < _WBI_TTL_SECONDS:
             return self._wbi_keys
-        data = await self._get_json(_NAV)
-        wbi_img = (data.get("data") or {}).get("wbi_img") or {}
-        img_key = wbi.key_from_url(wbi_img.get("img_url", ""))
-        sub_key = wbi.key_from_url(wbi_img.get("sub_url", ""))
-        if not img_key or not sub_key:
-            raise BiliApiError("could not obtain wbi keys from nav")
-        self._wbi_keys = (img_key, sub_key)
-        self._wbi_fetched_at = now
-        return self._wbi_keys
+        async with self._wbi_lock:
+            # Re-check after acquiring the lock so concurrent signed reads share
+            # a single nav fetch instead of stampeding it.
+            now = time.time()
+            if self._wbi_keys and (now - self._wbi_fetched_at) < _WBI_TTL_SECONDS:
+                return self._wbi_keys
+            data = await self._get_json(_NAV)
+            wbi_img = (data.get("data") or {}).get("wbi_img") or {}
+            img_key = wbi.key_from_url(wbi_img.get("img_url", ""))
+            sub_key = wbi.key_from_url(wbi_img.get("sub_url", ""))
+            if not img_key or not sub_key:
+                raise BiliApiError("could not obtain wbi keys from nav")
+            self._wbi_keys = (img_key, sub_key)
+            self._wbi_fetched_at = now
+            return self._wbi_keys
 
     # ----- reads -----
 

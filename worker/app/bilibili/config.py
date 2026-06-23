@@ -58,11 +58,6 @@ class BiliEngineConfig:
     #: pages of a UP's space feed to scan per run (~12 dynamics/page).
     scan_pages: int = 3
 
-    # --- safety caps (the reference lacks these) ---
-    #: hard ceiling on state-changing actions performed in one participate()
-    #: call; a backstop against a runaway loop on a single target.
-    max_actions_per_target: int = 6
-
     # --- lottery filtering ---
     min_follower: int = 1000
     #: a lottery dynamic must contain at least one of these to be acted on.
