@@ -60,4 +60,4 @@ DPMS_AUTO_DISPATCH_ENABLED=1  +  全局 real-run 开关(is_real_run_enabled)  + 
 
 > ⚠️ 此路径会**自主**对你的账号发起真实关注/转发，务必先用自测脚本在小号上验证引擎，再依次打开三个开关。
 
-**仍 TODO**：下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。
+已移除死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入），`docs/bilibili_integration.md` 改为指向本文档。
