@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from app.adapters.registry import get_adapter
+from app.adapters.bilibili_api_channel import api_mode_enabled, run_bilibili_api_task
 from app.browser_pool import BrowserPool
 from app.db import database, redis
 from app.event_store.service import record_event
@@ -436,8 +437,12 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
     task_mode = normalize_task_mode(task)
+    # Opt-in direct-API channel for Bilibili real_run (DPMS_BILIBILI_API_MODE).
+    # When on, real actions go through the signed HTTP engine, not Playwright, so
+    # the selector-based REAL_ACTIONS gate does not apply.
+    api_mode = task_mode == "real_run" and api_mode_enabled(task.get("platform", "bilibili"))
     try:
-        if task_mode == "real_run" and not getattr(adapter, "REAL_ACTIONS", False):
+        if task_mode == "real_run" and not api_mode and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
         await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         await mark_task_started(task_id, account_id, lottery_id, task_mode, stream_message_id)
@@ -445,6 +450,10 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
             await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))
         elif task_mode == "shadow_run":
             await execute_shadow_run(task, adapter, pool)
+        elif api_mode:
+            await run_bilibili_api_task(
+                task, requested_phases(task, require_plan=True), save_phase, refresh_task_lease
+            )
         else:
             await execute_real_task(task, adapter, pool)
         await mark_task_finished(task_id, account_id, lottery_id, task_mode, True)

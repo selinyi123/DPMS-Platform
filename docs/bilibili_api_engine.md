@@ -37,14 +37,17 @@ python worker/tools/bilibili_api_selftest.py \
 
 离线单测：`python worker/tests/test_bilibili_engine.py`（15 项，含 wbi 向量、解析、分类、请求构造、编排）。
 
-## 与现有架构的衔接（Phase 2，待你实机验证后）
+## Phase 2a — worker API 执行通道（本 PR 已含，opt-in，默认关）
 
-1. 在 `worker/app/adapters/bilibili.py` 增加 “API 执行通道”，real_run 改用本引擎而非 Playwright 选择器。
-2. 真实凭据沿用现有路径：`accounts.encrypted_credential`（AES）→ worker 按 `account_id` 解密取 cookie。
-3. 复用现有可靠性底座（outbox/恢复租约/死信/心跳/配额）。
-4. **消费 `ExecutionResult`**（对抗式复核要求，调用方必须接）：
-   - `aborted` 且 `abort_outcome ∈ {RISK, AUTH}` → 走与 Playwright `detect_page_risk` 相同的 `set_account_status(account_id,'cooling',…)`，**不要**只当普通 failed（否则刚 -352 的账号会继续被派发）。
-   - `terminal` 为真（成功 / 永久 SKIP 如评论区关闭 / 关注上限）→ 把该 lottery 置为终态，**不要**无限重投。
-   - `follow_capped` 为真 → 该账号切到关注清理 / 只转已关注模式。
-5. **无人值守**：新增自动派发循环 + `daily_task_count` 每日重置（注意：该重置已在待合并的 PR #22 `scheduler.py` 里实现）。
-6. 用本引擎替换/下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。
+- `worker/app/adapters/bilibili_api_channel.py`：当 `DPMS_BILIBILI_API_MODE=1` 且 platform=bilibili 时，`real_run` 走本引擎而非 Playwright（绕过选择器 `REAL_ACTIONS` 门）。`worker/app/task_runner.py:execute_task_with_phases` 增加该分支。
+- 凭据沿用现有路径：`accounts.encrypted_credential`（AES）→ 解密成 cookie list → 拼 `k=v; …` header 喂引擎。
+- 消费 `ExecutionResult`（`plan_from_result`，纯函数可测）：成功的 phase 落 `task_phases`；`abort_outcome=RISK → 账号 cooling`、`AUTH → login_required`（这些状态能在 `mark_task_finished` 之后存活，因其只重置仍是 `executing` 的账号）；非成功则 raise → 任务标记 failed。
+- 目标解析 `worker/app/bilibili/targets.py`（t.bilibili.com / `/opus/` / 纯数字 id；b23.tv 短链需先展开）。
+- **默认完全不生效**：不设 `DPMS_BILIBILI_API_MODE` 则行为与现状一致。**务必先用自测脚本实机验证引擎，再开此开关。**
+
+## Phase 2b — 无人值守（待实机验证 + 你确认后）
+
+- **自动派发循环**：定时挑 pending 抽奖 + ready 账号自动派发 `real_run`。API 通道不需要 Playwright 的 probe/shadow 证据门，需为 API 路径放宽/改造 `core/app/services/real_run_gate.py`。
+- `daily_task_count` 每日重置（已在待合并 PR #22 `scheduler.py` 实现，避免账号几天后卡死在“今日上限”）。
+- 消费 `terminal` / `follow_capped`：永久受阻的抽奖（评论区关闭、关注上限）置终态不再无限重投；关注上限账号切到只转已关注 / 清理模式。
+- 下线死代码 `core/app/adapters/bilibili/hybrid_executor.py`（破损 import、`path/to/...` 占位，从未接入）。

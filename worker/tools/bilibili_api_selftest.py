@@ -34,7 +34,6 @@ Examples
 import argparse
 import asyncio
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -49,14 +48,14 @@ from app.bilibili import (  # noqa: E402
     parse_feed,
 )
 
-_DYID_RE = re.compile(r"(?:/opus/|t\.bilibili\.com/|/dynamic/)(\d{10,})|(\d{12,})")
+from app.bilibili.targets import extract_dynamic_id as _extract_dynamic_id  # noqa: E402
 
 
 def extract_dynamic_id(value: str) -> str:
-    m = _DYID_RE.search(value.strip())
-    if not m:
+    dyid = _extract_dynamic_id(value)
+    if not dyid:
         raise SystemExit(f"无法从 '{value}' 解析出 dynamic_id（请用完整 t.bilibili.com 链接或纯数字 id；b23.tv 短链请先在浏览器展开）")
-    return m.group(1) or m.group(2)
+    return dyid
 
 
 def _print(title, *lines):
