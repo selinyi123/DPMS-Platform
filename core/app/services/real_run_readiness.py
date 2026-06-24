@@ -15,6 +15,8 @@ from app.services.lottery_rules import parse_lottery_rule
 from app.utils.log import structured_log
 from app.utils.lottery_targets import validate_lottery_target
 
+ACCOUNT_RISK_COOLDOWN_HOURS = 24
+
 
 def parse_json_field(value):
     if isinstance(value, (dict, list)) or value is None:
@@ -58,6 +60,106 @@ def action_plan_missing_rule_actions(lottery_data: dict, action_plan: dict | Non
         return []
     saved = set(str(action) for action in saved_actions)
     return [str(action) for action in suggested_actions if str(action) not in saved]
+
+
+def normalize_timestamp(value) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value).replace(" ", "T")
+
+
+def account_risk_payload(row) -> dict:
+    if not row:
+        return {"has_recent_risk": False, "cooldown_hours": ACCOUNT_RISK_COOLDOWN_HOURS}
+    detail = parse_json_field(row["detail"])
+    return {
+        "has_recent_risk": True,
+        "cooldown_hours": ACCOUNT_RISK_COOLDOWN_HOURS,
+        "latest_event": {
+            "id": row["id"],
+            "account_id": row["account_id"],
+            "event_type": row["event_type"],
+            "detail": detail if isinstance(detail, dict) else {},
+            "created_at": normalize_timestamp(row["created_at"]),
+        },
+        "cooldown_until": normalize_timestamp(row["cooldown_until"]),
+    }
+
+
+async def recent_account_risk(account_id: int) -> dict:
+    row = await database.fetch_one(
+        """SELECT id, account_id, event_type, detail, created_at,
+                  DATE_ADD(created_at, INTERVAL 24 HOUR) AS cooldown_until
+           FROM risk_events
+           WHERE account_id = :account_id
+             AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+           ORDER BY created_at DESC, id DESC
+           LIMIT 1""",
+        {"account_id": account_id},
+    )
+    return account_risk_payload(row)
+
+
+async def real_run_account_risk_summary(platform: str) -> dict:
+    ready = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM accounts a
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'""",
+        {"platform": platform},
+    )
+    runnable = await database.fetch_one(
+        """SELECT COUNT(*) AS cnt
+           FROM accounts a
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'
+             AND NOT EXISTS (
+               SELECT 1 FROM risk_events r
+               WHERE r.account_id = a.id
+                 AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             )""",
+        {"platform": platform},
+    )
+    latest_risk = await database.fetch_one(
+        """SELECT r.id, r.account_id, r.event_type, r.detail, r.created_at,
+                  DATE_ADD(r.created_at, INTERVAL 24 HOUR) AS cooldown_until
+           FROM risk_events r
+           JOIN accounts a ON a.id = r.account_id
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'
+             AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+           ORDER BY r.created_at DESC, r.id DESC
+           LIMIT 1""",
+        {"platform": platform},
+    )
+    return {
+        "ready_accounts": int(ready["cnt"] if ready else 0),
+        "runnable_accounts": int(runnable["cnt"] if runnable else 0),
+        "latest_recent_risk": account_risk_payload(latest_risk),
+    }
 
 
 async def validate_real_run_evidence(lottery, account_id: int | None = None) -> dict:
@@ -121,15 +223,10 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
     if not shadow:
         blockers.append("recent_shadow_run_required")
 
+    account_risk = None
     if account_id is not None:
-        risk = await database.fetch_one(
-            """SELECT COUNT(*) AS cnt
-               FROM risk_events
-               WHERE account_id = :account_id
-                 AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)""",
-            {"account_id": account_id},
-        )
-        if int(risk["cnt"] or 0) > 0:
+        account_risk = await recent_account_risk(account_id)
+        if account_risk["has_recent_risk"]:
             blockers.append("recent_account_risk_event")
 
     return {
@@ -138,6 +235,7 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         "probe_ready": bool(probe_summary and probe_summary.get("ready_for_real_actions")),
         "shadow_ready": bool(shadow),
         "action_plan_ready": bool(action_plan and required_actions and not action_plan.get("review_required")),
+        "account_risk": account_risk,
     }
 
 
@@ -243,27 +341,16 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
     real_run_target_valid = target.valid and not (
         platform_has_api_real_adapter(platform) and target.kind != "dynamic"
     )
-    safe_accounts = await database.fetch_one(
-        """SELECT COUNT(*) AS cnt
-           FROM accounts a
-           WHERE a.platform = :platform
-             AND a.status = 'ready'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND (
-               SELECT c.status FROM account_calibrations c
-               WHERE c.account_id = a.id
-               ORDER BY c.created_at DESC
-               LIMIT 1
-             ) = 'succeeded'""",
-        {"platform": platform},
-    )
+    account_summary = await real_run_account_risk_summary(platform)
     selector_ready = platform_selectors_complete(selector_config, platform)
     adapter_kind = platform_real_adapter_kind(selector_config, platform)
     adapter_enabled = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
     evidence = await validate_real_run_evidence(lottery, account_id=account_id)
     blockers = list(evidence["blockers"])
-    if not int(safe_accounts["cnt"] or 0):
+    if not account_summary["ready_accounts"]:
         blockers.insert(0, "no_calibrated_ready_account")
+    elif account_id is None and not account_summary["runnable_accounts"]:
+        blockers.insert(0, "recent_account_risk_event")
     if not adapter_enabled:
         blockers.insert(0, "real_adapter_not_enabled")
     if not real_run_enabled:
@@ -291,7 +378,9 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
         "adapter_kind": adapter_kind,
         "selector_ready": selector_ready,
         "api_adapter_ready": adapter_kind == "api",
-        "safe_accounts": int(safe_accounts["cnt"] or 0),
+        "safe_accounts": account_summary["ready_accounts"],
+        "risk_clear_accounts": account_summary["runnable_accounts"],
+        "account_risk": evidence["account_risk"] or account_summary["latest_recent_risk"],
         "probe_ready": evidence["probe_ready"],
         "shadow_ready": evidence["shadow_ready"],
         "action_plan_ready": evidence["action_plan_ready"],

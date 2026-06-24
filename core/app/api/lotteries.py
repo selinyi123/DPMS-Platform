@@ -1401,7 +1401,50 @@ async def pick_account(account_id: int | None, platform: str):
     recommendations = await load_strategy_account_recommendations(platform)
     recommended = first_or_none(recommendations.get(platform, []))
     if recommended:
-        return await database.fetch_one("SELECT * FROM accounts WHERE id = :id", {"id": recommended["account_id"]})
+        row = await database.fetch_one(
+            """SELECT * FROM accounts a
+               WHERE a.id = :id
+                 AND a.platform = :platform
+                 AND a.status = 'ready'
+                 AND OCTET_LENGTH(a.encrypted_credential) > 0
+                 AND (
+                   SELECT c.status FROM account_calibrations c
+                   WHERE c.account_id = a.id
+                   ORDER BY c.created_at DESC
+                   LIMIT 1
+                 ) = 'succeeded'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM risk_events r
+                   WHERE r.account_id = a.id
+                     AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                 )""",
+            {"id": recommended["account_id"], "platform": platform},
+        )
+        if row:
+            return row
+
+    risk_clear = await database.fetch_one(
+        """SELECT * FROM accounts a
+           WHERE a.platform = :platform
+             AND a.status = 'ready'
+             AND OCTET_LENGTH(a.encrypted_credential) > 0
+             AND (
+               SELECT c.status FROM account_calibrations c
+               WHERE c.account_id = a.id
+               ORDER BY c.created_at DESC
+               LIMIT 1
+             ) = 'succeeded'
+             AND NOT EXISTS (
+               SELECT 1 FROM risk_events r
+               WHERE r.account_id = a.id
+                 AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             )
+           ORDER BY daily_task_count ASC, id ASC
+           LIMIT 1""",
+        {"platform": platform},
+    )
+    if risk_clear:
+        return risk_clear
 
     return await database.fetch_one(
         """SELECT * FROM accounts a

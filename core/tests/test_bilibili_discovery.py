@@ -1,6 +1,7 @@
 import unittest
 
-from app.services.bilibili_discovery import parse_dynamic_item
+from app.services.bilibili_discovery import parse_dynamic_item, parse_search_item
+from app.services.discovery import split_keywords
 from app.services.lottery_rules import parse_lottery_rule
 
 
@@ -66,6 +67,24 @@ class BilibiliDiscoveryTests(unittest.TestCase):
         }
 
         self.assertIsNone(parse_dynamic_item(item))
+
+    def test_parses_keyword_search_dynamic_result(self):
+        item = {
+            "dynamic_id": "1217003060937621510",
+            "title": "<em class=\"keyword\">抽奖</em>福利",
+            "description": "关注我，点赞并转发，评论区留言参与。",
+            "pubdate": 1710000000,
+        }
+
+        candidate = parse_search_item(item)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual("https://t.bilibili.com/1217003060937621510", candidate.url)
+        self.assertEqual(["followed", "liked", "commented", "reposted"], candidate.action_plan["required_actions"])
+        self.assertFalse(candidate.action_plan["review_required"])
+
+    def test_keyword_split_accepts_common_separators(self):
+        self.assertEqual(split_keywords("互动抽奖, 福利\n转发抽奖；  "), ["互动抽奖", "福利", "转发抽奖"])
 
 
 if __name__ == "__main__":

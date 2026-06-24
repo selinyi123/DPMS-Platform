@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from urllib.parse import unquote
 
 from app.db import database
-from app.services.bilibili_discovery import fetch_bilibili_space_dynamics
+from app.services.bilibili_discovery import fetch_bilibili_keyword_search, fetch_bilibili_space_dynamics
 from app.utils.cookies import parse_cookie_payload
 from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 from app.utils.canonicalizer import canonicalize_platform_url
@@ -99,6 +99,8 @@ async def fetch_candidates_for_source(source) -> list[dict]:
         return [{"raw_url": url} for url in extract_urls(source["source_value"])]
     if source["platform"] == "bilibili" and source["source_type"] == "up":
         return await fetch_up_dynamics(source["source_value"])
+    if source["platform"] == "bilibili" and source["source_type"] == "keyword":
+        return await fetch_keyword_dynamics(source["source_value"])
     return []
 
 
@@ -187,6 +189,40 @@ async def fetch_up_dynamics(up_uid: str):
         }
         for item in items
     ]
+
+
+async def fetch_keyword_dynamics(source_value: str):
+    cookie_header = await try_load_bilibili_discovery_cookie_header()
+    candidates = []
+    for keyword in split_keywords(source_value):
+        items = await fetch_bilibili_keyword_search(keyword, cookie_header=cookie_header)
+        candidates.extend(
+            {
+                "raw_url": item.url,
+                "title": item.title,
+                "rule_text": item.rule_text,
+                "published_at": item.published_at,
+                "action_plan": item.action_plan,
+            }
+            for item in items
+        )
+    deduped = {}
+    for candidate in candidates:
+        deduped.setdefault(candidate["raw_url"], candidate)
+    return list(deduped.values())
+
+
+def split_keywords(value: str) -> list[str]:
+    parts = re.split(r"[\n,，;；]+", str(value or ""))
+    return [part.strip() for part in parts if part.strip()]
+
+
+async def try_load_bilibili_discovery_cookie_header() -> str | None:
+    try:
+        return await load_bilibili_discovery_cookie_header()
+    except Exception as exc:
+        structured_log("warning", "bilibili_keyword_search_without_cookie", exception=exc)
+        return None
 
 
 async def load_bilibili_discovery_cookie_header() -> str:

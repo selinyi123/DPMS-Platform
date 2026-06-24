@@ -44,6 +44,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 最近 Bilibili 发现节点：自动发现已从抽奖合集动态扩散到 UP 源池，本地验证新增 80 个 Bilibili UP 追踪源、70 个候选目标，并完成 ID 72 shadow-run 成功验证，详见 [[DPMS_BilibiliDiscoveryExpansion_实施记录_20260624]]
 - 最近 Bilibili 安全修复：修复规则识别建议与已保存执行计划不同步导致 real-run 漏动作的问题；新增 `lottery_action_plan_stale` 门禁，详见 [[DPMS_BilibiliRulePlanSafety_实施记录_20260624]]
 - 最近 Bilibili 补做能力：新增 missing-action repair，只补做真实执行中缺失的动作，避免完整重跑造成重复交互，详见 [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]]
+- 最近 Bilibili 风险感知更新：关键词发现开始真正接入 Bilibili 搜索，real-run 门禁新增账号近期风险冷却解释，前端显示全局 real-run 开关、账号池和冷却截止时间，详见 [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]]
 - 最近硬化：运行时可信度硬化（P0→P1→P2→生产基线：默认鉴权、派发原子化+outbox、Governance 唯一 real-run 权威、密文上下文绑定、关键事件死信、production 密钥校验+安全头+前端 auth guard+版本化迁移），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]、[[DPMS_V10-V13_运营规模化_后续版本规划_20260614]]
 - 测试基线：core **341 项** + worker 21 项单元测试通过
@@ -69,6 +70,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliDiscoveryExpansion_实施记录_20260624]]
 - [[DPMS_BilibiliRulePlanSafety_实施记录_20260624]]
 - [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]]
+- [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]

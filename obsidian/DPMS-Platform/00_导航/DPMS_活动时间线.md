@@ -116,6 +116,7 @@ updated: 2026-06-24
 | `e872913` | Bilibili 自动发现从合集动态扩散到 UP 源池，新增 80 个追踪源、70 个候选目标，并完成 ID 72 shadow-run 成功验证 | [[DPMS_BilibiliDiscoveryExpansion_实施记录_20260624]] |
 | 本次提交 | 修复 Bilibili real-run 规则计划过期与验证任务误入动作窗口问题；前端显式区分已保存执行计划、草稿和规则识别建议 | [[DPMS_BilibiliRulePlanSafety_实施记录_20260624]] |
 | 本次提交 | 新增 Bilibili missing-action repair：从事件流识别已完成真实动作，只补做缺失动作，避免完整重跑造成重复交互 | [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]] |
+| 本次提交 | 新增 Bilibili 关键词发现、账号近期风险冷却门禁与前端 real-run 风险解释；L72 缺失动作仍被全局开关和账号冷却阻断 | [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]] |
 
 ## 记录原则
 

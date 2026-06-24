@@ -53,6 +53,7 @@ export default function Lotteries() {
     [accounts],
   );
 
+  const realRunEnabled = Boolean(realRunEvidence[0]?.real_run_enabled);
   const safeAccountCount = platformId => safeAccounts.filter(account => account.platform === platformId).length;
   const selectedSafeAccount = safeAccounts.find(account => String(account.id) === String(selectedAccount));
 
@@ -290,6 +291,9 @@ export default function Lotteries() {
             <button className={dispatchMode === 'shadow_run' ? 'active' : ''} onClick={() => setDispatchMode('shadow_run')}>{t('lotteries.shadowRun')}</button>
             <button className={dispatchMode === 'real_run' ? 'active danger' : ''} onClick={() => setDispatchMode('real_run')}>{t('lotteries.real')}</button>
           </div>
+          <span className={`badge ${realRunEnabled ? 'badge-danger' : 'badge-muted'}`}>
+            {realRunEnabled ? t('lotteries.realRunSwitchOn') : t('lotteries.realRunSwitchOff')}
+          </span>
         </div>
       </header>
 
@@ -532,6 +536,7 @@ export default function Lotteries() {
                 const gateCanRunNext = gateBlocked && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
                 const repairAvailable = Boolean(repairPlan?.eligible);
                 const repairBlocked = repairAvailable && (!gate?.allowed || !safeAccountCount(lottery.platform));
+                const repairBlockReason = repairBlocked ? gateTitle(gate, t) : '';
                 return (
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
@@ -564,14 +569,17 @@ export default function Lotteries() {
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
                     <button onClick={() => probe(lottery.id)} disabled={!safeAccountCount(lottery.platform)} className="btn-ghost">{t('lotteries.probe')}</button>
                     {repairAvailable && (
-                      <button
-                        onClick={() => repairMissingActions(lottery.id)}
-                        disabled={repairBlocked}
-                        title={repairBlocked ? gateTitle(gate, t) : actionSummary(repairPlan.missing_actions, t)}
-                        className="btn-danger"
-                      >
-                        {t('lotteries.repairMissing')}
-                      </button>
+                      <div className="repair-action">
+                        <button
+                          onClick={() => repairMissingActions(lottery.id)}
+                          disabled={repairBlocked}
+                          title={repairBlocked ? repairBlockReason : actionSummary(repairPlan.missing_actions, t)}
+                          className="btn-danger"
+                        >
+                          {t('lotteries.repairMissing')}
+                        </button>
+                        {repairBlocked && <div className="small-text muted-text">{repairBlockReason}</div>}
+                      </div>
                     )}
                   </td>
                   </tr>
@@ -698,7 +706,9 @@ function gateBlockerText(code, t) {
 
 function gateTitle(gate, t) {
   if (!gate?.blockers?.length) return t('lotteries.realAdapterMissing');
-  return gate.blockers.map(code => gateBlockerText(code, t)).join(' / ');
+  const reason = gate.blockers.map(code => gateBlockerText(code, t)).join(' / ');
+  const risk = riskCooldownText(gate, t);
+  return risk ? `${reason} / ${risk}` : reason;
 }
 
 function sameActionSet(left = [], right = []) {
@@ -712,20 +722,47 @@ function actionSummary(actions = [], t) {
   return actions.map(action => t(`lotteries.actions.${action}`)).join(' / ');
 }
 
+function displayTime(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function riskCooldownText(gate, t) {
+  const risk = gate?.account_risk;
+  if (!risk?.has_recent_risk) return '';
+  const account = risk.latest_event?.account_id ? `A${risk.latest_event.account_id}` : t('lotteries.account');
+  return formatText(t('lotteries.riskCooldownUntil'), {
+    account,
+    time: displayTime(risk.cooldown_until),
+  });
+}
+
 function RealGateCell({ gate, t }) {
   if (!gate) return <span className="badge badge-muted">{t('lotteries.gateUnknown')}</span>;
   const repairPlan = gate.repair_plan;
+  const riskText = riskCooldownText(gate, t);
   return (
     <div className="gate-cell">
       <span className={`badge ${gate.allowed ? 'badge-ready' : 'badge-warn'}`}>
         {gate.allowed ? t('lotteries.gateReady') : t('lotteries.gateBlocked')}
       </span>
+      <div className="small-text muted-text">
+        {formatText(t('lotteries.realRunAccountPool'), {
+          ready: gate.safe_accounts ?? 0,
+          runnable: gate.risk_clear_accounts ?? gate.safe_accounts ?? 0,
+        })}
+      </div>
       <div className="blocker-list compact-blockers">
         {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
       </div>
-      {!!repairPlan?.completed_actions?.length && (
+      {riskText && <div className="small-text warning-text">{riskText}</div>}
+      {!!(repairPlan?.completed_actions?.length || repairPlan?.missing_actions?.length) && (
         <div className="repair-plan-summary">
-          <div className="small-text">{formatText(t('lotteries.repairCompletedActions'), { actions: actionSummary(repairPlan.completed_actions, t) })}</div>
+          {!!repairPlan.completed_actions?.length && (
+            <div className="small-text">{formatText(t('lotteries.repairCompletedActions'), { actions: actionSummary(repairPlan.completed_actions, t) })}</div>
+          )}
           {!!repairPlan.missing_actions?.length && (
             <div className="small-text">{formatText(t('lotteries.repairMissingActions'), { actions: actionSummary(repairPlan.missing_actions, t) })}</div>
           )}

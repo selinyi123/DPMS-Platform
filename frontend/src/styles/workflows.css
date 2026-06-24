@@ -404,6 +404,12 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.repair-action {
+  display: grid;
+  gap: 4px;
+  max-width: 220px;
+}
+
 .blocker-list {
   display: flex;
   gap: 6px;
@@ -646,6 +652,10 @@ button:disabled {
 .badge-danger {
   background: var(--danger-bg);
   color: var(--danger-text);
+}
+
+.warning-text {
+  color: var(--warning-text);
 }
 
 .badge-muted {
