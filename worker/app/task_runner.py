@@ -6,12 +6,23 @@ import uuid
 from pathlib import Path
 
 from app.adapters.registry import get_adapter
+from app.bilibili.client import BilibiliApiClient
+from app.bilibili.config import BiliEngineConfig
+from app.bilibili.executor import BilibiliApiExecutor
+from app.bilibili.runtime import (
+    API_TO_DPMS_PHASE,
+    account_status_for_results,
+    dpms_phases_to_api_actions,
+    extract_bilibili_dynamic_id,
+    parse_detail_card,
+    validate_card_for_actions,
+)
 from app.browser_pool import BrowserPool
 from app.db import database, redis
 from app.event_store.service import record_event
-from app.safety import detect_page_risk, ensure_account_can_run
+from app.safety import detect_page_risk, ensure_account_can_run, set_account_status
 from app.utils.log import structured_log
-from app.utils.cookies import inject_account_cookies
+from app.utils.cookies import credential_to_cookie_header, inject_account_cookies
 from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 
 
@@ -335,6 +346,96 @@ async def execute_real_task(task: dict, adapter, pool):
         await page.close()
 
 
+def uses_bilibili_api_real_task(task: dict) -> bool:
+    return str(task.get("platform") or "").lower() == "bilibili"
+
+
+async def execute_bilibili_api_real_task(task: dict):
+    task_id = task.get("task_id")
+    account_id = int(task.get("account_id"))
+    lottery_id = int(task.get("lottery_id"))
+    phases = requested_phases(task, require_plan=True)
+    current_phase = await get_latest_phase(task_id) or "init"
+    if current_phase == "completed":
+        return
+    if current_phase not in PHASE_ORDER and current_phase != "init":
+        return
+    if current_phase == "init":
+        remaining_phases = phases
+    else:
+        completed_index = PHASE_ORDER.index(current_phase)
+        remaining_phases = [phase for phase in phases if PHASE_ORDER.index(phase) > completed_index]
+    if not remaining_phases:
+        await save_phase(task_id, account_id, lottery_id, "completed")
+        return
+
+    dynamic_id = extract_bilibili_dynamic_id(task.get("raw_url"), task.get("canonical_url"))
+    actions = dpms_phases_to_api_actions(remaining_phases)
+    cookie_header = credential_to_cookie_header(await load_account_credential(account_id))
+    if not cookie_header:
+        raise RuntimeError(f"Account {account_id} has no usable Bilibili Cookie")
+
+    async with BilibiliApiClient(cookie_header, config=BiliEngineConfig()) as client:
+        if not await client.check_login():
+            await set_account_status(account_id, "login_required", "bilibili_cookie_invalid")
+            raise RuntimeError("Bilibili account Cookie is invalid or expired")
+
+        detail = await client.get_dynamic_detail(dynamic_id)
+        if int(detail.get("code", -1)) != 0:
+            raise RuntimeError(f"Bilibili dynamic detail failed: code={detail.get('code')}")
+        card = parse_detail_card(detail, dynamic_id)
+        validate_card_for_actions(card, actions)
+
+        result = await BilibiliApiExecutor(client, client.config).participate(card, actions)
+        for action, action_result in result.actions.items():
+            await record_event(
+                aggregate="task",
+                aggregate_id=task_id,
+                event_type="BilibiliApiActionCompleted",
+                payload={
+                    "account_id": account_id,
+                    "lottery_id": lottery_id,
+                    "dynamic_id": result.dynamic_id,
+                    "action": action,
+                    "code": action_result.code,
+                    "outcome": action_result.outcome.value,
+                    "message": action_result.message,
+                },
+                correlation_id=task_id,
+            )
+            phase = API_TO_DPMS_PHASE.get(action)
+            if phase and action_result.ok:
+                await save_phase(task_id, account_id, lottery_id, phase)
+
+        status_change = account_status_for_results(result.actions)
+        if status_change:
+            status, reason = status_change
+            await set_account_status(account_id, status, reason)
+
+        await record_event(
+            aggregate="task",
+            aggregate_id=task_id,
+            event_type="BilibiliApiRealRunExecuted",
+            payload={
+                "account_id": account_id,
+                "lottery_id": lottery_id,
+                "requested_dynamic_id": dynamic_id,
+                "executed_dynamic_id": result.dynamic_id,
+                "actions": list(result.actions.keys()),
+                "success": result.success,
+                "aborted": result.aborted,
+                "abort_reason": result.abort_reason,
+            },
+            correlation_id=task_id,
+        )
+        if not result.success:
+            details = "; ".join(
+                f"{name}={res.outcome.value}(code={res.code})" for name, res in result.actions.items()
+            )
+            raise RuntimeError(result.abort_reason or f"bilibili_api_real_run_failed: {details}")
+        await save_phase(task_id, account_id, lottery_id, "completed")
+
+
 async def capture_failure_screenshot(page, task_id: str) -> str | None:
     try:
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -386,15 +487,19 @@ async def capture_shadow_screenshot(page, task_id: str, account_id: int, lottery
         return None
 
 
-async def prepare_account_login(ctx, account_id: int, platform: str):
+async def load_account_credential(account_id: int) -> str:
     row = await database.fetch_one("SELECT encrypted_credential FROM accounts WHERE id = :id", {"id": account_id})
     if not row or not row["encrypted_credential"]:
         raise ValueError(f"Account {account_id} has no imported login Cookie")
     credential_blob = row["encrypted_credential"]
     try:
-        credential = cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
+        return cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
     except Exception:
-        credential = credential_blob.decode("utf-8") if isinstance(credential_blob, bytes) else str(credential_blob)
+        return credential_blob.decode("utf-8") if isinstance(credential_blob, bytes) else str(credential_blob)
+
+
+async def prepare_account_login(ctx, account_id: int, platform: str):
+    credential = await load_account_credential(account_id)
     await inject_account_cookies(ctx, platform, credential)
 
 
@@ -448,7 +553,7 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     lottery_id = int(task.get("lottery_id"))
     task_mode = normalize_task_mode(task)
     try:
-        if task_mode == "real_run" and not getattr(adapter, "REAL_ACTIONS", False):
+        if task_mode == "real_run" and not uses_bilibili_api_real_task(task) and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
         await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         await mark_task_started(task_id, account_id, lottery_id, task_mode, stream_message_id)
@@ -456,6 +561,8 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
             await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))
         elif task_mode == "shadow_run":
             await execute_shadow_run(task, adapter, pool)
+        elif uses_bilibili_api_real_task(task):
+            await execute_bilibili_api_real_task(task)
         else:
             await execute_real_task(task, adapter, pool)
         await mark_task_finished(task_id, account_id, lottery_id, task_mode, True)

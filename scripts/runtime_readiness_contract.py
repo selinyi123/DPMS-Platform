@@ -40,7 +40,7 @@ REQUIRED_MARKERS = {
         "TASK_OUTBOX_SENDING_RECLAIM_SECONDS",
     ],
     "VERSION.md": [
-        "Real-run Status: Gated / Calibration Required",
+        "Real-run Status: Gated / Bilibili API Adapter Wired",
         "Production Readiness: Not Ready",
     ],
 }

@@ -3,10 +3,10 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.13
-Architecture Stage: S15 / Controlled Runtime Readiness Contract
-Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
-Real-run Status: Gated / Calibration Required
+Product Version: 0.3.14
+Architecture Stage: S16 / Bilibili API Real-run Integration
+Runtime Stage: Bilibili API Real-run Path + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
+Real-run Status: Gated / Bilibili API Adapter Wired
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
 ```
@@ -20,7 +20,7 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 3. Import or discover lottery targets.
 4. Parse and review action plans.
 5. Run dry-run and shadow-run with evidence capture.
-6. Gate real-run behind selector calibration, policy decisions, circuit breakers, confirmation, and runtime settings.
+6. Gate real-run behind API/selector adapter readiness, policy decisions, circuit breakers, confirmation, and runtime settings.
 7. Record evidence, events, notifications, audit logs, policy decisions, transition history, recovery state, dead-letter state, and terminal outbox events.
 8. Enforce production schema changes through versioned migrations rather than startup self-heal DDL.
 9. Manage persistent browser contexts with TTL, idle eviction, capacity control, and per-account memory attribution.
@@ -30,7 +30,7 @@ DPMS currently targets a compliant, operator-gated automation runtime:
 13. Provide an explicit controlled browser lifecycle smoke harness with Chromium launch/context/close verification inside the worker container.
 14. Provide a static runtime readiness contract gate for stream, worker lease, outbox, and dead-letter readiness anchors.
 
-Real-run is intentionally not treated as production-ready until the Bilibili selector calibration and evidence gates pass in controlled small-scale validation.
+Real-run is intentionally not treated as production-ready until Bilibili dynamic targets pass account calibration, shadow-run evidence, governance gate, global switch, and controlled small-scale validation.
 
 ## Version Labels
 
@@ -64,7 +64,7 @@ python scripts/runtime_readiness_contract.py
 ## Next Key Node
 
 ```text
-Product Version: 0.3.14
-Target: Controlled Runtime Readiness Execution Node
-Scope: opt-in read-only DB/Redis readiness checks, queue idle checks, worker heartbeat check, no account login, no page navigation, no task dispatch
+Product Version: 0.3.15
+Target: Controlled Bilibili Live Validation Node
+Scope: opt-in Bilibili API self-test with a low-risk account, one dynamic target, shadow evidence, and manually confirmed real-run gate; no captcha bypass and no anti-bot evasion
 ```

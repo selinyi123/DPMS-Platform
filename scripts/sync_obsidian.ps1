@@ -54,6 +54,7 @@ $mappings = @(
     @{ Source = "docs\DPMS_BilibiliTargetValidation_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliTargetValidation_实施记录_20260609.md" },
     @{ Source = "docs\DPMS_BilibiliOfficialQrLogin_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliOfficialQrLogin_实施记录_20260609.md" },
     @{ Source = "docs\DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609.md" },
+    @{ Source = "docs\DPMS_BilibiliApiRealRun_实施记录_20260624.md"; Destination = "04_Bilibili里程碑\DPMS_BilibiliApiRealRun_实施记录_20260624.md" },
     @{ Source = "docs\DPMS_FrontendTheme_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_FrontendTheme_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_NotificationSecretBundle_实施记录_20260608.md"; Destination = "05_运维安全与前端\DPMS_NotificationSecretBundle_实施记录_20260608.md" },
     @{ Source = "docs\DPMS_最终搭建审阅与漏洞清单_20260602.md"; Destination = "06_审查与风险\DPMS_最终搭建审阅与漏洞清单_20260602.md" },
@@ -103,7 +104,8 @@ foreach ($name in $legacyMappings) {
     $source = Join-Path $legacyRoot $name
     $destination = Join-Path $destinationRoot ("01_项目基线\历史恢复资料\" + $name)
     if (-not (Test-Path -LiteralPath $source)) {
-        throw "Legacy source file missing: $source"
+        Write-Warning "Legacy source file missing; skipped: $source"
+        continue
     }
     if (-not $VerifyOnly) {
         Copy-Item -LiteralPath $source -Destination $destination -Force

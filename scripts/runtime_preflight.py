@@ -122,7 +122,7 @@ def check_runtime_status_contract() -> None:
         raise CheckFailure("VERSION.md missing Product Version: 0.3.x")
     for required in [
         "Production Readiness: Not Ready",
-        "Real-run Status: Gated / Calibration Required",
+        "Real-run Status: Gated / Bilibili API Adapter Wired",
     ]:
         if required not in text:
             raise CheckFailure(f"VERSION.md missing: {required}")

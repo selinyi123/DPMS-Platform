@@ -328,6 +328,7 @@ export const dictionaries = {
       },
       realGateBlockers: {
         invalid_lottery_target: '活动 URL 不可执行',
+        bilibili_dynamic_target_required: 'Bilibili API 执行需要动态/opus 链接',
         lottery_action_plan_required: '缺少动作计划',
         lottery_rule_review_required: '活动规则待确认',
         lottery_required_actions_missing: '未识别参与动作',
@@ -1457,6 +1458,7 @@ export const dictionaries = {
       },
       realGateBlockers: {
         invalid_lottery_target: 'Target URL is not actionable',
+        bilibili_dynamic_target_required: 'Bilibili API execution requires a dynamic/opus URL',
         lottery_action_plan_required: 'Action plan missing',
         lottery_rule_review_required: 'Activity rule needs review',
         lottery_required_actions_missing: 'No required actions found',

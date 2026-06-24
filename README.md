@@ -13,10 +13,10 @@ DPMS 是一个多平台抽奖活动管理、账号资产治理与证据化运行
 ## 当前版本状态
 
 ```text
-Product Version: 0.3.13
-Architecture Stage: S15 / Controlled Runtime Readiness Contract
-Runtime Stage: Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
-Real-run Status: Gated / Calibration Required
+Product Version: 0.3.14
+Architecture Stage: S16 / Bilibili API Real-run Integration
+Runtime Stage: Bilibili API Real-run Path + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
+Real-run Status: Gated / Bilibili API Adapter Wired
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
 ```
@@ -27,7 +27,7 @@ Primary Platform: Bilibili first, other platforms remain plugin/calibration trac
 
 - 多平台账号池：支持二维码登录会话和 Cookie 导入，账号状态通过校准流程进入可用状态。
 - 活动目标管理：支持目标上传、活动池、规则解析、action plan 审核和 canonical URL 去重。
-- 执行分层：支持 dry-run、shadow-run、real-run 门禁；real-run 默认关闭。
+- 执行分层：支持 dry-run、shadow-run、real-run 门禁；Bilibili 动态/opus 目标已接入 API real-run 通道，real-run 默认关闭。
 - 队列与恢复：使用 Redis Streams consumer group、pending recovery、worker heartbeat、lease、dead-letter 与 outbox 结构。
 - 事务一致性：正常 dispatch 使用 DB transaction + outbox row + relay，降低 DB/Redis 双写不一致风险。
 - 浏览器生命周期：支持 persistent browser context、TTL、idle eviction、capacity guard、context reaper 和内存归因。
@@ -38,7 +38,7 @@ Primary Platform: Bilibili first, other platforms remain plugin/calibration trac
 
 - `REAL_RUN_ENABLED=false` 是默认安全姿态。
 - `DEPLOYMENT_MODE=production` 时，系统会拒绝使用默认 `ADMIN_TOKEN`、默认 `UPDATE_SECRET` 或空 `ENCRYPTION_KEY` 启动。
-- real-run 不是默认能力；必须通过账号校准、selector probe、evidence gate、策略门禁、熔断器和二次确认。
+- real-run 不是默认能力；必须通过账号校准、API/selector adapter readiness、evidence gate、策略门禁、熔断器和二次确认。
 - shadow-run 当前属于“认证态观察型运行”：可能打开真实目标页面并读取页面状态，但不执行点击/互动动作。
 - 本项目的账号安全目标是合规限速、风险识别、账号隔离，以及在需要人工处理时停止并通知。
 
@@ -133,6 +133,7 @@ cd ../worker; python -m unittest discover -s tests
 - `docs/DPMS_v0.3.9_Runtime_Preflight_20260621.md`：runtime preflight 说明。
 - `docs/version-runtime-note.md`：运行时版本号统一的剩余限制。
 - `docs/DPMS_运行时可信度硬化_实施记录_20260614.md`
+- `docs/DPMS_BilibiliApiRealRun_实施记录_20260624.md`
 - `docs/DPMS_总设计方案_v1_20260611.md`
 
 ## 当前未合入分支说明

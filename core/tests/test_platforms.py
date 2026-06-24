@@ -12,6 +12,7 @@ from app.adapter_config import SELECTOR_B64_ENV, SELECTOR_ENV  # noqa: E402
 from app.platforms import get_platform  # noqa: E402
 
 STRUCTURED = ("bilibili", "weibo", "douyin", "xiaohongshu")
+SELECTOR_GATED = ("weibo", "douyin", "xiaohongshu")
 
 
 def _complete_config(platform):
@@ -39,10 +40,15 @@ class PlatformAdapterStatusTests(unittest.TestCase):
                 os.environ[key] = value
 
     def test_no_selector_config_stays_calibration_required(self):
-        for platform in STRUCTURED:
+        for platform in SELECTOR_GATED:
             cfg = get_platform(platform)
             self.assertFalse(cfg["action_adapter"], platform)
             self.assertEqual(cfg["adapter_status"], "calibration_required", platform)
+
+    def test_bilibili_api_adapter_is_enabled_without_selectors(self):
+        cfg = get_platform("bilibili")
+        self.assertTrue(cfg["action_adapter"])
+        self.assertEqual(cfg["adapter_status"], "configured")
 
     def test_complete_selector_config_enables_adapter(self):
         """A complete selector config flips action_adapter on for EVERY structured
@@ -54,21 +60,18 @@ class PlatformAdapterStatusTests(unittest.TestCase):
             self.assertEqual(cfg["adapter_status"], "configured", platform)
             os.environ.pop(SELECTOR_ENV, None)
 
-    def test_bilibili_not_special_cased(self):
-        """Bilibili must behave identically to the other structured platforms."""
-        os.environ[SELECTOR_ENV] = json.dumps(_complete_config("bilibili"))
-        bilibili = get_platform("bilibili")
-        os.environ[SELECTOR_ENV] = json.dumps(_complete_config("weibo"))
-        weibo = get_platform("weibo")
-        self.assertEqual(bilibili["action_adapter"], weibo["action_adapter"])
-        self.assertEqual(bilibili["adapter_status"], weibo["adapter_status"])
+    def test_bilibili_no_longer_depends_on_selector_config(self):
+        os.environ[SELECTOR_ENV] = json.dumps({"bilibili": {}})
+        cfg = get_platform("bilibili")
+        self.assertTrue(cfg["action_adapter"])
+        self.assertEqual(cfg["adapter_status"], "configured")
 
     def test_incomplete_config_does_not_enable(self):
         # Missing the commented input/submit group -> not complete.
         os.environ[SELECTOR_ENV] = json.dumps(
-            {"bilibili": {"followed": ["x"], "liked": ["y"], "reposted": ["z"]}}
+            {"weibo": {"followed": ["x"], "liked": ["y"], "reposted": ["z"]}}
         )
-        cfg = get_platform("bilibili")
+        cfg = get_platform("weibo")
         self.assertFalse(cfg["action_adapter"])
         self.assertEqual(cfg["adapter_status"], "calibration_required")
 

@@ -7,7 +7,7 @@ tags:
   - 项目管理
   - 自动化
 status: active
-updated: 2026-06-13
+updated: 2026-06-24
 ---
 
 # DPMS-Platform
@@ -34,12 +34,13 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 
 ## 当前状态
 
-- 当前运行版本：`v13.0-local`（V5.5–V9 认知阶梯 + V10 Scheduling / V11 Capacity / V12 Orchestration / V13 Throughput 运营规模化主线已落地）
+- 当前运行版本：`v0.3.14-local`（V5.5–V9 认知阶梯 + V10 Scheduling / V11 Capacity / V12 Orchestration / V13 Throughput 运营规模化主线 + Bilibili API real-run 受控执行链）
 - 当前优先平台：Bilibili
 - 平台状态：微博、小红书、抖音均已接入选择器驱动执行链路，处于 `calibration_required` 阶段
 - 本机入口：`http://localhost/`
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`（开发分支 `claude/code-review-ul0pqt`）
 - 最近功能提交：运营规模化主线 V10–V13（Scheduling / Capacity / Orchestration / Throughput，四个只读 advisory 运行时；编排时间→资源→广度→可持续），详见 [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]]
+- 最近 Bilibili 执行节点：Bilibili 动态/opus 目标已接入 API real-run 通道，仍受账号校准、shadow-run、Governance gate、熔断器、全局开关和管理员确认约束，详见 [[DPMS_BilibiliApiRealRun_实施记录_20260624]]
 - 最近硬化：运行时可信度硬化（P0→P1→P2→生产基线：默认鉴权、派发原子化+outbox、Governance 唯一 real-run 权威、密文上下文绑定、关键事件死信、production 密钥校验+安全头+前端 auth guard+版本化迁移），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]、[[DPMS_V10-V13_运营规模化_后续版本规划_20260614]]
 - 测试基线：core **314 项**（V10–V13 后 242 + 硬化新增 72）+ worker 21 项单元测试通过
@@ -61,6 +62,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliTargetValidation_实施记录_20260609]]
 - [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]]
 - [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]]
+- [[DPMS_BilibiliApiRealRun_实施记录_20260624]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]

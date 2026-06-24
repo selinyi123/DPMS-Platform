@@ -6,7 +6,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.adapter_config import load_runtime_selector_config, selector_config_complete
+from app.adapter_config import (
+    load_runtime_selector_config,
+    platform_has_runtime_real_adapter,
+    platform_real_adapter_kind,
+    selector_config_complete,
+)
 from app.db import database, redis
 from app.event_store.service import record_event
 from app.api.notify import configured_channels
@@ -118,8 +123,10 @@ async def readiness():
         probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
 
         runtime_adapter_ready = platform_selectors_complete(selector_config, platform)
-        action_adapter_enabled = bool(cfg.get("action_adapter")) or runtime_adapter_ready
-        real_actions_ready = action_adapter_enabled and bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+        adapter_kind = platform_real_adapter_kind(selector_config, platform)
+        action_adapter_enabled = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
+        probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+        real_actions_ready = action_adapter_enabled and (adapter_kind == "api" or probe_ready)
 
         blockers = []
         blocker_codes = []
@@ -134,7 +141,7 @@ async def readiness():
             blockers.append("real adapter not enabled")
             blocker_codes.append("real_adapter_not_enabled")
 
-        if action_adapter_enabled and not real_actions_ready:
+        if action_adapter_enabled and adapter_kind != "api" and not real_actions_ready:
 
             blockers.append("adapter probe is incomplete")
             blocker_codes.append("adapter_probe_incomplete")
@@ -158,7 +165,8 @@ async def readiness():
 
                 "cookie_login": bool(cfg.get("cookie_login")),
 
-                "adapter_status": "configured" if runtime_adapter_ready else cfg.get("adapter_status", "planned"),
+                "adapter_status": "configured" if action_adapter_enabled else cfg.get("adapter_status", "planned"),
+                "adapter_kind": adapter_kind,
 
                 "action_adapter": action_adapter_enabled,
 
@@ -449,7 +457,7 @@ def build_next_actions(platforms, summary):
 
             })
 
-        if platform["action_adapter"] and not platform["real_actions_ready"]:
+        if platform["action_adapter"] and platform.get("adapter_kind") != "api" and not platform["real_actions_ready"]:
 
             actions.append({
 

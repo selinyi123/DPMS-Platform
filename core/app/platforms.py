@@ -31,10 +31,9 @@ def get_platform(platform: str) -> dict | None:
     output = dict(cfg)
     output["action_adapter"] = False
     output["adapter_status"] = "calibration_required"
-    # A platform's real-action adapter turns on only when a complete, reviewed
-    # selector config exists for it (selector_config_complete). Bilibili is a
-    # first-class structured platform and follows the same selector-driven path
-    # as weibo/douyin/xiaohongshu — no platform is special-cased here.
+    # Native API engines and complete selector configs both count as real-action
+    # adapters; Bilibili currently uses the API path, other platforms use
+    # selector calibration.
     if platform_has_real_adapter(platform):
         output["action_adapter"] = True
         output["adapter_status"] = "configured"

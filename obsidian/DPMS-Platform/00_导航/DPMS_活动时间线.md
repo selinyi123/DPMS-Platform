@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-14
+updated: 2026-06-24
 ---
 
 # DPMS 活动时间线
@@ -107,6 +107,12 @@ updated: 2026-06-14
 | `126db99` | 生产部署基线：production 密钥校验、API/nginx 安全响应头与 CSP、日志脱敏、移除 worker SYS_ADMIN | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 | `5c49bb3` | 前端统一 auth guard：未登录不渲染数据页面，改为登录卡 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
 | `820b44d` | 版本化 SQL 迁移框架（schema_migrations + core/migrations）+ baseline 0001 | [[DPMS_运行时可信度硬化_实施记录_20260614]] |
+
+## 2026-06-24
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| `本次提交` | Bilibili API real-run 通道接入任务运行链，学习 LotteryAutoScript 的接口经验但不复制 GPL 源码；真实执行仍受完整门禁约束 | [[DPMS_BilibiliApiRealRun_实施记录_20260624]] |
 
 ## 记录原则
 

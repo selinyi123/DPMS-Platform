@@ -9,6 +9,8 @@ from fastapi.responses import FileResponse
 from app.adapter_config import (
     PHASES as ADAPTER_PHASES,
     load_runtime_selector_config,
+    platform_has_runtime_real_adapter,
+    platform_real_adapter_kind,
     recommended_config_from_probe,
     selector_config_complete,
 )
@@ -138,8 +140,9 @@ async def list_adapters():
             "platform": key,
             "label": cfg["label"],
             "dry_run": True,
-            "real_actions": cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, key),
-            "adapter_status": "configured" if platform_selectors_complete(selector_config, key) else cfg.get("adapter_status", "planned"),
+            "real_actions": cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, key),
+            "adapter_status": "configured" if platform_has_runtime_real_adapter(selector_config, key) else cfg.get("adapter_status", "planned"),
+            "adapter_kind": platform_real_adapter_kind(selector_config, key),
             "phases": PHASES,
             "notes": "real actions require gray calibration"
             if cfg.get("action_adapter") or platform_selectors_complete(selector_config, key)
@@ -164,7 +167,9 @@ async def get_adapter_config_status():
         platforms.append(
             {
                 "platform": platform,
-                "configured": configured_complete,
+                "configured": configured_complete or platform_has_runtime_real_adapter(config, platform),
+                "selector_configured": configured_complete,
+                "adapter_kind": platform_real_adapter_kind(config, platform),
                 "phases": phase_status,
             }
         )
@@ -561,7 +566,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
 
     selector_config = await load_runtime_selector_config()
     platform_selectors = selector_config.get(lottery["platform"], {})
-    real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_selectors_complete(selector_config, lottery["platform"])
+    real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, lottery["platform"])
     task_mode = resolve_task_mode(data)
     dry_run = task_mode != "real_run"
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
@@ -1152,12 +1157,14 @@ async def compute_strategy_item(
     recent_risk = int(item.get("recent_platform_risk") or 0)
     probe_result = parse_json_field(item.get("latest_probe_result"))
     probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
-    adapter_ready = bool(cfg.get("action_adapter")) or platform_selectors_complete(selector_config, platform)
-    probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+    adapter_kind = platform_real_adapter_kind(selector_config, platform)
+    adapter_ready = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
     breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
     target = validate_lottery_target(platform, item["raw_url"])
+    target_real_valid = target.valid and not (adapter_kind == "api" and target.kind != "dynamic")
+    probe_ready = adapter_kind == "api" or bool(probe_summary and probe_summary.get("ready_for_real_actions"))
 
-    if target.valid:
+    if target_real_valid:
         recommended_mode, reason_codes, blockers = choose_strategy_mode(
             safe_accounts=safe_accounts,
             active_runs=active_runs,
@@ -1172,7 +1179,7 @@ async def compute_strategy_item(
     else:
         recommended_mode = "blocked"
         reason_codes = ["invalid_lottery_target"]
-        blockers = [target.reason or "invalid lottery target"]
+        blockers = [target.reason or "bilibili_dynamic_target_required"]
     if recent_risk:
         reason_codes.append("recent_platform_risk")
     if failed_runs:
@@ -1245,7 +1252,7 @@ async def compute_strategy_item(
         "probe_ready": probe_ready,
         "real_run_enabled": real_run_enabled,
         "breaker_allowed": breaker_allowed,
-        "target_valid": target.valid,
+        "target_valid": target_real_valid,
         "target_kind": target.kind,
     }
     if include_breakdown:
@@ -1256,9 +1263,11 @@ async def compute_strategy_item(
                 "blockers": blockers,
                 "breaker_allowed": breaker_allowed,
                 "breaker_reason": breaker_reason,
-                "target_valid": target.valid,
+                "target_valid": target_real_valid,
                 "target_kind": target.kind,
-                "target_error": target.reason,
+                "target_error": None
+                if target_real_valid
+                else (target.reason or "bilibili_dynamic_target_required"),
             },
             "score": score_breakdown,
             "win_probability": win_probability_breakdown,

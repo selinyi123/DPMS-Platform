@@ -7,6 +7,7 @@ from app.db import database
 
 PHASES = ("followed", "liked", "commented", "reposted")
 STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu", "douyin")
+API_REAL_ADAPTER_PLATFORMS = ("bilibili",)
 SELECTOR_ENV = "DPMS_ADAPTER_SELECTORS"
 SELECTOR_B64_ENV = "DPMS_ADAPTER_SELECTORS_B64"
 
@@ -45,13 +46,37 @@ def decode_b64(value: str) -> str:
 
 
 def platform_has_real_adapter(platform: str) -> bool:
+    if platform_has_api_real_adapter(platform):
+        return True
     configured = load_selector_config().get(platform, {})
     return selector_config_complete(platform, configured)
 
 
 async def platform_has_real_adapter_async(platform: str) -> bool:
+    if platform_has_api_real_adapter(platform):
+        return True
     configured = (await load_runtime_selector_config()).get(platform, {})
     return selector_config_complete(platform, configured)
+
+
+def platform_has_api_real_adapter(platform: str) -> bool:
+    return platform in API_REAL_ADAPTER_PLATFORMS
+
+
+def platform_has_runtime_real_adapter(selector_config: dict, platform: str) -> bool:
+    if platform_has_api_real_adapter(platform):
+        return True
+    configured = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
+    return selector_config_complete(platform, configured)
+
+
+def platform_real_adapter_kind(selector_config: dict, platform: str) -> str:
+    if platform_has_api_real_adapter(platform):
+        return "api"
+    configured = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
+    if selector_config_complete(platform, configured):
+        return "selector"
+    return "none"
 
 
 def selector_config_complete(platform: str, configured: dict) -> bool:

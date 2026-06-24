@@ -1,6 +1,14 @@
 import json
 
-from app.adapter_config import STRUCTURED_SELECTOR_PLATFORMS, click_selectors, selector_config_complete, selector_values
+from app.adapter_config import (
+    STRUCTURED_SELECTOR_PLATFORMS,
+    click_selectors,
+    platform_has_api_real_adapter,
+    platform_has_runtime_real_adapter,
+    platform_real_adapter_kind,
+    selector_config_complete,
+    selector_values,
+)
 from app.db import database, redis
 from app.platforms import get_platform
 from app.utils.log import structured_log
@@ -40,6 +48,8 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
     if not target.valid:
         blockers.append("invalid_lottery_target")
+    if platform_has_api_real_adapter(lottery["platform"]) and target.valid and target.kind != "dynamic":
+        blockers.append("bilibili_dynamic_target_required")
     lottery_data = dict(lottery)
     action_plan = parse_json_field(lottery_data.get("action_plan"))
     required_actions = action_plan.get("required_actions", []) if isinstance(action_plan, dict) else []
@@ -57,24 +67,25 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         probe_values["account_id"] = account_id
         task_values["account_id"] = account_id
 
-    probe = await database.fetch_one(
-        f"""SELECT result, status, created_at
-            FROM adapter_calibrations
-            WHERE platform = :platform
-              AND lottery_id = :lottery_id
-              AND status = 'succeeded'
-              AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-              {account_filter}
-            ORDER BY id DESC
-            LIMIT 1""",
-        probe_values,
-    )
-    probe_summary = None
-    if probe and probe["result"]:
-        probe_result = parse_json_field(probe["result"])
-        probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
-    if not probe_summary or not probe_summary.get("ready_for_real_actions"):
-        blockers.append("recent_complete_probe_required")
+    probe_summary = {"ready_for_real_actions": True, "adapter_kind": "api"} if platform_has_api_real_adapter(lottery["platform"]) else None
+    if not platform_has_api_real_adapter(lottery["platform"]):
+        probe = await database.fetch_one(
+            f"""SELECT result, status, created_at
+                FROM adapter_calibrations
+                WHERE platform = :platform
+                  AND lottery_id = :lottery_id
+                  AND status = 'succeeded'
+                  AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                  {account_filter}
+                ORDER BY id DESC
+                LIMIT 1""",
+            probe_values,
+        )
+        if probe and probe["result"]:
+            probe_result = parse_json_field(probe["result"])
+            probe_summary = probe_result.get("_summary") if isinstance(probe_result, dict) else None
+        if not probe_summary or not probe_summary.get("ready_for_real_actions"):
+            blockers.append("recent_complete_probe_required")
 
     shadow = await database.fetch_one(
         f"""SELECT task_id, finished_at
@@ -167,6 +178,8 @@ def extract_real_run_blockers(reason) -> list[str]:
 def next_action_for_blockers(blockers: list[str]) -> str:
     if "invalid_lottery_target" in blockers:
         return "add_target"
+    if "bilibili_dynamic_target_required" in blockers:
+        return "add_target"
     if any(
         blocker in blockers
         for blocker in ("lottery_action_plan_required", "lottery_rule_review_required", "lottery_required_actions_missing")
@@ -203,6 +216,9 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
     platform = lottery["platform"]
     cfg = get_platform(platform) or {}
     target = validate_lottery_target(platform, lottery["raw_url"])
+    real_run_target_valid = target.valid and not (
+        platform_has_api_real_adapter(platform) and target.kind != "dynamic"
+    )
     safe_accounts = await database.fetch_one(
         """SELECT COUNT(*) AS cnt
            FROM accounts a
@@ -218,7 +234,8 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
         {"platform": platform},
     )
     selector_ready = platform_selectors_complete(selector_config, platform)
-    adapter_enabled = bool(cfg.get("action_adapter")) or selector_ready
+    adapter_kind = platform_real_adapter_kind(selector_config, platform)
+    adapter_enabled = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
     evidence = await validate_real_run_evidence(lottery, account_id=account_id)
     blockers = list(evidence["blockers"])
     if not int(safe_accounts["cnt"] or 0):
@@ -237,15 +254,19 @@ async def real_run_gate_status(lottery, *, selector_config: dict, real_run_enabl
         "platform": platform,
         "status": lottery["status"],
         "raw_url": lottery["raw_url"],
-        "target_valid": target.valid,
+        "target_valid": real_run_target_valid,
         "target_kind": target.kind,
-        "target_error": target.reason,
+        "target_error": None
+        if real_run_target_valid
+        else (target.reason or "bilibili_dynamic_target_required"),
         "allowed": not blockers,
         "blockers": blockers,
         "next_action": next_action,
         "real_run_enabled": real_run_enabled,
         "adapter_enabled": adapter_enabled,
+        "adapter_kind": adapter_kind,
         "selector_ready": selector_ready,
+        "api_adapter_ready": adapter_kind == "api",
         "safe_accounts": int(safe_accounts["cnt"] or 0),
         "probe_ready": evidence["probe_ready"],
         "shadow_ready": evidence["shadow_ready"],

@@ -18,6 +18,7 @@ from .config import BiliEngineConfig
 from .errors import CodeResult, Outcome, classify
 from .executor import BilibiliApiExecutor, ExecutionResult
 from .parser import DynamicCard, looks_like_lottery, parse_dynamic_card, parse_feed
+from .runtime import extract_bilibili_dynamic_id
 
 __all__ = [
     "BilibiliApiClient",
@@ -32,4 +33,5 @@ __all__ = [
     "looks_like_lottery",
     "parse_dynamic_card",
     "parse_feed",
+    "extract_bilibili_dynamic_id",
 ]
