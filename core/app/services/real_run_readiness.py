@@ -11,6 +11,7 @@ from app.adapter_config import (
 )
 from app.db import database, redis
 from app.platforms import get_platform
+from app.services.lottery_rules import parse_lottery_rule
 from app.utils.log import structured_log
 from app.utils.lottery_targets import validate_lottery_target
 
@@ -43,6 +44,22 @@ def phase_configured(platform: str, config: dict, phase: str) -> bool:
     return bool(click_selectors(value))
 
 
+def action_plan_missing_rule_actions(lottery_data: dict, action_plan: dict | None) -> list[str]:
+    if not isinstance(action_plan, dict):
+        return []
+    rule_text = str(lottery_data.get("rule_text") or "").strip()
+    if not rule_text:
+        return []
+    platform = str(lottery_data.get("platform") or "bilibili")
+    suggested = parse_lottery_rule(rule_text, platform)
+    suggested_actions = suggested.get("required_actions") or []
+    saved_actions = action_plan.get("required_actions") or []
+    if not isinstance(suggested_actions, list) or not isinstance(saved_actions, list):
+        return []
+    saved = set(str(action) for action in saved_actions)
+    return [str(action) for action in suggested_actions if str(action) not in saved]
+
+
 async def validate_real_run_evidence(lottery, account_id: int | None = None) -> dict:
     blockers = []
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
@@ -59,6 +76,8 @@ async def validate_real_run_evidence(lottery, account_id: int | None = None) -> 
         blockers.append("lottery_rule_review_required")
     elif not required_actions:
         blockers.append("lottery_required_actions_missing")
+    elif action_plan_missing_rule_actions(lottery_data, action_plan):
+        blockers.append("lottery_action_plan_stale")
     probe_values = {"platform": lottery["platform"], "lottery_id": lottery["id"]}
     task_values = {"lottery_id": lottery["id"]}
     account_filter = ""
@@ -182,7 +201,12 @@ def next_action_for_blockers(blockers: list[str]) -> str:
         return "add_target"
     if any(
         blocker in blockers
-        for blocker in ("lottery_action_plan_required", "lottery_rule_review_required", "lottery_required_actions_missing")
+        for blocker in (
+            "lottery_action_plan_required",
+            "lottery_rule_review_required",
+            "lottery_required_actions_missing",
+            "lottery_action_plan_stale",
+        )
     ):
         return "review_rule"
     if "no_calibrated_ready_account" in blockers:

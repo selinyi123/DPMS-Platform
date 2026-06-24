@@ -105,9 +105,21 @@ class BilibiliShadowRunSmokeTests(unittest.TestCase):
         fake_page = FakePage(visible_selectors_for_all_phases(selectors))
         pool = FakePool(fake_page)
 
-        ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool))
+        original_ensure = task_runner.ensure_account_can_run
+        safety_calls = []
+
+        async def fail_if_safety_window_is_used(*args):
+            safety_calls.append(args)
+            raise AssertionError("shadow-run must not consume the real action safety window")
+
+        task_runner.ensure_account_can_run = fail_if_safety_window_is_used
+        try:
+            ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool))
+        finally:
+            task_runner.ensure_account_can_run = original_ensure
 
         self.assertTrue(ok)
+        self.assertEqual(safety_calls, [])
         # Shadow-run never touches the per-action phase ledger; only the
         # terminal "completed" marker is written, and no clicks happened.
         self.assertEqual(fake_db.phases, ["completed"])

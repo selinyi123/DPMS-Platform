@@ -5,6 +5,8 @@ import StatusBadge from '../components/StatusBadge';
 import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
+const LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
+
 export default function Lotteries() {
   const { notify, t } = useUi();
   const [lotteries, setLotteries] = useState([]);
@@ -669,6 +671,17 @@ function gateTitle(gate, t) {
   return gate.blockers.map(code => gateBlockerText(code, t)).join(' / ');
 }
 
+function sameActionSet(left = [], right = []) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every(action => rightSet.has(action));
+}
+
+function actionSummary(actions = [], t) {
+  if (!Array.isArray(actions) || !actions.length) return t('lotteries.noSavedRuleActions');
+  return actions.map(action => t(`lotteries.actions.${action}`)).join(' / ');
+}
+
 function RealGateCell({ gate, t }) {
   if (!gate) return <span className="badge badge-muted">{t('lotteries.gateUnknown')}</span>;
   return (
@@ -692,6 +705,9 @@ function RulePlanEditor({ lottery, onSave, t }) {
   const [ruleText, setRuleText] = useState(lottery.rule_text || '');
   const [suggestion, setSuggestion] = useState(null);
   const [suggesting, setSuggesting] = useState(false);
+  const suggestionActions = Array.isArray(suggestion?.required_actions) ? suggestion.required_actions : [];
+  const draftChanged = !sameActionSet(actions, initialActions);
+  const missingSuggestedActions = suggestionActions.filter(action => !initialActions.includes(action));
 
   useEffect(() => {
     setActions(Array.isArray(plan.required_actions) ? plan.required_actions : []);
@@ -722,12 +738,35 @@ function RulePlanEditor({ lottery, onSave, t }) {
   return (
     <details className="rule-plan-editor">
       <summary>
-        <span className={`badge ${plan.review_required || !initialActions.length ? 'badge-warn' : 'badge-ready'}`}>
+        <span className={`badge ${plan.review_required || !initialActions.length || draftChanged ? 'badge-warn' : 'badge-ready'}`}>
           {plan.review_required || !initialActions.length ? t('lotteries.ruleNeedsReview') : t('lotteries.ruleReady')}
         </span>
-        {!!initialActions.length && <span className="small-text">{initialActions.map(action => t(`lotteries.actions.${action}`)).join(' / ')}</span>}
+        <span className="small-text">{actionSummary(initialActions, t)}</span>
+        {draftChanged && <span className="badge badge-warn">{t('lotteries.ruleDraftUnsavedBadge')}</span>}
       </summary>
       <div className="rule-plan-body">
+        <div className="rule-plan-snapshots">
+          <div className="rule-plan-snapshot">
+            <span>{t('lotteries.savedExecutionPlan')}</span>
+            <strong>{actionSummary(initialActions, t)}</strong>
+          </div>
+          <div className={`rule-plan-snapshot ${draftChanged ? 'is-dirty' : ''}`}>
+            <span>{t('lotteries.draftExecutionPlan')}</span>
+            <strong>{actionSummary(actions, t)}</strong>
+          </div>
+          {!!suggestionActions.length && (
+            <div className={`rule-plan-snapshot ${missingSuggestedActions.length ? 'is-dirty' : ''}`}>
+              <span>{t('lotteries.suggestedExecutionPlan')}</span>
+              <strong>{actionSummary(suggestionActions, t)}</strong>
+            </div>
+          )}
+        </div>
+        {draftChanged && <div className="notice notice-warning">{t('lotteries.ruleDraftNotSaved')}</div>}
+        {!!missingSuggestedActions.length && (
+          <div className="notice notice-warning">
+            {formatText(t('lotteries.suggestedActionsMissingSaved'), { actions: actionSummary(missingSuggestedActions, t) })}
+          </div>
+        )}
         <textarea
           className="input textarea"
           value={ruleText}
@@ -751,7 +790,7 @@ function RulePlanEditor({ lottery, onSave, t }) {
           </div>
         )}
         <div className="rule-action-grid">
-          {['followed', 'liked', 'commented', 'reposted'].map(action => (
+          {LOTTERY_ACTIONS.map(action => (
             <label key={action}>
               <input type="checkbox" checked={actions.includes(action)} onChange={() => toggle(action)} />
               <span>{t(`lotteries.actions.${action}`)}</span>
@@ -759,7 +798,7 @@ function RulePlanEditor({ lottery, onSave, t }) {
           ))}
         </div>
         <button className="btn-primary" type="button" disabled={!actions.length} onClick={() => onSave(lottery, actions, ruleText)}>
-          {t('lotteries.confirmRule')}
+          {t('lotteries.saveCurrentRule')}
         </button>
       </div>
     </details>

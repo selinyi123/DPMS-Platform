@@ -121,12 +121,18 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
             "UPDATE lotteries SET status = 'running' WHERE id = :lottery_id AND execution_lock = :task_id",
             {"lottery_id": lottery_id, "task_id": task_id},
         )
-        await database.execute(
-            """UPDATE accounts
-               SET status = 'executing', daily_task_count = daily_task_count + 1, last_active_at = NOW()
-               WHERE id = :account_id AND status <> 'executing'""",
-            {"account_id": account_id},
-        )
+        if task_mode == "real_run":
+            await database.execute(
+                """UPDATE accounts
+                   SET status = 'executing', daily_task_count = daily_task_count + 1, last_active_at = NOW()
+                   WHERE id = :account_id AND status <> 'executing'""",
+                {"account_id": account_id},
+            )
+        else:
+            await database.execute(
+                "UPDATE accounts SET last_active_at = NOW() WHERE id = :account_id",
+                {"account_id": account_id},
+            )
     await record_event(
         aggregate="task",
         aggregate_id=task_id,
@@ -134,13 +140,14 @@ async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task
         payload={"account_id": account_id, "lottery_id": lottery_id, "mode": task_mode, "worker_id": WORKER_ID},
         correlation_id=task_id,
     )
-    await record_event(
-        aggregate="account",
-        aggregate_id=account_id,
-        event_type="AccountExecutionStarted",
-        payload={"task_id": task_id, "lottery_id": lottery_id},
-        correlation_id=task_id,
-    )
+    if task_mode == "real_run":
+        await record_event(
+            aggregate="account",
+            aggregate_id=account_id,
+            event_type="AccountExecutionStarted",
+            payload={"task_id": task_id, "lottery_id": lottery_id},
+            correlation_id=task_id,
+        )
 
 
 async def mark_task_finished(
@@ -555,7 +562,8 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     try:
         if task_mode == "real_run" and not uses_bilibili_api_real_task(task) and not getattr(adapter, "REAL_ACTIONS", False):
             raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
-        await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
+        if task_mode == "real_run":
+            await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         await mark_task_started(task_id, account_id, lottery_id, task_mode, stream_message_id)
         if task_mode == "dry_run":
             await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))

@@ -122,9 +122,21 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             adapter = get_adapter("bilibili", {})
             self.assertFalse(adapter.REAL_ACTIONS)
 
-            ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool=None))
+            original_ensure = task_runner.ensure_account_can_run
+            safety_calls = []
+
+            async def record_safety_window(account_id, platform=None):
+                safety_calls.append((account_id, platform))
+                await original_ensure(account_id, platform)
+
+            task_runner.ensure_account_can_run = record_safety_window
+            try:
+                ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool=None))
+            finally:
+                task_runner.ensure_account_can_run = original_ensure
 
             self.assertTrue(ok)
+            self.assertEqual(safety_calls, [(9001, "bilibili")])
             self.assertEqual(FakeBiliExecutor.last_actions, ["follow", "like", "comment", "repost"])
             self.assertEqual(fake_db.phases, ["followed", "liked", "commented", "reposted", "completed"])
         finally:

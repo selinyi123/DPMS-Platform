@@ -97,9 +97,21 @@ class BilibiliDryRunSmokeTests(unittest.TestCase):
         self.assertTrue(adapter.REAL_ACTIONS)
         self.assertEqual(adapter.STATUS, "configured")
 
-        ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool=None))
+        original_ensure = task_runner.ensure_account_can_run
+        safety_calls = []
+
+        async def fail_if_safety_window_is_used(*args):
+            safety_calls.append(args)
+            raise AssertionError("dry-run must not consume the real action safety window")
+
+        task_runner.ensure_account_can_run = fail_if_safety_window_is_used
+        try:
+            ok = asyncio.run(task_runner.execute_task_with_phases(message, adapter, pool=None))
+        finally:
+            task_runner.ensure_account_can_run = original_ensure
 
         self.assertTrue(ok)
+        self.assertEqual(safety_calls, [])
         self.assertEqual(fake_db.phases, COMPLETED_PHASES)
 
 
