@@ -2,31 +2,38 @@ import re
 from typing import Any
 
 
-# Bilibili keeps its original patterns (regression-safe: unchanged from the
-# pre-refactor `bilibili_discovery.parse_lottery_rule`).
 BILIBILI_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|UP主|up主|主播)?",),
-    "liked": (r"点赞", r"点个赞"),
-    "commented": (r"评论", r"留言"),
-    "reposted": (r"转发", r"分享动态"),
+    "followed": (r"关注(?:我|本账号|本账户|UP主|up主|主播|@[\w\u4e00-\u9fff_-]+)?",),
+    "liked": (r"点赞", r"点个赞", r"转赞评", r"\b赞\b"),
+    "commented": (r"评论", r"留言", r"转赞评"),
+    "reposted": (r"转发", r"分享动态", r"转赞评"),
 }
-BILIBILI_LOTTERY_PATTERNS = (r"抽奖", r"抽送", r"开奖", r"福利", r"奖品")
+BILIBILI_LOTTERY_PATTERNS = (
+    r"抽奖",
+    r"抽取",
+    r"开奖",
+    r"福利",
+    r"奖品",
+    r"送出",
+    r"中奖",
+    r"评论区抽",
+    r"抽[\d一二三四五六七八九十]+[位名]",
+)
 BILIBILI_AMBIGUOUS_PATTERNS = (
-    r"无需(?:关注|点赞|评论|留言|转发)",
-    r"不用(?:关注|点赞|评论|留言|转发)",
-    r"禁止(?:关注|点赞|评论|留言|转发)",
+    r"无需(?:关注|点赞|评论|留言|转发|分享)",
+    r"不用(?:关注|点赞|评论|留言|转发|分享)",
+    r"禁止(?:关注|点赞|评论|留言|转发|分享)",
     r"可选",
     r"任选",
 )
 
-# Weibo lotteries are usually phrased as "关注+转发+评论抽奖", with an
-# additional "@N位好友" mention requirement that adapters cannot fulfill
-# automatically (flagged via unsupported_actions instead of required_actions).
+# Weibo lotteries often add a friend-mention requirement. The adapters cannot
+# fulfill that safely, so it is surfaced through unsupported_actions.
 WEIBO_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|博主)?",),
-    "liked": (r"点赞", r"点个赞"),
+    "followed": (r"关注(?:我|本账号|本账户|博主|主播)?",),
+    "liked": (r"点赞", r"点个赞", r"\b赞\b"),
     "commented": (r"评论", r"留言"),
-    "reposted": (r"转发", r"转发(?:本)?微博", r"转起"),
+    "reposted": (r"转发", r"转发(?:本条|这条)?微博", r"转起"),
 }
 WEIBO_LOTTERY_PATTERNS = (
     r"抽奖",
@@ -46,11 +53,10 @@ WEIBO_AMBIGUOUS_PATTERNS = (
     r"任选",
 )
 
-# Xiaohongshu notes commonly ask for "关注+点赞+收藏+评论"; "收藏" (favorite)
-# has no adapter phase, so it is reported as an unsupported action instead of
-# silently dropped or mismapped onto "liked".
+# Xiaohongshu notes commonly ask for collect/favorite. There is no adapter
+# phase for that action, so it must force human review.
 XIAOHONGSHU_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|博主|up主)?",),
+    "followed": (r"关注(?:我|本账号|本账户|博主|up主)?",),
     "liked": (r"点赞", r"双击点赞"),
     "commented": (r"评论", r"留言", r"评论区"),
     "reposted": (r"分享", r"转发"),
@@ -75,7 +81,7 @@ XIAOHONGSHU_AMBIGUOUS_PATTERNS = (
 )
 
 DOUYIN_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|up主)?",),
+    "followed": (r"关注(?:我|本账号|本账户|up主)?",),
     "liked": (r"点赞", r"双击点赞"),
     "commented": (r"评论", r"留言"),
     "reposted": (r"分享", r"转发"),
@@ -118,11 +124,11 @@ PLATFORM_AMBIGUOUS_PATTERNS: dict[str, tuple[str, ...]] = {
 
 # Actions that the rule text asks for but no adapter phase can perform. These
 # never enter `required_actions`; they force `review_required` so an operator
-# decides how to handle the gap (e.g. manually tagging friends).
+# decides how to handle the gap.
 PLATFORM_UNSUPPORTED_ACTION_PATTERNS: dict[str, dict[str, tuple[str, ...]]] = {
     "weibo": {
         "mention_friends": (
-            r"@[\d一二三四五六七八九十]*(?:位|个)?(?:好友|朋友)",
+            r"@[\d一二三四五六七八九十]*个?(?:好友|朋友)",
             r"艾特.*?(?:好友|朋友)",
         ),
     },
@@ -130,6 +136,8 @@ PLATFORM_UNSUPPORTED_ACTION_PATTERNS: dict[str, dict[str, tuple[str, ...]]] = {
         "favorited": (r"收藏",),
     },
 }
+
+MOJIBAKE_MARKERS = ("Ã", "Â", "â", "ä", "å", "æ", "ç", "è", "é", "ï")
 
 
 def parse_lottery_rule(text: str, platform: str = "bilibili") -> dict[str, Any]:
@@ -181,4 +189,32 @@ def parse_lottery_rule(text: str, platform: str = "bilibili") -> dict[str, Any]:
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    return re.sub(r"\s+", " ", repair_mojibake(str(value or ""))).strip()
+
+
+def repair_mojibake(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+
+    candidates = [text]
+    if any(marker in text for marker in MOJIBAKE_MARKERS) or has_c1_controls(text):
+        for encoding in ("latin1", "cp1252"):
+            try:
+                candidates.append(text.encode(encoding).decode("utf-8"))
+            except UnicodeError:
+                continue
+
+    return max(candidates, key=text_quality_score)
+
+
+def has_c1_controls(text: str) -> bool:
+    return any(0x80 <= ord(ch) <= 0x9F for ch in text)
+
+
+def text_quality_score(text: str) -> int:
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+    markers = sum(text.count(marker) for marker in MOJIBAKE_MARKERS)
+    controls = sum(1 for ch in text if 0x80 <= ord(ch) <= 0x9F)
+    replacement = text.count("\ufffd") + text.count("?")
+    return cjk * 4 - markers * 2 - controls * 3 - replacement * 4

@@ -1,6 +1,7 @@
 import unittest
 
-from app.services.bilibili_discovery import parse_dynamic_item, parse_lottery_rule
+from app.services.bilibili_discovery import parse_dynamic_item
+from app.services.lottery_rules import parse_lottery_rule
 
 
 class BilibiliDiscoveryTests(unittest.TestCase):
@@ -23,6 +24,25 @@ class BilibiliDiscoveryTests(unittest.TestCase):
         self.assertEqual(["followed", "liked", "commented", "reposted"], candidate.action_plan["required_actions"])
         self.assertFalse(candidate.action_plan["review_required"])
         self.assertGreaterEqual(candidate.action_plan["confidence"], 0.8)
+
+    def test_repairs_latin1_mojibake_before_parsing(self):
+        text = "互动抽奖福利：关注我，点赞并转发本动态，评论区留言参与。"
+        mojibake_text = text.encode("utf-8").decode("latin1")
+        item = {
+            "id_str": "123456790",
+            "modules": {
+                "module_dynamic": {
+                    "desc": {"text": mojibake_text},
+                    "major": None,
+                },
+            },
+        }
+
+        candidate = parse_dynamic_item(item)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(text, candidate.rule_text)
+        self.assertEqual(["followed", "liked", "commented", "reposted"], candidate.action_plan["required_actions"])
 
     def test_marks_ambiguous_rule_for_review(self):
         plan = parse_lottery_rule("抽奖：转发本动态，关注可选。")

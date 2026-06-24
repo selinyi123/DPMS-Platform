@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from app.services.lottery_rules import parse_lottery_rule
+from app.services.lottery_rules import parse_lottery_rule, repair_mojibake
 
 
 BILIBILI_SPACE_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
@@ -110,7 +110,7 @@ def extract_dynamic_text(dynamic: dict[str, Any]) -> str:
 
 
 def append_text(chunks: list[str], value: Any) -> None:
-    text = str(value or "").strip()
+    text = repair_mojibake(str(value or "")).strip()
     if text:
         chunks.append(text)
 

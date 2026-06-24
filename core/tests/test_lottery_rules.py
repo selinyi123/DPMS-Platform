@@ -13,7 +13,7 @@ class WeiboLotteryRuleTests(unittest.TestCase):
         self.assertEqual([], plan["unsupported_actions"])
 
     def test_flags_friend_mention_as_unsupported(self):
-        plan = parse_lottery_rule("转发抽奖，评论区@三个好友，点赞", "weibo")
+        plan = parse_lottery_rule("转发抽奖：评论区@三个好友，点赞", "weibo")
 
         self.assertTrue(plan["is_lottery"])
         self.assertIn("mention_friends", plan["unsupported_actions"])
@@ -28,7 +28,7 @@ class WeiboLotteryRuleTests(unittest.TestCase):
 
 class XiaohongshuLotteryRuleTests(unittest.TestCase):
     def test_extracts_required_actions_without_review(self):
-        plan = parse_lottery_rule("福利来啦～关注点赞评论分享，抽3位包邮送同款", "xiaohongshu")
+        plan = parse_lottery_rule("福利来啦，关注点赞评论分享，抽2位包邮送同款", "xiaohongshu")
 
         self.assertTrue(plan["is_lottery"])
         self.assertEqual({"followed", "liked", "commented", "reposted"}, set(plan["required_actions"]))
@@ -36,7 +36,7 @@ class XiaohongshuLotteryRuleTests(unittest.TestCase):
         self.assertEqual([], plan["unsupported_actions"])
 
     def test_flags_favorite_as_unsupported(self):
-        plan = parse_lottery_rule("抽奖时间到～关注+点赞+收藏+评论，评论区抽1位送同款", "xiaohongshu")
+        plan = parse_lottery_rule("抽奖时间到：关注+点赞+收藏+评论，评论区抽1位送同款", "xiaohongshu")
 
         self.assertTrue(plan["is_lottery"])
         self.assertIn("favorited", plan["unsupported_actions"])
