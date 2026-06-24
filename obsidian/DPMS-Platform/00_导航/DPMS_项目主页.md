@@ -41,9 +41,10 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - GitHub：`https://github.com/selinyi123/DPMS-Platform`（开发分支 `claude/code-review-ul0pqt`）
 - 最近功能提交：运营规模化主线 V10–V13（Scheduling / Capacity / Orchestration / Throughput，四个只读 advisory 运行时；编排时间→资源→广度→可持续），详见 [[DPMS_V10-V13_OperationalScaling_实施记录_20260614]]
 - 最近 Bilibili 执行节点：Bilibili 动态/opus 目标已接入 API real-run 通道，仍受账号校准、shadow-run、Governance gate、熔断器、全局开关和管理员确认约束，详见 [[DPMS_BilibiliApiRealRun_实施记录_20260624]]
+- 最近 Bilibili 发现节点：自动发现已从抽奖合集动态扩散到 UP 源池，本地验证新增 80 个 Bilibili UP 追踪源、70 个候选目标，并完成 ID 72 shadow-run 成功验证，详见 [[DPMS_BilibiliDiscoveryExpansion_实施记录_20260624]]
 - 最近硬化：运行时可信度硬化（P0→P1→P2→生产基线：默认鉴权、派发原子化+outbox、Governance 唯一 real-run 权威、密文上下文绑定、关键事件死信、production 密钥校验+安全头+前端 auth guard+版本化迁移），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]、[[DPMS_V10-V13_运营规模化_后续版本规划_20260614]]
-- 测试基线：core **314 项**（V10–V13 后 242 + 硬化新增 72）+ worker 21 项单元测试通过
+- 测试基线：core **341 项** + worker 21 项单元测试通过
 - Obsidian 知识库里程碑：`90f6236 Add Obsidian project knowledge base`
 - Bilibili 官方二维码登录里程碑：`761051d Add official Bilibili QR login`
 - Bilibili 动态发现与规则计划里程碑：`04e4c1d Add Bilibili discovery rule plans`
@@ -63,6 +64,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliOfficialQrLogin_实施记录_20260609]]
 - [[DPMS_BilibiliDiscoveryRulePlan_实施记录_20260609]]
 - [[DPMS_BilibiliApiRealRun_实施记录_20260624]]
+- [[DPMS_BilibiliDiscoveryExpansion_实施记录_20260624]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]
