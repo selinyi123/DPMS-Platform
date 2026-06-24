@@ -216,6 +216,23 @@ export default function Lotteries() {
     }
   };
 
+  const repairMissingActions = async (id) => {
+    setError('');
+    try {
+      const lottery = lotteries.find(item => item.id === id);
+      const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
+      await postJSON(`/lotteries/${id}/repair-dispatch`, {
+        confirm: true,
+        account_id: selectedMatches ? Number(selectedAccount) : null,
+      }, { confirm: true });
+      notify(t('lotteries.repairQueued'), 'success');
+      await load();
+    } catch (err) {
+      setError(err.message);
+      notify(err.message, 'error');
+    }
+  };
+
   const probe = async (id) => {
     setError('');
     try {
@@ -510,8 +527,11 @@ export default function Lotteries() {
             <tbody>
               {lotteries.map(lottery => {
                 const gate = gateByLotteryId[lottery.id];
+                const repairPlan = gate?.repair_plan;
                 const gateBlocked = dispatchMode === 'real_run' && !gate?.allowed;
                 const gateCanRunNext = gateBlocked && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
+                const repairAvailable = Boolean(repairPlan?.eligible);
+                const repairBlocked = repairAvailable && (!gate?.allowed || !safeAccountCount(lottery.platform));
                 return (
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
@@ -543,6 +563,16 @@ export default function Lotteries() {
                     <button onClick={() => markResult(lottery.id, 'won')} className="btn-ghost">{t('lotteries.won')}</button>
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
                     <button onClick={() => probe(lottery.id)} disabled={!safeAccountCount(lottery.platform)} className="btn-ghost">{t('lotteries.probe')}</button>
+                    {repairAvailable && (
+                      <button
+                        onClick={() => repairMissingActions(lottery.id)}
+                        disabled={repairBlocked}
+                        title={repairBlocked ? gateTitle(gate, t) : actionSummary(repairPlan.missing_actions, t)}
+                        className="btn-danger"
+                      >
+                        {t('lotteries.repairMissing')}
+                      </button>
+                    )}
                   </td>
                   </tr>
                 );
@@ -684,6 +714,7 @@ function actionSummary(actions = [], t) {
 
 function RealGateCell({ gate, t }) {
   if (!gate) return <span className="badge badge-muted">{t('lotteries.gateUnknown')}</span>;
+  const repairPlan = gate.repair_plan;
   return (
     <div className="gate-cell">
       <span className={`badge ${gate.allowed ? 'badge-ready' : 'badge-warn'}`}>
@@ -692,6 +723,14 @@ function RealGateCell({ gate, t }) {
       <div className="blocker-list compact-blockers">
         {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
       </div>
+      {!!repairPlan?.completed_actions?.length && (
+        <div className="repair-plan-summary">
+          <div className="small-text">{formatText(t('lotteries.repairCompletedActions'), { actions: actionSummary(repairPlan.completed_actions, t) })}</div>
+          {!!repairPlan.missing_actions?.length && (
+            <div className="small-text">{formatText(t('lotteries.repairMissingActions'), { actions: actionSummary(repairPlan.missing_actions, t) })}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

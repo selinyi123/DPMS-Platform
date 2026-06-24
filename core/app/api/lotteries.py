@@ -275,8 +275,78 @@ async def list_real_run_evidence(status: str = None, limit: int = 50):
     for row in rows:
         lottery = dict(row)
         gate = await real_run_gate_status(lottery, selector_config=selector_config, real_run_enabled=real_run_enabled)
+        gate["repair_plan"] = await build_lottery_repair_plan(lottery)
         items.append(gate)
     return {"items": items}
+
+
+def ordered_actions(actions) -> list[str]:
+    if not isinstance(actions, list):
+        return []
+    selected = {str(action) for action in actions}
+    return [action for action in PHASES if action in selected]
+
+
+def missing_repair_actions(required_actions: list[str], completed_actions: list[str]) -> list[str]:
+    completed = set(completed_actions)
+    return [action for action in ordered_actions(required_actions) if action not in completed]
+
+
+async def completed_real_run_actions(lottery_id: int) -> list[str]:
+    rows = await database.fetch_all(
+        """SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.phase')) AS phase
+           FROM events e
+           JOIN task_runs tr ON tr.task_id = e.correlation_id
+           WHERE tr.lottery_id = :lottery_id
+             AND tr.task_mode = 'real_run'
+             AND e.event_type = 'TaskPhaseCompleted'""",
+        {"lottery_id": lottery_id},
+    )
+    completed = [row["phase"] for row in rows if row["phase"] in PHASES]
+    return ordered_actions(completed)
+
+
+async def build_lottery_repair_plan(lottery) -> dict:
+    lottery_data = dict(lottery)
+    action_plan = parse_json_field(lottery_data.get("action_plan")) or {}
+    required_actions = ordered_actions(action_plan.get("required_actions") if isinstance(action_plan, dict) else [])
+    completed_actions = await completed_real_run_actions(int(lottery_data["id"]))
+    missing_actions = missing_repair_actions(required_actions, completed_actions)
+
+    reason = "missing_actions_available"
+    if not isinstance(action_plan, dict) or not action_plan:
+        reason = "action_plan_missing"
+    elif action_plan.get("review_required"):
+        reason = "rule_review_required"
+    elif not required_actions:
+        reason = "required_actions_missing"
+    elif not completed_actions:
+        reason = "no_real_actions_completed"
+    elif not missing_actions:
+        reason = "no_missing_actions"
+
+    eligible = reason == "missing_actions_available"
+    repair_action_plan = None
+    if eligible:
+        repair_action_plan = {
+            "version": 1,
+            "is_lottery": True,
+            "required_actions": missing_actions,
+            "review_required": False,
+            "confidence": 1.0,
+            "source": "missing_action_repair",
+            "full_required_actions": required_actions,
+            "completed_actions": completed_actions,
+        }
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "required_actions": required_actions,
+        "completed_actions": completed_actions,
+        "missing_actions": missing_actions,
+        "repair_action_plan": repair_action_plan,
+    }
 
 
 @router.get("/strategy/queue")
@@ -807,6 +877,231 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         "account_id": account["id"],
         "lottery_id": lottery_id,
         "mode": task_mode,
+        "decision_id": decision_id,
+        "policy_version": policy_version,
+    }
+
+
+@router.get("/{lottery_id}/repair-plan")
+async def get_lottery_repair_plan(lottery_id: int, request: Request):
+    require_min_role(request, "viewer")
+    lottery = await database.fetch_one("SELECT * FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+    return {
+        "lottery_id": lottery_id,
+        "platform": lottery["platform"],
+        "repair_plan": await build_lottery_repair_plan(lottery),
+    }
+
+
+@router.post("/{lottery_id}/repair-dispatch")
+async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, request: Request):
+    actor = require_min_role(request, "operator")
+    lottery = await database.fetch_one("SELECT * FROM lotteries WHERE id = :id", {"id": lottery_id})
+    if not lottery:
+        raise HTTPException(404, detail="Lottery not found")
+
+    repair_plan = await build_lottery_repair_plan(lottery)
+    if not repair_plan["eligible"]:
+        raise HTTPException(409, detail={"message": "Lottery has no safe missing-action repair plan", "repair_plan": repair_plan})
+
+    platform_cfg = get_platform(lottery["platform"])
+    if not platform_cfg:
+        raise HTTPException(400, detail=f"Unsupported platform: {lottery['platform']}")
+
+    selector_config = await load_runtime_selector_config()
+    platform_selectors = selector_config.get(lottery["platform"], {})
+    real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, lottery["platform"])
+    task_mode = "real_run"
+    dry_run = False
+    target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
+    if not target.valid:
+        raise HTTPException(400, detail=target.reason)
+
+    require_min_role(request, "admin")
+    try:
+        require_confirmation(request)
+        if not data.confirm:
+            raise HTTPException(409, detail="Repair real-run body confirmation required")
+        if not await is_real_run_enabled():
+            raise HTTPException(403, detail="Global real-run switch is disabled")
+        breaker_allowed, breaker_reason = await circuit_breaker_allows(lottery["platform"])
+        if not breaker_allowed:
+            raise HTTPException(423, detail=f"Circuit breaker blocks repair-run: {breaker_reason}")
+        if not real_adapter_enabled:
+            raise HTTPException(400, detail=f"Real actions for {lottery['platform']} are not implemented yet.")
+        evidence = await validate_real_run_evidence(lottery, account_id=data.account_id)
+        if not evidence["allowed"]:
+            raise HTTPException(409, detail={"message": "Repair evidence gate is not satisfied", "blockers": evidence["blockers"]})
+    except HTTPException as exc:
+        await audit_event(
+            request,
+            action="lottery.dispatch.repair",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="blocked",
+            risk_level="critical",
+            detail={"platform": lottery["platform"], "reason": exc.detail, "repair_plan": repair_plan},
+        )
+        await record_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="LotteryRepairDenied",
+            payload={"platform": lottery["platform"], "reason": exc.detail, "repair_plan": repair_plan},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+            critical=True,
+        )
+        await emit_real_run_gate_notification(lottery, exc.detail, actor_id=actor["actor_id"])
+        raise
+
+    account = await pick_account(data.account_id, lottery["platform"])
+    if not account:
+        await record_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="LotteryRepairBlocked",
+            payload={"platform": lottery["platform"], "reason": "no_available_account", "repair_plan": repair_plan},
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+            critical=True,
+        )
+        raise HTTPException(400, detail="No available account. Create a ready account first.")
+
+    decision = await evaluate_real_run_decision(lottery, account_id=account["id"], record=True)
+    decision_id = decision["decision_id"]
+    policy_version = decision["policy_version"]
+    if not decision["allowed"]:
+        await record_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="LotteryRepairDenied",
+            payload={
+                "platform": lottery["platform"],
+                "account_id": account["id"],
+                "blockers": decision["blockers"],
+                "failed_gates": decision["failed_gates"],
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+                "repair_plan": repair_plan,
+            },
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+            critical=True,
+        )
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Repair policy gate is not satisfied",
+                "blockers": decision["blockers"],
+                "failed_gates": decision["failed_gates"],
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+                "repair_plan": repair_plan,
+            },
+        )
+
+    task_id = str(uuid.uuid4())
+    repair_action_plan = repair_plan["repair_action_plan"]
+    message = build_lottery_task_message(
+        task_id=task_id,
+        account_id=account["id"],
+        lottery_id=lottery_id,
+        platform=lottery["platform"],
+        raw_url=lottery["raw_url"],
+        canonical_url=lottery["canonical_url"],
+        task_mode=task_mode,
+        dry_run=dry_run,
+        platform_selectors=platform_selectors,
+        action_plan=repair_action_plan,
+    )
+
+    async with database.transaction():
+        locked = await database.fetch_one(
+            "SELECT status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            {"id": lottery_id},
+        )
+        if locked and locked["execution_lock"] and locked["status"] in {"claimed", "running"}:
+            raise HTTPException(409, detail="Lottery already has an active task in flight")
+        await database.execute(
+            """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode, decision_id, policy_version)
+               VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode, :decision_id, :policy_version)""",
+            {
+                "task_id": task_id,
+                "account_id": account["id"],
+                "lottery_id": lottery_id,
+                "dry_run": int(dry_run),
+                "task_mode": task_mode,
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+            },
+        )
+        await database.execute(
+            "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
+            {"task_id": task_id, "id": lottery_id},
+        )
+        await enqueue_outbox(message, "lottery_tasks", dedup_key=task_id)
+
+    try:
+        await try_flush_dedup(task_id)
+    except Exception as exc:
+        structured_log("warning", "repair_dispatch_immediate_flush_failed", task_id=task_id, error=str(exc))
+
+    await audit_event(
+        request,
+        action="lottery.dispatch.repair",
+        resource_type="lottery",
+        resource_id=lottery_id,
+        result="queued",
+        risk_level="critical",
+        detail={
+            "platform": lottery["platform"],
+            "task_id": task_id,
+            "account_id": account["id"],
+            "decision_id": decision_id,
+            "policy_version": policy_version,
+            "repair_plan": repair_plan,
+        },
+    )
+    await record_event(
+        aggregate="task",
+        aggregate_id=task_id,
+        event_type="TaskDispatched",
+        payload={
+            "platform": lottery["platform"],
+            "account_id": account["id"],
+            "lottery_id": lottery_id,
+            "dry_run": dry_run,
+            "mode": task_mode,
+            "raw_url": lottery["raw_url"],
+            "action_plan": repair_action_plan,
+            "repair_plan": repair_plan,
+            "decision_id": decision_id,
+            "policy_version": policy_version,
+        },
+        correlation_id=task_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+        critical=True,
+    )
+    await record_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type="LotteryRepairQueued",
+        payload={"task_id": task_id, "account_id": account["id"], "mode": task_mode, "repair_plan": repair_plan},
+        correlation_id=task_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+        critical=True,
+    )
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "account_id": account["id"],
+        "lottery_id": lottery_id,
+        "mode": task_mode,
+        "repair_plan": repair_plan,
         "decision_id": decision_id,
         "policy_version": policy_version,
     }

@@ -410,6 +410,16 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.gate-cell,
+.repair-plan-summary {
+  display: grid;
+  gap: 5px;
+}
+
+.repair-plan-summary {
+  min-width: 160px;
+}
+
 .strategy-account {
   display: grid;
   gap: 4px;
