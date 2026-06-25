@@ -6,7 +6,11 @@ os.environ.setdefault("ENCRYPTION_KEY", base64.b64encode(b"0" * 32).decode())
 os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
-from app.services.real_run_readiness import account_risk_payload, action_plan_missing_rule_actions  # noqa: E402
+from app.services.real_run_readiness import (  # noqa: E402
+    account_risk_cooldown_hours,
+    account_risk_payload,
+    action_plan_missing_rule_actions,
+)
 
 
 class ActionPlanFreshnessTests(unittest.TestCase):
@@ -46,16 +50,21 @@ class AccountRiskPayloadTests(unittest.TestCase):
             "event_type": "cooling",
             "detail": '{"reason":"action_window"}',
             "created_at": "2026-06-24 06:16:36",
-            "cooldown_until": "2026-06-25 06:16:36",
         }
 
         payload = account_risk_payload(row)
 
         self.assertTrue(payload["has_recent_risk"])
+        self.assertEqual(payload["cooldown_hours"], 4)
         self.assertEqual(payload["latest_event"]["account_id"], 14)
         self.assertEqual(payload["latest_event"]["detail"], {"reason": "action_window"})
         self.assertEqual(payload["latest_event"]["created_at"], "2026-06-24T06:16:36")
-        self.assertEqual(payload["cooldown_until"], "2026-06-25T06:16:36")
+        self.assertEqual(payload["cooldown_until"], "2026-06-24T10:16:36")
+
+    def test_hard_risk_reasons_keep_full_day_cooldown(self):
+        self.assertEqual(account_risk_cooldown_hours({"reason": "page_risk_signal"}, "cooling"), 24)
+        self.assertEqual(account_risk_cooldown_hours({"reason": "redirected_to_login"}, "login_required"), 24)
+        self.assertEqual(account_risk_cooldown_hours({"reason": "unknown"}, "cooling"), 24)
 
 
 if __name__ == "__main__":

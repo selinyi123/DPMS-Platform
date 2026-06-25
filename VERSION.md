@@ -3,9 +3,9 @@
 ## Current Product Snapshot
 
 ```text
-Product Version: 0.3.14
+Product Version: 0.3.15
 Architecture Stage: S16 / Bilibili API Real-run Integration
-Runtime Stage: Bilibili API Real-run Path + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
+Runtime Stage: Bilibili API Real-run Path + Adaptive Account Risk Cooldown + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
 Real-run Status: Gated / Bilibili API Adapter Wired
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -64,7 +64,7 @@ python scripts/runtime_readiness_contract.py
 ## Next Key Node
 
 ```text
-Product Version: 0.3.15
+Product Version: 0.3.16
 Target: Controlled Bilibili Live Validation Node
-Scope: opt-in Bilibili API self-test with a low-risk account, one dynamic target, shadow evidence, and manually confirmed real-run gate; no captcha bypass and no anti-bot evasion
+Scope: opt-in Bilibili API self-test with a low-risk account, one dynamic target, shadow evidence, adaptive risk-clear account state, and manually confirmed real-run gate; no captcha bypass and no anti-bot evasion
 ```

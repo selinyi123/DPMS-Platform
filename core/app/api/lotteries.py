@@ -49,6 +49,7 @@ from app.services.real_run_readiness import (
     parse_json_field,
     phase_configured,
     platform_selectors_complete,
+    recent_account_risk,
     real_run_gate_status,
     validate_real_run_evidence,
 )
@@ -1473,18 +1474,13 @@ async def pick_account(account_id: int | None, platform: str):
                    WHERE c.account_id = a.id
                    ORDER BY c.created_at DESC
                    LIMIT 1
-                 ) = 'succeeded'
-                 AND NOT EXISTS (
-                   SELECT 1 FROM risk_events r
-                   WHERE r.account_id = a.id
-                     AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                 )""",
+                 ) = 'succeeded'""",
             {"id": recommended["account_id"], "platform": platform},
         )
-        if row:
+        if row and not (await recent_account_risk(int(row["id"])))["has_recent_risk"]:
             return row
 
-    risk_clear = await database.fetch_one(
+    candidates = await database.fetch_all(
         """SELECT * FROM accounts a
            WHERE a.platform = :platform
              AND a.status = 'ready'
@@ -1495,17 +1491,13 @@ async def pick_account(account_id: int | None, platform: str):
                ORDER BY c.created_at DESC
                LIMIT 1
              ) = 'succeeded'
-             AND NOT EXISTS (
-               SELECT 1 FROM risk_events r
-               WHERE r.account_id = a.id
-                 AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-             )
            ORDER BY daily_task_count ASC, id ASC
-           LIMIT 1""",
+           LIMIT 25""",
         {"platform": platform},
     )
-    if risk_clear:
-        return risk_clear
+    for row in candidates:
+        if not (await recent_account_risk(int(row["id"])))["has_recent_risk"]:
+            return row
 
     return await database.fetch_one(
         """SELECT * FROM accounts a

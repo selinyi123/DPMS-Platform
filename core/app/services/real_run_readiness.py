@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 
 from app.adapter_config import (
     STRUCTURED_SELECTOR_PLATFORMS,
@@ -16,6 +17,29 @@ from app.utils.log import structured_log
 from app.utils.lottery_targets import validate_lottery_target
 
 ACCOUNT_RISK_COOLDOWN_HOURS = 24
+MAX_ACCOUNT_RISK_COOLDOWN_HOURS = 24
+ACCOUNT_RISK_COOLDOWN_BY_REASON = {
+    # A local action burst should pause the account, not lock it out for a day.
+    "action_window": 4,
+    "sliding_window_exceeded": 4,
+    # Harder risk signals keep the conservative 24 hour hold.
+    "daily_limit": 24,
+    "page_risk_signal": 24,
+    "redirected_to_login": 24,
+    "execution_timeout": 24,
+    "bilibili_follow_captcha": 24,
+    "bilibili_like_captcha": 24,
+    "bilibili_comment_captcha": 24,
+    "bilibili_repost_captcha": 24,
+    "bilibili_follow_limit": 24,
+    "bilibili_like_limit": 24,
+    "bilibili_comment_limit": 24,
+    "bilibili_repost_limit": 24,
+    "bilibili_follow_risk": 24,
+    "bilibili_like_risk": 24,
+    "bilibili_comment_risk": 24,
+    "bilibili_repost_risk": 24,
+}
 
 
 def parse_json_field(value):
@@ -70,41 +94,113 @@ def normalize_timestamp(value) -> str | None:
     return str(value).replace(" ", "T")
 
 
+def normalize_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    if " " in text and "T" not in text:
+        text = text.replace(" ", "T", 1)
+    try:
+        return datetime.fromisoformat(text).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def row_value(row, key, default=None):
+    if not row:
+        return default
+    try:
+        return row[key]
+    except Exception:
+        if hasattr(row, "get"):
+            return row.get(key, default)
+    return default
+
+
+def account_risk_reason(detail) -> str:
+    parsed = parse_json_field(detail)
+    if isinstance(parsed, dict):
+        return str(parsed.get("reason") or "").strip()
+    return ""
+
+
+def account_risk_cooldown_hours(detail=None, event_type: str | None = None) -> int:
+    reason = account_risk_reason(detail).lower()
+    if reason in ACCOUNT_RISK_COOLDOWN_BY_REASON:
+        return ACCOUNT_RISK_COOLDOWN_BY_REASON[reason]
+    if str(event_type or "").lower() == "login_required":
+        return 24
+    return ACCOUNT_RISK_COOLDOWN_HOURS
+
+
+def account_risk_cooldown_until(row) -> datetime | None:
+    created_at = normalize_datetime(row_value(row, "created_at"))
+    if not created_at:
+        fallback = normalize_datetime(row_value(row, "cooldown_until"))
+        return fallback
+    hours = account_risk_cooldown_hours(row_value(row, "detail"), row_value(row, "event_type"))
+    return created_at + timedelta(hours=hours)
+
+
+def account_risk_is_active(row, now=None) -> bool:
+    cooldown_until = account_risk_cooldown_until(row)
+    if not cooldown_until:
+        return True
+    now_dt = normalize_datetime(now) or datetime.now()
+    return cooldown_until > now_dt
+
+
+async def current_db_time() -> datetime:
+    row = await database.fetch_one("SELECT NOW() AS db_now")
+    return normalize_datetime(row_value(row, "db_now")) or datetime.now()
+
+
 def account_risk_payload(row) -> dict:
     if not row:
         return {"has_recent_risk": False, "cooldown_hours": ACCOUNT_RISK_COOLDOWN_HOURS}
-    detail = parse_json_field(row["detail"])
+    detail = parse_json_field(row_value(row, "detail"))
+    event_type = row_value(row, "event_type")
+    cooldown_hours = account_risk_cooldown_hours(detail, event_type)
+    cooldown_until = account_risk_cooldown_until(row)
     return {
         "has_recent_risk": True,
-        "cooldown_hours": ACCOUNT_RISK_COOLDOWN_HOURS,
+        "cooldown_hours": cooldown_hours,
         "latest_event": {
-            "id": row["id"],
-            "account_id": row["account_id"],
-            "event_type": row["event_type"],
+            "id": row_value(row, "id"),
+            "account_id": row_value(row, "account_id"),
+            "event_type": event_type,
             "detail": detail if isinstance(detail, dict) else {},
-            "created_at": normalize_timestamp(row["created_at"]),
+            "created_at": normalize_timestamp(row_value(row, "created_at")),
         },
-        "cooldown_until": normalize_timestamp(row["cooldown_until"]),
+        "cooldown_until": normalize_timestamp(cooldown_until),
     }
 
 
-async def recent_account_risk(account_id: int) -> dict:
-    row = await database.fetch_one(
-        """SELECT id, account_id, event_type, detail, created_at,
-                  DATE_ADD(created_at, INTERVAL 24 HOUR) AS cooldown_until
+async def recent_account_risk(account_id: int, *, now=None) -> dict:
+    now_dt = normalize_datetime(now) or await current_db_time()
+    rows = await database.fetch_all(
+        f"""SELECT id, account_id, event_type, detail, created_at
            FROM risk_events
            WHERE account_id = :account_id
-             AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             AND created_at >= DATE_SUB(NOW(), INTERVAL {MAX_ACCOUNT_RISK_COOLDOWN_HOURS} HOUR)
            ORDER BY created_at DESC, id DESC
-           LIMIT 1""",
+           LIMIT 50""",
         {"account_id": account_id},
     )
-    return account_risk_payload(row)
+    for row in rows:
+        if account_risk_is_active(row, now_dt):
+            return account_risk_payload(row)
+    return account_risk_payload(None)
 
 
 async def real_run_account_risk_summary(platform: str) -> dict:
-    ready = await database.fetch_one(
-        """SELECT COUNT(*) AS cnt
+    ready_rows = await database.fetch_all(
+        """SELECT a.id
            FROM accounts a
            WHERE a.platform = :platform
              AND a.status = 'ready'
@@ -117,48 +213,23 @@ async def real_run_account_risk_summary(platform: str) -> dict:
              ) = 'succeeded'""",
         {"platform": platform},
     )
-    runnable = await database.fetch_one(
-        """SELECT COUNT(*) AS cnt
-           FROM accounts a
-           WHERE a.platform = :platform
-             AND a.status = 'ready'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND (
-               SELECT c.status FROM account_calibrations c
-               WHERE c.account_id = a.id
-               ORDER BY c.created_at DESC
-               LIMIT 1
-             ) = 'succeeded'
-             AND NOT EXISTS (
-               SELECT 1 FROM risk_events r
-               WHERE r.account_id = a.id
-                 AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-             )""",
-        {"platform": platform},
-    )
-    latest_risk = await database.fetch_one(
-        """SELECT r.id, r.account_id, r.event_type, r.detail, r.created_at,
-                  DATE_ADD(r.created_at, INTERVAL 24 HOUR) AS cooldown_until
-           FROM risk_events r
-           JOIN accounts a ON a.id = r.account_id
-           WHERE a.platform = :platform
-             AND a.status = 'ready'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND (
-               SELECT c.status FROM account_calibrations c
-               WHERE c.account_id = a.id
-               ORDER BY c.created_at DESC
-               LIMIT 1
-             ) = 'succeeded'
-             AND r.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-           ORDER BY r.created_at DESC, r.id DESC
-           LIMIT 1""",
-        {"platform": platform},
-    )
+    db_now = await current_db_time()
+    runnable_count = 0
+    latest_risk = None
+    latest_risk_created_at = None
+    for account in ready_rows:
+        risk = await recent_account_risk(int(account["id"]), now=db_now)
+        if not risk["has_recent_risk"]:
+            runnable_count += 1
+            continue
+        created_at = normalize_datetime(risk["latest_event"].get("created_at"))
+        if latest_risk is None or (created_at and (latest_risk_created_at is None or created_at > latest_risk_created_at)):
+            latest_risk = risk
+            latest_risk_created_at = created_at
     return {
-        "ready_accounts": int(ready["cnt"] if ready else 0),
-        "runnable_accounts": int(runnable["cnt"] if runnable else 0),
-        "latest_recent_risk": account_risk_payload(latest_risk),
+        "ready_accounts": len(ready_rows),
+        "runnable_accounts": runnable_count,
+        "latest_recent_risk": latest_risk or account_risk_payload(None),
     }
 
 

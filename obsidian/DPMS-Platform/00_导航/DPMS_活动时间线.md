@@ -3,7 +3,7 @@ tags:
   - DPMS
   - 活动记录
   - 时间线
-updated: 2026-06-24
+updated: 2026-06-25
 ---
 
 # DPMS 活动时间线
@@ -123,6 +123,7 @@ updated: 2026-06-24
 | 提交 | 活动 | 关联记录 |
 | --- | --- | --- |
 | 本次提交 | 新增 Bilibili API 动作账本：结构化记录真实业务动作的 code/outcome/message/ok，并在 Activity Pool 的 Real 门禁中只读展示 | [[DPMS_BilibiliActionLedger_实施记录_20260625]] |
+| 本次提交 | Bilibili real-run 账号风险冷却改为分级策略：`action_window` 短冷却 4 小时，验证码/页面风险/登录失效等硬风险保持 24 小时；L101 当前只剩全局 real-run 开关阻断 | [[DPMS_BilibiliAdaptiveRiskCooldown_实施记录_20260625]] |
 
 ## 记录原则
 

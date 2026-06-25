@@ -7,10 +7,14 @@ tags:
   - 项目管理
   - 自动化
 status: active
-updated: 2026-06-24
+updated: 2026-06-25
 ---
 
 # DPMS-Platform
+
+## 最新节点
+
+- 2026-06-25：Bilibili real-run 账号风险冷却从固定 24 小时改为分级冷却。`action_window` / `sliding_window_exceeded` 按 4 小时短冷却处理，验证码、页面风险、登录失效、日限额、Bilibili API 风险类结果仍保持 24 小时保守冷却。L101 本地部署态验证显示旧 `action_window` blocker 已过期，当前仅剩 `global_real_run_disabled` 全局开关阻断。详见 [[DPMS_BilibiliAdaptiveRiskCooldown_实施记录_20260625]]。
 
 ## 项目定位
 
@@ -46,6 +50,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - 最近 Bilibili 补做能力：新增 missing-action repair，只补做真实执行中缺失的动作，避免完整重跑造成重复交互，详见 [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]]
 - 最近 Bilibili 风险感知更新：关键词发现开始真正接入 Bilibili 搜索，real-run 门禁新增账号近期风险冷却解释，前端显示全局 real-run 开关、账号池和冷却截止时间，详见 [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]]
 - 最近 Bilibili 审计更新：新增 Bilibili API 动作账本，记录真实业务动作的 `code/outcome/message/ok`，并在 Activity Pool 的 Real 门禁中只读展示，详见 [[DPMS_BilibiliActionLedger_实施记录_20260625]]
+- 最近 Bilibili 风险策略更新：real-run 账号近期风险门禁改为分级冷却，动作窗口类短冷却 4 小时，验证码/页面风控/登录失效/日限额仍保持 24 小时，详见 [[DPMS_BilibiliAdaptiveRiskCooldown_实施记录_20260625]]
 - 最近硬化：运行时可信度硬化（P0→P1→P2→生产基线：默认鉴权、派发原子化+outbox、Governance 唯一 real-run 权威、密文上下文绑定、关键事件死信、production 密钥校验+安全头+前端 auth guard+版本化迁移），详见 [[DPMS_运行时可信度硬化_实施记录_20260614]]
 - 后续开发总设计方案：[[DPMS_总设计方案_v1_20260611]]；后续版本规划：[[DPMS_V8-V9_后续版本规划_20260612]]、[[DPMS_V10-V13_运营规模化_后续版本规划_20260614]]
 - 测试基线：core **341 项** + worker 21 项单元测试通过
@@ -73,6 +78,7 @@ DPMS 是多平台抽奖自动化与账号资产管理运行时，目标工作流
 - [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]]
 - [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]]
 - [[DPMS_BilibiliActionLedger_实施记录_20260625]]
+- [[DPMS_BilibiliAdaptiveRiskCooldown_实施记录_20260625]]
 - [[DPMS_ObsidianKnowledgeBase_实施记录_20260609]]
 - [[DPMS_BilibiliGateReviewCleanup_实施记录_20260611]]
 - [[DPMS_WeiboXiaohongshuLotteryModule_实施记录_20260611]]

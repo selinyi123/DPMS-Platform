@@ -13,9 +13,9 @@ DPMS 是一个多平台抽奖活动管理、账号资产治理与证据化运行
 ## 当前版本状态
 
 ```text
-Product Version: 0.3.14
+Product Version: 0.3.15
 Architecture Stage: S16 / Bilibili API Real-run Integration
-Runtime Stage: Bilibili API Real-run Path + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
+Runtime Stage: Bilibili API Real-run Path + Adaptive Account Risk Cooldown + Shadow-run Closed Loop + Migration-Gated Reliability Baseline + Managed Browser Context Pool + Static Preflight Gate + Compose Smoke Gate + Controlled Worker Lifecycle Harness + Controlled Browser Lifecycle Harness + Runtime Readiness Contract
 Real-run Status: Gated / Bilibili API Adapter Wired
 Production Readiness: Not Ready
 Primary Platform: Bilibili first, other platforms remain plugin/calibration tracks
@@ -136,6 +136,7 @@ cd ../worker; python -m unittest discover -s tests
 - `docs/DPMS_BilibiliApiRealRun_实施记录_20260624.md`
 - `docs/DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624.md`
 - `docs/DPMS_BilibiliActionLedger_实施记录_20260625.md`
+- `docs/DPMS_BilibiliAdaptiveRiskCooldown_实施记录_20260625.md`
 - `docs/DPMS_总设计方案_v1_20260611.md`
 
 ## 当前未合入分支说明
