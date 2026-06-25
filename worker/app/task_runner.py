@@ -91,6 +91,54 @@ async def save_phase(task_id: str, account_id: int, lottery_id: int, phase: str)
     structured_log("info", "phase_saved", task_id=task_id, phase=phase)
 
 
+async def save_bilibili_action_ledger(
+    *,
+    task_id: str,
+    account_id: int,
+    lottery_id: int,
+    dynamic_id: str,
+    action: str,
+    phase: str | None,
+    action_result,
+):
+    try:
+        await database.execute(
+            """INSERT INTO bilibili_action_ledger
+                 (task_id, account_id, lottery_id, dynamic_id, action, phase, code, outcome, message, ok, task_mode, source)
+               VALUES
+                 (:task_id, :account_id, :lottery_id, :dynamic_id, :action, :phase, :code, :outcome, :message, :ok, 'real_run', 'api_real_run')
+               ON DUPLICATE KEY UPDATE
+                 dynamic_id = VALUES(dynamic_id),
+                 phase = VALUES(phase),
+                 code = VALUES(code),
+                 outcome = VALUES(outcome),
+                 message = VALUES(message),
+                 ok = VALUES(ok),
+                 updated_at = CURRENT_TIMESTAMP""",
+            {
+                "task_id": task_id,
+                "account_id": account_id,
+                "lottery_id": lottery_id,
+                "dynamic_id": dynamic_id,
+                "action": action,
+                "phase": phase,
+                "code": action_result.code,
+                "outcome": action_result.outcome.value,
+                "message": action_result.message,
+                "ok": 1 if action_result.ok else 0,
+            },
+        )
+    except Exception as exc:
+        structured_log(
+            "warning",
+            "bilibili_action_ledger_write_failed",
+            task_id=task_id,
+            lottery_id=lottery_id,
+            action=action,
+            error=str(exc),
+        )
+
+
 async def mark_task_started(task_id: str, account_id: int, lottery_id: int, task_mode: str, stream_message_id: str | None = None):
     async with database.transaction():
         row = await database.fetch_one(
@@ -395,6 +443,16 @@ async def execute_bilibili_api_real_task(task: dict):
 
         result = await BilibiliApiExecutor(client, client.config).participate(card, actions)
         for action, action_result in result.actions.items():
+            phase = API_TO_DPMS_PHASE.get(action)
+            await save_bilibili_action_ledger(
+                task_id=task_id,
+                account_id=account_id,
+                lottery_id=lottery_id,
+                dynamic_id=result.dynamic_id,
+                action=action,
+                phase=phase,
+                action_result=action_result,
+            )
             await record_event(
                 aggregate="task",
                 aggregate_id=task_id,
@@ -410,7 +468,6 @@ async def execute_bilibili_api_real_task(task: dict):
                 },
                 correlation_id=task_id,
             )
-            phase = API_TO_DPMS_PHASE.get(action)
             if phase and action_result.ok:
                 await save_phase(task_id, account_id, lottery_id, phase)
 

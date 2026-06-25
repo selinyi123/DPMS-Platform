@@ -120,7 +120,7 @@
 }
 
 .activity-pool-table {
-  min-width: 1280px;
+  min-width: 1380px;
 }
 
 .activity-pool-table th:nth-child(3),
@@ -135,7 +135,7 @@
 
 .activity-pool-table th:nth-child(7),
 .activity-pool-table td:nth-child(7) {
-  width: 270px;
+  width: 360px;
 }
 
 .activity-pool-table th:nth-child(9),
@@ -420,6 +420,25 @@ button:disabled {
 .repair-plan-summary {
   display: grid;
   gap: 5px;
+}
+
+.action-ledger-summary {
+  display: grid;
+  gap: 5px;
+  min-width: 190px;
+  padding-top: 4px;
+  border-top: 1px solid var(--surface-border);
+}
+
+.action-ledger-row {
+  display: grid;
+  grid-template-columns: minmax(52px, auto) minmax(70px, 1fr) minmax(98px, auto);
+  gap: 6px;
+  align-items: center;
+}
+
+.ledger-disclaimer {
+  color: var(--text-muted);
 }
 
 .repair-plan-summary {

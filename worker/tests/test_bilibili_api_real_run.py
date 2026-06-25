@@ -139,6 +139,12 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             self.assertEqual(safety_calls, [(9001, "bilibili")])
             self.assertEqual(FakeBiliExecutor.last_actions, ["follow", "like", "comment", "repost"])
             self.assertEqual(fake_db.phases, ["followed", "liked", "commented", "reposted", "completed"])
+            self.assertEqual(
+                [entry["action"] for entry in fake_db.bilibili_action_ledger],
+                ["follow", "like", "comment", "repost"],
+            )
+            self.assertTrue(all(entry["ok"] == 1 for entry in fake_db.bilibili_action_ledger))
+            self.assertEqual(fake_db.bilibili_action_ledger[1]["phase"], "liked")
         finally:
             task_runner.BilibiliApiClient = original_client
             task_runner.BilibiliApiExecutor = original_executor

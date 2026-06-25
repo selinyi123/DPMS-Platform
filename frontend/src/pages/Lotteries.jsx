@@ -6,6 +6,12 @@ import { formatText } from '../i18n/format';
 import { useUi } from '../uiContext';
 
 const LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
+const API_ACTION_PHASES = {
+  follow: 'followed',
+  like: 'liked',
+  comment: 'commented',
+  repost: 'reposted',
+};
 
 export default function Lotteries() {
   const { notify, t } = useUi();
@@ -768,8 +774,49 @@ function RealGateCell({ gate, t }) {
           )}
         </div>
       )}
+      <ActionLedgerSummary ledger={gate.action_ledger} repairPlan={repairPlan} t={t} />
     </div>
   );
+}
+
+function ActionLedgerSummary({ ledger = [], repairPlan, t }) {
+  const rows = Array.isArray(ledger) ? ledger.slice(0, 4) : [];
+  const shouldShow = rows.length || repairPlan?.completed_actions?.length || repairPlan?.missing_actions?.length;
+  if (!shouldShow) return null;
+  return (
+    <div className="action-ledger-summary">
+      <div className="small-text ledger-disclaimer">{t('lotteries.actionLedgerHint')}</div>
+      {rows.length ? rows.map(row => (
+        <div className="action-ledger-row" key={`${row.task_id}-${row.action}-${row.id || row.created_at}`}>
+          <span className={`badge ${ledgerOutcomeClass(row)}`}>{ledgerActionLabel(row, t)}</span>
+          <span className="small-text">{ledgerOutcomeLabel(row, t)}</span>
+          <span className="small-text muted-text">{displayTime(row.created_at)}</span>
+        </div>
+      )) : (
+        <div className="small-text muted-text">{t('lotteries.actionLedgerEmpty')}</div>
+      )}
+    </div>
+  );
+}
+
+function ledgerActionLabel(row, t) {
+  const phase = row.phase || API_ACTION_PHASES[row.action];
+  if (phase) return actionSummary([phase], t);
+  return row.action || '-';
+}
+
+function ledgerOutcomeLabel(row, t) {
+  const outcome = row.outcome || 'missing';
+  const status = row.ok ? t('lotteries.ledgerStatuses.completed') : t(`lotteries.ledgerStatuses.${outcome}`);
+  const label = status === `lotteries.ledgerStatuses.${outcome}` ? outcome : status;
+  return row.code === null || row.code === undefined ? label : `${label} (${row.code})`;
+}
+
+function ledgerOutcomeClass(row) {
+  if (row.ok) return 'badge-ready';
+  if (['risk', 'auth', 'captcha', 'fatal'].includes(row.outcome)) return 'badge-danger';
+  if (['limit', 'retry'].includes(row.outcome)) return 'badge-warn';
+  return 'badge-muted';
 }
 
 function RulePlanEditor({ lottery, onSave, t }) {

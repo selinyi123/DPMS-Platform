@@ -118,6 +118,12 @@ updated: 2026-06-24
 | 本次提交 | 新增 Bilibili missing-action repair：从事件流识别已完成真实动作，只补做缺失动作，避免完整重跑造成重复交互 | [[DPMS_BilibiliMissingActionRepair_实施记录_20260624]] |
 | 本次提交 | 新增 Bilibili 关键词发现、账号近期风险冷却门禁与前端 real-run 风险解释；L72 缺失动作仍被全局开关和账号冷却阻断 | [[DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624]] |
 
+## 2026-06-25
+
+| 提交 | 活动 | 关联记录 |
+| --- | --- | --- |
+| 本次提交 | 新增 Bilibili API 动作账本：结构化记录真实业务动作的 code/outcome/message/ok，并在 Activity Pool 的 Real 门禁中只读展示 | [[DPMS_BilibiliActionLedger_实施记录_20260625]] |
+
 ## 记录原则
 
 - Git 提交是代码变更的权威记录。

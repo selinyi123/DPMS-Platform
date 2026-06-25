@@ -6,7 +6,7 @@ os.environ.setdefault("ENCRYPTION_KEY", base64.b64encode(b"0" * 32).decode())
 os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
-from app.api.lotteries import missing_repair_actions, ordered_actions  # noqa: E402
+from app.api.lotteries import missing_repair_actions, normalize_action_ledger_row, ordered_actions  # noqa: E402
 
 
 class LotteryRepairPlanTests(unittest.TestCase):
@@ -33,6 +33,20 @@ class LotteryRepairPlanTests(unittest.TestCase):
         completed = ["liked", "followed", "reposted"]
 
         self.assertEqual(missing_repair_actions(required, completed), [])
+
+    def test_action_ledger_row_normalizes_ok_to_boolean(self):
+        row = {
+            "task_id": "task-1",
+            "action": "like",
+            "phase": "liked",
+            "outcome": "ok",
+            "ok": 1,
+        }
+
+        normalized = normalize_action_ledger_row(row)
+
+        self.assertIs(normalized["ok"], True)
+        self.assertEqual(normalized["phase"], "liked")
 
 
 if __name__ == "__main__":

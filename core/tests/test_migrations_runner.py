@@ -88,6 +88,14 @@ class RealBaselineTests(unittest.TestCase):
         self.assertTrue(statements)
         self.assertTrue(all(stmt.strip() for stmt in statements))
 
+    def test_bilibili_action_ledger_migration_present(self):
+        found = dict(discover_migrations(MIGRATIONS_DIR))
+
+        self.assertIn("0009", found)
+        sql = Path(found["0009"]).read_text(encoding="utf-8")
+        self.assertIn("CREATE TABLE IF NOT EXISTS bilibili_action_ledger", sql)
+        self.assertIn("uk_bilibili_action_task_action", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

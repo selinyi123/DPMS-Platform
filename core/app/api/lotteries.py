@@ -276,6 +276,7 @@ async def list_real_run_evidence(status: str = None, limit: int = 50):
         lottery = dict(row)
         gate = await real_run_gate_status(lottery, selector_config=selector_config, real_run_enabled=real_run_enabled)
         gate["repair_plan"] = await build_lottery_repair_plan(lottery)
+        gate["action_ledger"] = await bilibili_action_ledger_for_lottery(int(lottery["id"]), limit=12)
         items.append(gate)
     return {"items": items}
 
@@ -292,7 +293,67 @@ def missing_repair_actions(required_actions: list[str], completed_actions: list[
     return [action for action in ordered_actions(required_actions) if action not in completed]
 
 
+def normalize_action_ledger_row(row) -> dict:
+    item = dict(row)
+    item["ok"] = bool(item.get("ok"))
+    return item
+
+
+async def bilibili_action_ledger_for_lottery(lottery_id: int, limit: int = 20) -> list[dict]:
+    try:
+        rows = await database.fetch_all(
+            """SELECT * FROM bilibili_action_ledger
+               WHERE lottery_id = :lottery_id
+               ORDER BY id DESC LIMIT :limit""",
+            {"lottery_id": lottery_id, "limit": clamp_limit(limit)},
+        )
+    except Exception as exc:
+        structured_log("warning", "bilibili_action_ledger_query_failed", lottery_id=lottery_id, error=str(exc))
+        return []
+    return [normalize_action_ledger_row(row) for row in rows]
+
+
+async def completed_real_run_actions_from_ledger(lottery_id: int) -> list[str]:
+    try:
+        rows = await database.fetch_all(
+            """SELECT DISTINCT phase
+               FROM bilibili_action_ledger
+               WHERE lottery_id = :lottery_id
+                 AND task_mode = 'real_run'
+                 AND ok = 1
+                 AND phase IS NOT NULL""",
+            {"lottery_id": lottery_id},
+        )
+    except Exception as exc:
+        structured_log("warning", "bilibili_completed_actions_ledger_query_failed", lottery_id=lottery_id, error=str(exc))
+        return []
+    completed = [row["phase"] for row in rows if row["phase"] in PHASES]
+    return ordered_actions(completed)
+
+
+@router.get("/action-ledger")
+async def list_bilibili_action_ledger(limit: int = 100, lottery_id: int = None, task_id: str = None):
+    limit = clamp_limit(limit)
+    where = []
+    values = {"limit": limit}
+    if lottery_id is not None:
+        where.append("lottery_id = :lottery_id")
+        values["lottery_id"] = lottery_id
+    if task_id:
+        where.append("task_id = :task_id")
+        values["task_id"] = task_id
+    query = "SELECT * FROM bilibili_action_ledger"
+    if where:
+        query += " WHERE " + " AND ".join(where)
+    query += " ORDER BY id DESC LIMIT :limit"
+    rows = await database.fetch_all(query, values)
+    return [normalize_action_ledger_row(row) for row in rows]
+
+
 async def completed_real_run_actions(lottery_id: int) -> list[str]:
+    ledger_completed = await completed_real_run_actions_from_ledger(lottery_id)
+    if ledger_completed:
+        return ledger_completed
     rows = await database.fetch_all(
         """SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.phase')) AS phase
            FROM events e

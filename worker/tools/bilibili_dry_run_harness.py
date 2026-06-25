@@ -91,6 +91,7 @@ class FakeDatabase:
 
     def __init__(self):
         self.phases: list[str] = []
+        self.bilibili_action_ledger: list[dict] = []
         self.writes: int = 0
 
     async def fetch_one(self, query, values=None):
@@ -107,6 +108,8 @@ class FakeDatabase:
         self.writes += 1
         if "INSERT INTO task_phases" in query and values:
             self.phases.append(values.get("phase"))
+        if "INSERT INTO bilibili_action_ledger" in query and values:
+            self.bilibili_action_ledger.append(dict(values))
         return None
 
     def transaction(self):

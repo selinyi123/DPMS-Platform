@@ -135,6 +135,7 @@ cd ../worker; python -m unittest discover -s tests
 - `docs/DPMS_运行时可信度硬化_实施记录_20260614.md`
 - `docs/DPMS_BilibiliApiRealRun_实施记录_20260624.md`
 - `docs/DPMS_BilibiliRiskAwareDiscovery_实施记录_20260624.md`
+- `docs/DPMS_BilibiliActionLedger_实施记录_20260625.md`
 - `docs/DPMS_总设计方案_v1_20260611.md`
 
 ## 当前未合入分支说明

@@ -241,6 +241,54 @@ CREATE TABLE IF NOT EXISTS `risk_events` (
 
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS `bilibili_action_ledger` (
+
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+
+  `task_id` CHAR(36) NOT NULL,
+
+  `account_id` BIGINT NOT NULL,
+
+  `lottery_id` BIGINT NOT NULL,
+
+  `dynamic_id` VARCHAR(64) NULL,
+
+  `action` VARCHAR(32) NOT NULL,
+
+  `phase` VARCHAR(32) NULL,
+
+  `code` INT NULL,
+
+  `outcome` VARCHAR(32) NOT NULL,
+
+  `message` TEXT NULL,
+
+  `ok` TINYINT DEFAULT 0,
+
+  `task_mode` VARCHAR(32) NOT NULL DEFAULT 'real_run',
+
+  `source` VARCHAR(32) NOT NULL DEFAULT 'api_real_run',
+
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  UNIQUE KEY `uk_bilibili_action_task_action` (`task_id`, `action`),
+
+  INDEX `idx_bilibili_action_lottery_created` (`lottery_id`, `created_at`),
+
+  INDEX `idx_bilibili_action_account_created` (`account_id`, `created_at`),
+
+  INDEX `idx_bilibili_action_outcome_created` (`outcome`, `created_at`),
+
+  FOREIGN KEY (`task_id`) REFERENCES `task_runs`(`task_id`),
+
+  FOREIGN KEY (`account_id`) REFERENCES `accounts`(`id`),
+
+  FOREIGN KEY (`lottery_id`) REFERENCES `lotteries`(`id`)
+
+) ENGINE=InnoDB;
+
 
 
 CREATE TABLE IF NOT EXISTS `notify_logs` (

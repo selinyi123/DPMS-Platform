@@ -31,6 +31,7 @@ PRODUCTION_REQUIRED_TABLES = {
     "task_outbox_events",
     "failed_task_messages",
     "worker_heartbeats",
+    "bilibili_action_ledger",
 }
 
 PRODUCTION_REQUIRED_COLUMNS = {
@@ -39,6 +40,7 @@ PRODUCTION_REQUIRED_COLUMNS = {
     "accounts": {"id", "status"},
     "task_outbox_events": {"event_kind", "status", "dedup_key", "payload"},
     "failed_task_messages": {"stream_key", "message_id", "reason", "payload"},
+    "bilibili_action_ledger": {"task_id", "account_id", "lottery_id", "action", "outcome", "ok"},
 }
 
 PRODUCTION_REQUIRED_TRIGGERS = {"trg_task_runs_terminal_outbox"}
