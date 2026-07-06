@@ -14,6 +14,7 @@ import json
 from app.adapter_config import load_runtime_selector_config
 from app.db import database, redis
 from app.services.outbox import build_lottery_task_message
+from app.services.real_run_gate import evaluate_real_run_decision
 from app.utils.log import structured_log
 
 
@@ -23,6 +24,10 @@ RECOVERY_CONSUMER = "recovery-daemon"
 MAX_RECOVERY_COUNT = 3
 IDLE_THRESHOLD_MS = 120_000
 TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
+
+
+class RealRunRecoveryBlocked(Exception):
+    """Raised when current real-run gates reject replaying a recovered task."""
 
 
 def pending_idle_ms(entry: dict) -> int:
@@ -76,7 +81,13 @@ async def start_recovery_daemon():
                     await redis.delete(recovery_key)
                     continue
 
-                payload = await _rebuild_task_payload(task_id)
+                try:
+                    payload = await _rebuild_task_payload(task_id)
+                except RealRunRecoveryBlocked as exc:
+                    structured_log("warning", "recovery_real_run_gate_blocked", task_id=task_id, reason=str(exc))
+                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await redis.delete(recovery_key)
+                    continue
                 if payload is None:
                     structured_log("error", "recovery_task_row_missing", task_id=task_id)
                     await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
@@ -176,7 +187,7 @@ async def _mark_recovery_exhausted(task_id: str) -> None:
 async def _rebuild_task_payload(task_id: str) -> dict | None:
     row = await database.fetch_one(
         """SELECT tr.account_id, tr.lottery_id, tr.task_mode, tr.dry_run,
-                  l.platform, l.raw_url, l.canonical_url, l.action_plan
+                  l.id, l.platform, l.raw_url, l.canonical_url, l.action_plan
            FROM task_runs tr
            JOIN lotteries l ON l.id = tr.lottery_id
            WHERE tr.task_id = :task_id""",
@@ -188,6 +199,11 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
     platform = row["platform"]
     task_mode = row["task_mode"] or ("dry_run" if row["dry_run"] else "real_run")
     dry_run = task_mode != "real_run"
+    if task_mode == "real_run":
+        decision = await evaluate_real_run_decision(row, account_id=row["account_id"], record=False)
+        if not decision["allowed"]:
+            blockers = ",".join(decision.get("failed_gates") or decision.get("blockers") or ["unknown"])
+            raise RealRunRecoveryBlocked(blockers)
 
     selector_config = await load_runtime_selector_config()
     platform_selectors = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
