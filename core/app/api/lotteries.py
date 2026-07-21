@@ -9,13 +9,16 @@ from fastapi.responses import FileResponse
 
 from app.action_plan import (
     ACTION_ORDER,
-    ACTION_SET,
     BILIBILI_API_EXECUTION_PATH,
+    XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+    XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
+    action_order_for_platform,
     compute_action_plan_hash,
     compute_bilibili_api_config_hash,
     compute_config_hash,
     compute_target_hash,
+    default_execution_path_for_platform,
     semantic_requirement_status,
     validate_action_payload,
     validate_action_plan_v2,
@@ -95,7 +98,7 @@ from app.utils.log import structured_log
 
 
 router = APIRouter()
-PHASES = ["followed", "liked", "commented", "reposted"]
+PHASES = list(ACTION_ORDER)
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/profiles"))
 TASK_FAILURE_DIR = EVIDENCE_ROOT / "task-failures"
 TASK_SHADOW_DIR = EVIDENCE_ROOT / "shadow-runs"
@@ -291,10 +294,17 @@ async def list_adapters():
             "real_actions": cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, key),
             "adapter_status": "configured" if platform_has_runtime_real_adapter(selector_config, key) else cfg.get("adapter_status", "planned"),
             "adapter_kind": platform_real_adapter_kind(selector_config, key),
-            "phases": PHASES,
-            "notes": "real actions require gray calibration"
-            if cfg.get("action_adapter") or platform_selectors_complete(selector_config, key)
-            else "login and dry-run only until adapter calibration is implemented",
+            "phases": list(action_order_for_platform(key)),
+            "notes": (
+                "manual-assisted checklist and read-only shadow only; no official interaction API"
+                if key == "xiaohongshu"
+                else (
+                    "real actions require gray calibration"
+                    if cfg.get("action_adapter")
+                    or platform_selectors_complete(selector_config, key)
+                    else "login and dry-run only until adapter calibration is implemented"
+                )
+            ),
         }
         for key, cfg in get_platforms().items()
     ]
@@ -579,6 +589,75 @@ def bilibili_plan_binding(
         "execution_path_id": plan.execution_path_id,
         "target_hash": target_hash,
         "config_hash": config_hash,
+        "execution_revision": execution_revision,
+        "required_actions": plan.required_actions,
+        "follow_target_handle": plan.follow_target_handle,
+        "action_plan": plan.plan,
+    }
+
+
+def xiaohongshu_manual_plan_binding(
+    lottery,
+    *,
+    execution_revision: int,
+    selector_config: dict,
+) -> dict:
+    """Bind a reviewed XHS plan for a side-effect-free shadow run only."""
+
+    try:
+        plan = validate_action_plan_v2(
+            parse_json_field(lottery["action_plan"]),
+            require_executable=False,
+        )
+        snapshot_id = int(lottery["authoritative_rule_snapshot_id"] or 0)
+    except (ActionPlanV2Error, TypeError, ValueError, KeyError) as exc:
+        code = (
+            exc.code
+            if isinstance(exc, ActionPlanV2Error)
+            else "action_plan_binding_invalid"
+        )
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Xiaohongshu manual-assisted Action Plan v2 is not shadow-ready",
+                "blockers": [code],
+            },
+        ) from exc
+    if (
+        plan.plan.get("platform") != "xiaohongshu"
+        or plan.execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH
+        or snapshot_id != plan.rule_snapshot_id
+        or str(lottery["rule_hash"] or "") != plan.rule_hash
+        or str(lottery["action_plan_hash"] or "") != plan.plan_hash
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Xiaohongshu manual-assisted plan binding changed; review again",
+                "blockers": ["action_plan_rule_binding_mismatch"],
+            },
+        )
+    if type(execution_revision) is not int or execution_revision <= 0:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Xiaohongshu account revision is invalid",
+                "blockers": ["execution_revision_invalid"],
+            },
+        )
+    return {
+        "rule_snapshot_id": plan.rule_snapshot_id,
+        "rule_hash": plan.rule_hash,
+        "action_plan_hash": plan.plan_hash,
+        "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        "target_hash": compute_target_hash(str(lottery["canonical_url"] or "")),
+        "config_hash": compute_config_hash(
+            {
+                "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+                "execution_revision": execution_revision,
+                "selector_config": dict(selector_config or {}),
+            }
+        ),
         "execution_revision": execution_revision,
         "required_actions": plan.required_actions,
         "follow_target_handle": plan.follow_target_handle,
@@ -1143,16 +1222,35 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, lottery["platform"])
     task_mode = resolve_task_mode(data)
     dry_run = task_mode != "real_run"
+    if lottery["platform"] == "xiaohongshu" and task_mode == "dry_run":
+        # task_phases.phase cannot persist ``favorited`` without a schema
+        # migration.  Do not silently omit the fourth action; the read-only
+        # shadow path remains available for contract validation.
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Xiaohongshu four-action plans support manual-assisted shadow only",
+                "blockers": ["xiaohongshu_manual_shadow_only"],
+            },
+        )
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
     if task_mode in {"shadow_run", "real_run"} and not target.valid:
         raise HTTPException(400, detail=target.reason)
-    if task_mode == "shadow_run" and lottery["platform"] == "bilibili":
+    if task_mode == "shadow_run" and lottery["platform"] in {
+        "bilibili",
+        "xiaohongshu",
+    }:
         shadow_contract = await validate_real_run_evidence(lottery, account_id=None)
         if not shadow_contract.get("action_plan_ready"):
+            platform_label = (
+                "Xiaohongshu manual-assisted"
+                if lottery["platform"] == "xiaohongshu"
+                else "Bilibili API-path"
+            )
             raise HTTPException(
                 409,
                 detail={
-                    "message": "Shadow-run requires an attested, exact Bilibili Action Plan v2",
+                    "message": f"Shadow-run requires an attested, exact {platform_label} Action Plan v2",
                     "blockers": [
                         blocker
                         for blocker in shadow_contract.get("blockers", [])
@@ -1164,6 +1262,14 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     if task_mode == "real_run":
         require_min_role(request, "admin")
         try:
+            if lottery["platform"] == "xiaohongshu":
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "Xiaohongshu has no official interaction API; use the manual-assisted checklist and shadow run",
+                        "blockers": [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
+                    },
+                )
             require_confirmation(request)
             if not data.confirm:
                 raise HTTPException(409, detail="Real-run body confirmation required")
@@ -1304,6 +1410,13 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             lottery,
             require_executable=(task_mode == "real_run"),
             execution_revision=int(account["execution_revision"] or 0),
+        )
+        action_plan = plan_binding["action_plan"]
+    elif lottery["platform"] == "xiaohongshu" and task_mode == "shadow_run":
+        plan_binding = xiaohongshu_manual_plan_binding(
+            lottery,
+            execution_revision=int(account["execution_revision"] or 0),
+            selector_config=platform_selectors,
         )
         action_plan = plan_binding["action_plan"]
     execution_evidence_id = (
@@ -1817,7 +1930,6 @@ async def suggest_lottery_action_plan(lottery_id: int, request: Request, rule_te
 async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpdate, request: Request):
     actor = require_min_role(request, "operator")
     submitted_actions = [str(action).strip() for action in data.required_actions]
-    invalid = [action for action in submitted_actions if action not in ACTION_SET]
     async with database.transaction():
         lottery = await database.fetch_one(
             """SELECT id, platform, source_type, source_id, raw_url, canonical_url,
@@ -1828,13 +1940,20 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
         if not lottery:
             raise HTTPException(404, detail="Lottery not found")
         require_lottery_not_executing(lottery, operation="change its action plan")
+        platform_action_order = action_order_for_platform(lottery["platform"])
+        platform_action_set = frozenset(platform_action_order)
+        invalid = [
+            action for action in submitted_actions if action not in platform_action_set
+        ]
         if invalid:
             raise HTTPException(400, detail={"message": "Unsupported lottery actions", "actions": invalid})
         if not submitted_actions:
             raise HTTPException(400, detail="At least one required action must be selected")
         if len(submitted_actions) != len(set(submitted_actions)):
             raise HTTPException(400, detail="Required actions must not contain duplicates")
-        required_actions = [action for action in ACTION_ORDER if action in set(submitted_actions)]
+        required_actions = [
+            action for action in platform_action_order if action in set(submitted_actions)
+        ]
 
         rule_text = protected_source_rule_text(lottery["rule_text"], data.rule_text)
         parsed_rule = parse_lottery_rule(rule_text, lottery["platform"])
@@ -1859,7 +1978,7 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
         payload_validation_errors: list[str] = []
         if set(raw_payloads) != selected_required_actions:
             payload_validation_errors.append("action_plan_payload_binding_mismatch")
-        if set(raw_payloads) - ACTION_SET:
+        if set(raw_payloads) - platform_action_set:
             payload_validation_errors.append("action_plan_payload_unknown_action")
         action_payloads: dict[str, dict] = {}
         for action in required_actions:
@@ -1878,8 +1997,18 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
                 content_requirements,
             )
         )
-        execution_path_id = str(data.execution_path_id or "").strip()
-        if lottery["platform"] != "bilibili":
+        execution_path_id = str(
+            data.execution_path_id
+            if "execution_path_id" in data.model_fields_set
+            else default_execution_path_for_platform(lottery["platform"])
+        ).strip()
+        if lottery["platform"] == "xiaohongshu":
+            if execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH:
+                capability_blockers.append(
+                    "xiaohongshu_execution_path_not_supported"
+                )
+            capability_blockers.append(XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER)
+        elif lottery["platform"] != "bilibili":
             capability_blockers.append("platform_execution_path_not_bound")
         elif execution_path_id != BILIBILI_API_EXECUTION_PATH:
             capability_blockers.append("bilibili_execution_path_not_supported")

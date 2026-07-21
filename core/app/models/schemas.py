@@ -203,6 +203,9 @@ class LotteryActionPlanUpdate(BaseModel):
     # that a truncated discovery summary is the complete source rule.
     rule_complete_confirmed: bool = False
 
+    # Keep the existing public-model default for generated clients.  The API
+    # distinguishes omission via ``model_fields_set`` and selects the target
+    # platform's safe default before persisting the plan.
     execution_path_id: str = Field(default="bilibili_api_v2", min_length=1, max_length=128)
 
     action_payloads: dict[str, dict[str, Any]] = Field(default_factory=dict)

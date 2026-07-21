@@ -65,13 +65,14 @@ WEIBO_AMBIGUOUS_PATTERNS = (
     r"任选",
 )
 
-# Xiaohongshu notes commonly ask for collect/favorite. There is no adapter
-# phase for that action, so it must force human review.
+# Xiaohongshu's participation contract uses collection/favorite as the fourth
+# action. Sharing/reposting is a different side effect and must never be treated
+# as a substitute for collection.
 XIAOHONGSHU_ACTION_PATTERNS = {
     "followed": (r"关注(?:我|本账号|本账户|博主|up主)?",),
     "liked": (r"点赞", r"双击点赞"),
     "commented": (r"评论", r"留言", r"评论区"),
-    "reposted": (r"分享", r"转发"),
+    "favorited": (r"收藏",),
 }
 XIAOHONGSHU_LOTTERY_PATTERNS = (
     r"抽奖",
@@ -241,7 +242,9 @@ PLATFORM_UNSUPPORTED_ACTION_PATTERNS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "xiaohongshu": {
         **COMMON_CONTENT_UNSUPPORTED_ACTION_PATTERNS,
-        "favorited": (r"收藏",),
+        # Sharing/reposting is outside the strict four-action contract. Keep it
+        # unresolved so an operator cannot exchange it for ``favorited``.
+        "reposted": (r"分享", r"转发"),
     },
     "douyin": {
         **COMMON_CONTENT_UNSUPPORTED_ACTION_PATTERNS,

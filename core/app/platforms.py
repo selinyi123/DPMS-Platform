@@ -31,6 +31,16 @@ def get_platform(platform: str) -> dict | None:
     output = dict(cfg)
     output["action_adapter"] = False
     output["adapter_status"] = "calibration_required"
+    if platform == "xiaohongshu":
+        output.update(
+            {
+                "adapter_status": "manual_assisted_only",
+                "execution_mode": "manual_assisted",
+                "real_run_supported": False,
+                "real_run_blocker": "xiaohongshu_no_official_interaction_api",
+            }
+        )
+        return output
     # Native API engines and complete selector configs both count as real-action
     # adapters; Bilibili currently uses the API path, other platforms use
     # selector calibration.

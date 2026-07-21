@@ -2,6 +2,10 @@ import copy
 import unittest
 
 from app.action_plan import (
+    ACTION_ORDER,
+    XIAOHONGSHU_ACTION_ORDER,
+    XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+    XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
     compute_action_plan_hash,
     compute_bilibili_api_config_hash,
@@ -67,7 +71,52 @@ def complete_plan() -> dict:
     return plan
 
 
+def complete_xiaohongshu_plan() -> dict:
+    plan = {
+        "version": 2,
+        "platform": "xiaohongshu",
+        "is_lottery": True,
+        "required_actions": list(XIAOHONGSHU_ACTION_ORDER),
+        "action_payloads": {
+            "followed": {"target_handle": "@小红书博主"},
+            "liked": {},
+            "commented": {"text": "已认真阅读，参与抽奖"},
+            "favorited": {},
+        },
+        # Keep the v2 compatibility shape: repost requirements remain present
+        # and empty even though repost is not one of the XHS four actions.
+        "content_requirements": {
+            "follow_targets": ["@小红书博主"],
+            "commented": {"topic_tags": [], "mentions": []},
+            "reposted": {"topic_tags": [], "mentions": []},
+        },
+        "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        "rule_snapshot_id": 202,
+        "rule_hash": "b" * 64,
+        "review_required": False,
+        "executable": False,
+        "confidence": 1.0,
+        "source": "operator_complete_attestation",
+        "reviewed_by": "operator-1",
+        "rule_complete_confirmed": True,
+        "unsupported_actions": [],
+        "represented_requirements": [],
+        "unresolved_requirements": [],
+        "ambiguity_patterns": [],
+        "payload_validation_errors": [],
+        "capability_blockers": [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
+    }
+    plan["plan_hash"] = compute_action_plan_hash(plan)
+    return plan
+
+
 class ActionPlanV2Tests(unittest.TestCase):
+    def test_global_order_adds_favorite_without_reordering_existing_actions(self):
+        self.assertEqual(
+            ("followed", "liked", "commented", "favorited", "reposted"),
+            ACTION_ORDER,
+        )
+
     def test_complete_exact_plan_is_valid(self):
         validated = validate_action_plan_v2(complete_plan(), reject_media=True)
 
@@ -180,6 +229,87 @@ class ActionPlanV2Tests(unittest.TestCase):
                     ActionPlanV2Error, "execution_revision_invalid"
                 ):
                     compute_bilibili_api_config_hash(value)
+
+    def test_xiaohongshu_manual_plan_binds_exact_four_action_checklist(self):
+        validated = validate_action_plan_v2(
+            complete_xiaohongshu_plan(), require_executable=False
+        )
+
+        self.assertEqual(XIAOHONGSHU_ACTION_ORDER, validated.required_actions)
+        self.assertEqual(
+            "已认真阅读，参与抽奖",
+            validated.payload_for("commented")["text"],
+        )
+        self.assertEqual({}, validated.payload_for("favorited"))
+
+    def test_xiaohongshu_manual_plan_never_satisfies_executable_validation(self):
+        with self.assertRaisesRegex(ActionPlanV2Error, "action_plan_not_executable"):
+            validate_action_plan_v2(complete_xiaohongshu_plan())
+
+    def test_xiaohongshu_validator_rejects_executable_claim_in_manual_mode(self):
+        plan = complete_xiaohongshu_plan()
+        plan["executable"] = True
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_manual_plan_must_be_non_executable",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_validator_requires_manual_execution_path(self):
+        plan = complete_xiaohongshu_plan()
+        plan["execution_path_id"] = "xiaohongshu_selector_v1"
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_execution_path_not_supported",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_validator_requires_empty_legacy_repost_bucket(self):
+        plan = complete_xiaohongshu_plan()
+        plan["content_requirements"]["reposted"]["topic_tags"] = ["#转发#"]
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_repost_content_not_supported",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_comment_requires_exact_reviewed_text(self):
+        plan = complete_xiaohongshu_plan()
+        plan["action_payloads"]["commented"] = {}
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error, "action_payload_commented_text_required"
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_plan_requires_all_four_actions_in_canonical_order(self):
+        plan = complete_xiaohongshu_plan()
+        plan["required_actions"].remove("favorited")
+        plan["action_payloads"].pop("favorited")
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error, "xiaohongshu_four_action_plan_required"
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_favorite_is_not_silently_enabled_for_bilibili(self):
+        plan = complete_plan()
+        plan["required_actions"].insert(3, "favorited")
+        plan["action_payloads"]["favorited"] = {}
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error, "action_plan_required_actions_invalid"
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
 
 
 if __name__ == "__main__":
