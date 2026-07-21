@@ -79,19 +79,43 @@ def platform_real_adapter_kind(selector_config: dict, platform: str) -> str:
     return "none"
 
 
+def platform_probe_ready_for_real_actions(platform: str, probe_summary) -> bool:
+    """Return whether the available probe covers the platform's execution path.
+
+    The current probe worker inspects browser selectors. That evidence cannot
+    qualify Bilibili's HTTP API mutation path. For selector adapters, neither
+    the Probe nor Shadow evidence is bound to the exact selector-config version,
+    so changing selectors after evidence collection could authorize unrelated
+    clicks. Keep both paths fail-closed until versioned evidence is persisted.
+    """
+    if platform_has_api_real_adapter(platform) or platform in STRUCTURED_SELECTOR_PLATFORMS:
+        return False
+    return bool(
+        isinstance(probe_summary, dict)
+        and probe_summary.get("ready_for_real_actions") is True
+    )
+
+
 def selector_config_complete(platform: str, configured: dict) -> bool:
     if not isinstance(configured, dict):
         return False
     if platform not in STRUCTURED_SELECTOR_PLATFORMS:
         return all(bool(configured.get(phase)) for phase in PHASES)
-    if not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
-        return False
+    for phase in ("followed", "liked", "reposted"):
+        phase_config = configured.get(phase)
+        if not isinstance(phase_config, dict):
+            return False
+        if not click_selectors(phase_config) or not selector_values(
+            phase_config.get("done") or phase_config.get("success")
+        ):
+            return False
     comment = configured.get("commented")
     if not isinstance(comment, dict):
         return False
     return bool(
         selector_values(comment.get("input") or comment.get("inputs"))
         and selector_values(comment.get("submit") or comment.get("submits"))
+        and selector_values(comment.get("done") or comment.get("success"))
     )
 
 

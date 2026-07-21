@@ -1,4 +1,23 @@
 services:
+  evidence-init:
+    image: alpine:3.20
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        mkdir -p /evidence/task-failures /evidence/shadow-runs /evidence/adapter-probes
+        chmod 0700 /evidence /evidence/task-failures /evidence/shadow-runs /evidence/adapter-probes
+    volumes:
+      - evidence-data:/evidence
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   nginx:
     image: nginx:alpine
     ports:
@@ -30,12 +49,14 @@ services:
       - ./releases:/app/releases
       - ./backups:/app/backups
       - ./browser-profiles:/profiles
+      - evidence-data:/evidence:ro
       - ./logs:/app/logs
     env_file:
       - .env
     environment:
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-user}:${MYSQL_PASSWORD:-password}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
       REDIS_URL: redis://redis:6379/0
+      EVIDENCE_ROOT: /evidence
     networks:
       - app-net
     depends_on:
@@ -43,6 +64,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      evidence-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 10s
@@ -63,16 +86,20 @@ services:
     volumes:
       - ./worker/app:/app/app
       - ./browser-profiles:/profiles
+      - evidence-data:/evidence
     env_file:
       - .env
     environment:
       DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-user}:${MYSQL_PASSWORD:-password}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
       REDIS_URL: redis://redis:6379/0
+      EVIDENCE_ROOT: /evidence
     networks:
       - app-net
     depends_on:
       core-api:
         condition: service_healthy
+      evidence-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os, sys, time; p='/tmp/worker-health'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 90 else 1)\""]
       interval: 10s
@@ -147,3 +174,4 @@ networks:
 
 volumes:
   mysql-data:
+  evidence-data:

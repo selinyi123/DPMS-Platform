@@ -3,7 +3,7 @@ import json
 import uuid
 from typing import Any
 
-from app.db import database, redis
+from app.db import database, execute_affected_rows, redis
 from app.utils.log import structured_log
 
 
@@ -100,9 +100,10 @@ def _retry_status(attempts: int) -> str:
 
 
 async def reclaim_stale_task_outbox() -> int:
-    result = await database.execute(
+    result = await execute_affected_rows(
         """UPDATE task_outbox_events SET status = 'pending'
-           WHERE status = 'sending' AND updated_at < (NOW() - INTERVAL 60 SECOND)"""
+           WHERE status = 'sending' AND updated_at < (NOW() - INTERVAL 60 SECOND)""",
+        db=database,
     )
     return int(result or 0)
 

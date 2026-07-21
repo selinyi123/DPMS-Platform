@@ -4,6 +4,15 @@ from app.utils.lottery_targets import validate_lottery_target
 
 
 class LotteryTargetValidationTests(unittest.TestCase):
+    def test_known_platform_case_variant_does_not_fall_back_to_generic(self):
+        result = validate_lottery_target(
+            " BILIBILI ",
+            "https://evil.example/video/BV1xx411c7mD",
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual("bilibili_actionable_url_required", result.reason)
+
     def test_accepts_bilibili_video(self):
         result = validate_lottery_target("bilibili", "https://www.bilibili.com/video/BV1xx411c7mD")
         self.assertTrue(result.valid)
@@ -13,6 +22,70 @@ class LotteryTargetValidationTests(unittest.TestCase):
         result = validate_lottery_target("bilibili", "https://t.bilibili.com/123456789")
         self.assertTrue(result.valid)
         self.assertEqual("dynamic", result.kind)
+
+    def test_accepts_default_ports(self):
+        cases = (("https://www.bilibili.com:443/opus/1220306071196794898", "dynamic"),)
+        for url, kind in cases:
+            with self.subTest(url=url):
+                result = validate_lottery_target("bilibili", url)
+                self.assertTrue(result.valid)
+                self.assertEqual(kind, result.kind)
+
+    def test_rejects_plain_http_for_structured_platforms(self):
+        for platform, url, kind in (
+            ("bilibili", "http://t.bilibili.com/123456789", "dynamic"),
+            ("weibo", "http://t.cn/A6abcdef", "short_link"),
+            ("xiaohongshu", "http://xhslink.com/a/AbC123def", "short_link"),
+            ("douyin", "http://v.douyin.com/abc123/", "short_link"),
+        ):
+            with self.subTest(platform=platform):
+                result = validate_lottery_target(platform, url)
+                self.assertFalse(result.valid)
+                self.assertEqual(kind, result.kind)
+                self.assertEqual("https_required", result.reason)
+
+    def test_does_not_misdiagnose_unsafe_or_foreign_http_as_https_only(self):
+        cases = (
+            (
+                "http://operator@www.bilibili.com/opus/1220306071196794898",
+                "invalid_url",
+            ),
+            (
+                "http://www.bilibili.com:444/opus/1220306071196794898",
+                "invalid_url",
+            ),
+            (
+                "http://www.bilibili.com.evil.example/opus/1220306071196794898",
+                "bilibili_actionable_url_required",
+            ),
+        )
+        for url, reason in cases:
+            with self.subTest(url=url):
+                result = validate_lottery_target("bilibili", url)
+                self.assertFalse(result.valid)
+                self.assertEqual(reason, result.reason)
+
+    def test_rejects_userinfo_hostname_and_port_confusion(self):
+        for url in (
+            "https://www.bilibili.com:443@127.0.0.1/opus/1220306071196794898",
+            "https://operator@www.bilibili.com/opus/1220306071196794898",
+            "https://www.bilibili.com:444/opus/1220306071196794898",
+            "https://www.bilibili.com:not-a-port/opus/1220306071196794898",
+            "https://www.bilibili.com.evil.example/opus/1220306071196794898",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("bilibili", url)
+                self.assertFalse(result.valid)
+
+    def test_rejects_unsafe_authority_for_generic_platform(self):
+        for url in (
+            "https://trusted.example:443@127.0.0.1/path",
+            "https://trusted.example:8443/path",
+        ):
+            with self.subTest(url=url):
+                result = validate_lottery_target("kuaishou", url)
+                self.assertFalse(result.valid)
+                self.assertEqual("invalid_url", result.reason)
 
     def test_rejects_bilibili_homepage_and_test_query(self):
         for url in (
@@ -67,7 +140,7 @@ class LotteryTargetValidationTests(unittest.TestCase):
                 self.assertEqual("note", result.kind)
 
     def test_accepts_xiaohongshu_short_link(self):
-        result = validate_lottery_target("xiaohongshu", "http://xhslink.com/a/AbC123def")
+        result = validate_lottery_target("xiaohongshu", "https://xhslink.com/a/AbC123def")
         self.assertTrue(result.valid)
         self.assertEqual("short_link", result.kind)
 

@@ -18,10 +18,14 @@ SELECTOR_GATED = ("weibo", "douyin", "xiaohongshu")
 def _complete_config(platform):
     return {
         platform: {
-            "followed": ["button:has-text('关注')"],
-            "liked": ["[aria-label*='点赞']"],
-            "reposted": ["button:has-text('转发')"],
-            "commented": {"input": ["textarea"], "submit": ["button:has-text('发布')"]},
+            "followed": {"click": ["button.follow"], "done": ["button.following"]},
+            "liked": {"click": ["button.like"], "done": ["button.liked"]},
+            "reposted": {"click": ["button.repost"], "done": ["div.repost-sent"]},
+            "commented": {
+                "input": ["textarea"],
+                "submit": ["button.publish"],
+                "done": ["div.comment-sent"],
+            },
         }
     }
 
@@ -71,6 +75,14 @@ class PlatformAdapterStatusTests(unittest.TestCase):
         os.environ[SELECTOR_ENV] = json.dumps(
             {"weibo": {"followed": ["x"], "liked": ["y"], "reposted": ["z"]}}
         )
+        cfg = get_platform("weibo")
+        self.assertFalse(cfg["action_adapter"])
+        self.assertEqual(cfg["adapter_status"], "calibration_required")
+
+    def test_config_without_success_readback_does_not_enable(self):
+        config = _complete_config("weibo")
+        del config["weibo"]["liked"]["done"]
+        os.environ[SELECTOR_ENV] = json.dumps(config)
         cfg = get_platform("weibo")
         self.assertFalse(cfg["action_adapter"])
         self.assertEqual(cfg["adapter_status"], "calibration_required")

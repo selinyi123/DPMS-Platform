@@ -40,10 +40,10 @@ class RecommendedConfigFromProbeTests(unittest.TestCase):
         config = recommended_config_from_probe(result, "bilibili")
         self.assertTrue(config)
 
-    def test_extracted_config_passes_completeness_gate(self):
+    def test_probe_recommendation_without_success_readback_stays_incomplete(self):
         result = _probe_result(recommended=_complete_bilibili_recommendation())
         config = recommended_config_from_probe(result, "bilibili")
-        self.assertTrue(selector_config_complete("bilibili", config))
+        self.assertFalse(selector_config_complete("bilibili", config))
 
     def test_missing_recommendation_returns_empty(self):
         self.assertEqual(recommended_config_from_probe(_probe_result(), "bilibili"), {})

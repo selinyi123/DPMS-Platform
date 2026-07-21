@@ -14,10 +14,6 @@ _schema_write_allowed = contextvars.ContextVar("schema_write_allowed", default=F
 
 
 DDL_RE = re.compile(r"^\s*(ALTER|CREATE|DROP|RENAME|TRUNCATE)\s+", re.IGNORECASE)
-RUNTIME_SEED_RE = re.compile(
-    r"^\s*INSERT\s+INTO\s+(runtime_settings|circuit_breakers|policy_versions)\b",
-    re.IGNORECASE,
-)
 
 
 def production_mode() -> bool:
@@ -37,9 +33,41 @@ def _query_text(query) -> str:
     return str(query or "")
 
 
-def _is_runtime_schema_write(query) -> bool:
+def _schema_guard_sql_body(query) -> str:
+    """Return the first executable SQL body after harmless leading comments.
+
+    MySQL executes ``/*! ... */`` comments, so their body must be inspected
+    rather than discarded. This helper is only a defence-in-depth classifier;
+    production database privileges remain the authoritative schema boundary.
+    """
+
     text = _query_text(query)
-    return bool(DDL_RE.search(text) or RUNTIME_SEED_RE.search(text))
+    while True:
+        text = text.lstrip()
+        if text.startswith("--") or text.startswith("#"):
+            newline = text.find("\n")
+            return "" if newline < 0 else _schema_guard_sql_body(text[newline + 1 :])
+        if not text.startswith("/*"):
+            return text
+        end = text.find("*/", 2)
+        if end < 0:
+            return text
+        comment_body = text[2:end].lstrip()
+        if comment_body.startswith("!"):
+            executable = re.sub(r"^!\d*\s*", "", comment_body)
+            # MySQL may split a statement across the executable comment and
+            # ordinary SQL, e.g. ``/*!50000 CREATE*/ TABLE x``.
+            return f"{executable} {text[end + 2 :]}".strip()
+        text = text[end + 2 :]
+
+
+def _is_schema_write(query) -> bool:
+    text = _schema_guard_sql_body(query)
+    # Runtime settings, circuit breakers, and policy versions are ordinary
+    # application data. Blocking their INSERT/UPSERT statements in production
+    # silently disables safety controls. Only actual DDL belongs behind the
+    # migration-only schema-write context.
+    return bool(DDL_RE.search(text))
 
 
 class GuardedDatabase:
@@ -47,7 +75,7 @@ class GuardedDatabase:
         self._inner = databases.Database(url)
 
     async def execute(self, query, values=None, *args, **kwargs):
-        if production_mode() and not _schema_write_allowed.get() and _is_runtime_schema_write(query):
+        if production_mode() and not _schema_write_allowed.get() and _is_schema_write(query):
             text = _query_text(query).strip().splitlines()[0][:160]
             structured_log(
                 "warning",
@@ -62,6 +90,27 @@ class GuardedDatabase:
 
 
 database = GuardedDatabase(settings.database_url)
+
+
+async def execute_affected_rows(query, values=None, *, db=None) -> int:
+    """Execute one MySQL DML statement and return its real affected-row count.
+
+    ``databases`` returns the driver's ``lastrowid`` from ``execute()``.  That
+    is useful for INSERTs, but it is not an affected-row count for conditional
+    UPDATE/DELETE statements.  ``ROW_COUNT()`` is connection-local, so both
+    statements must run in the same transaction-bound connection.
+    """
+
+    target = db or database
+    async with target.transaction():
+        await target.execute(query, values)
+        row = await target.fetch_one("SELECT ROW_COUNT() AS affected")
+    if row is None:
+        raise RuntimeError("database_affected_row_count_unavailable")
+    affected = int(row["affected"])
+    if affected < 0:
+        raise RuntimeError("database_affected_row_count_invalid")
+    return affected
 
 
 class RedisClient:

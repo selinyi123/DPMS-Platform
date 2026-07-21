@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from app.utils.canonicalizer import (
     BilibiliCanonicalizer,
@@ -6,7 +7,89 @@ from app.utils.canonicalizer import (
     WeiboCanonicalizer,
     XiaohongshuCanonicalizer,
     canonicalize_platform_url,
+    resolve_platform_short_link,
 )
+
+
+class _RedirectResponse:
+    def __init__(self, location: str | None, status_code: int = 302):
+        self.status_code = status_code
+        self.headers = {"location": location} if location else {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _RedirectClient:
+    def __init__(self, location: str, *, head_status: int = 302):
+        self.location = location
+        self.head_status = head_status
+        self.requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def head(self, url, **_kwargs):
+        self.requests.append(url)
+        return _RedirectResponse(
+            self.location if self.head_status in {301, 302, 303, 307, 308} else None,
+            self.head_status,
+        )
+
+    def stream(self, method, url, **_kwargs):
+        self.requests.append(f"{method} {url}")
+        return _RedirectResponse(self.location)
+
+
+class ShortLinkSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_safe_platform_redirect_is_returned_without_following_unchecked_hops(self):
+        client = _RedirectClient("https://www.bilibili.com/opus/1220306071196794898")
+        with patch("httpx.AsyncClient", return_value=client):
+            resolved = await resolve_platform_short_link(
+                "https://b23.tv/AbCdEf",
+                "bilibili",
+                "b23.tv",
+            )
+
+        self.assertEqual(resolved, "https://www.bilibili.com/opus/1220306071196794898")
+        self.assertEqual(client.requests, ["https://b23.tv/AbCdEf"])
+
+    async def test_redirect_to_private_or_foreign_host_is_rejected_before_request(self):
+        for location in ("http://127.0.0.1/admin", "https://evil.example/steal"):
+            with self.subTest(location=location):
+                client = _RedirectClient(location)
+                with patch("httpx.AsyncClient", return_value=client):
+                    with self.assertRaisesRegex(ValueError, "canonicalization_target_not_allowed"):
+                        await resolve_platform_short_link(
+                            "https://b23.tv/AbCdEf",
+                            "bilibili",
+                            "b23.tv",
+                        )
+                self.assertEqual(client.requests, ["https://b23.tv/AbCdEf"])
+
+    async def test_get_fallback_preserves_shorteners_that_reject_head(self):
+        client = _RedirectClient(
+            "https://www.bilibili.com/opus/1220306071196794898",
+            head_status=405,
+        )
+        with patch("httpx.AsyncClient", return_value=client):
+            resolved = await resolve_platform_short_link(
+                "https://b23.tv/AbCdEf",
+                "bilibili",
+                "b23.tv",
+            )
+
+        self.assertEqual(resolved, "https://www.bilibili.com/opus/1220306071196794898")
+        self.assertEqual(
+            client.requests,
+            ["https://b23.tv/AbCdEf", "GET https://b23.tv/AbCdEf"],
+        )
 
 
 class WeiboCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
@@ -62,9 +145,26 @@ class DouyinCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlatformDispatchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_known_platform_case_variant_uses_structured_canonicalizer(self):
+        result = await canonicalize_platform_url(
+            " BILIBILI ",
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+        )
+
+        self.assertEqual("canonical://bilibili/video/BV1xx411c7mD", result)
+
     async def test_bilibili_video_regression(self):
         result = await BilibiliCanonicalizer.canonicalize("https://www.bilibili.com/video/BV1xx411c7mD")
         self.assertEqual("canonical://bilibili/video/BV1xx411c7mD", result.to_uri())
+
+    async def test_trailing_dot_host_uses_the_same_normalized_identity(self):
+        result = await BilibiliCanonicalizer.canonicalize(
+            "https://www.bilibili.com./opus/1220306071196794898"
+        )
+        self.assertEqual(
+            "canonical://bilibili/dynamic/opus_1220306071196794898",
+            result.to_uri(),
+        )
 
     async def test_dispatches_weibo_and_xiaohongshu(self):
         weibo = await canonicalize_platform_url("weibo", "https://weibo.com/detail/4890123456789012")

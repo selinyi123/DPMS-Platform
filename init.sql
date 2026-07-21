@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS `accounts` (
 
   `version` BIGINT NOT NULL DEFAULT 0 COMMENT '乐观锁',
 
+  `execution_revision` BIGINT UNSIGNED NOT NULL DEFAULT 1 COMMENT 'Cookie/代理等执行身份修订号',
+
   `risk_score` TINYINT UNSIGNED DEFAULT 0,
 
   `daily_task_count` INT DEFAULT 0,
@@ -87,7 +89,9 @@ CREATE TABLE IF NOT EXISTS `accounts` (
 
   INDEX `idx_status` (`platform`, `status`),
 
-  INDEX `idx_accounts_deleted` (`deleted_at`, `status`)
+  INDEX `idx_accounts_deleted` (`deleted_at`, `status`),
+
+  CONSTRAINT `chk_account_execution_revision` CHECK (`execution_revision` > 0)
 
 ) ENGINE=InnoDB;
 

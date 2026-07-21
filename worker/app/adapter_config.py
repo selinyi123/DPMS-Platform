@@ -38,14 +38,21 @@ def has_complete_selectors(platform: str) -> bool:
     configured = selectors_for(platform)
     if platform not in STRUCTURED_SELECTOR_PLATFORMS:
         return all(bool(configured.get(phase)) for phase in PHASES)
-    if not all(click_selectors(configured.get(phase)) for phase in ("followed", "liked", "reposted")):
-        return False
+    for phase in ("followed", "liked", "reposted"):
+        phase_config = configured.get(phase)
+        if not isinstance(phase_config, dict):
+            return False
+        if not click_selectors(phase_config) or not selector_values(
+            phase_config.get("done") or phase_config.get("success")
+        ):
+            return False
     comment = configured.get("commented")
     if not isinstance(comment, dict):
         return False
     return bool(
         selector_values(comment.get("input") or comment.get("inputs"))
         and selector_values(comment.get("submit") or comment.get("submits"))
+        and selector_values(comment.get("done") or comment.get("success"))
     )
 
 

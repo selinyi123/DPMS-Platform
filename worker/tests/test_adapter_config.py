@@ -15,10 +15,14 @@ from app.adapter_config import (
 def complete_structured_config():
     """A minimal but complete selector config for a structured platform."""
     return {
-        "followed": {"click": ["button.follow"]},
-        "liked": {"click": ["button.like"]},
-        "reposted": {"click": ["button.repost"]},
-        "commented": {"input": ["textarea.comment"], "submit": ["button.send"]},
+        "followed": {"click": ["button.follow"], "done": ["button.following"]},
+        "liked": {"click": ["button.like"], "done": ["button.liked"]},
+        "reposted": {"click": ["button.repost"], "done": ["div.repost-sent"]},
+        "commented": {
+            "input": ["textarea.comment"],
+            "submit": ["button.send"],
+            "done": ["div.comment-sent"],
+        },
     }
 
 
@@ -152,6 +156,14 @@ class HasCompleteSelectorsTests(unittest.TestCase):
         config["commented"] = {"input": ["textarea"]}  # missing submit
         self._set({"xiaohongshu": config})
         self.assertFalse(has_complete_selectors("xiaohongshu"))
+
+    def test_every_mutation_requires_success_readback_selector(self):
+        for phase in ("followed", "liked", "commented", "reposted"):
+            with self.subTest(phase=phase):
+                config = complete_structured_config()
+                del config[phase]["done"]
+                self._set({"weibo": config})
+                self.assertFalse(has_complete_selectors("weibo"))
 
     def test_comment_must_be_dict(self):
         config = complete_structured_config()

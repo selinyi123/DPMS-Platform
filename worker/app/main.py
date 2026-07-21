@@ -12,6 +12,11 @@ from app.account_calibrator import calibration_loop
 from app.adapter_probe import probe_loop
 from app.config import settings
 from app.db import database, redis as redis_client
+from app.evidence_storage import (
+    DEFAULT_EVIDENCE_DIRECTORIES,
+    EvidenceStoragePreflightError,
+    preflight_evidence_storage,
+)
 from app.event_store.service import ensure_event_schema, record_event
 from app.login_broker import login_loop
 from app.services.task_outbox import start_task_outbox_dispatcher
@@ -23,6 +28,67 @@ HEALTH_FILE = Path("/tmp/worker-health")
 WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
 STARTUP_CONNECT_ATTEMPTS = int(os.getenv("WORKER_STARTUP_CONNECT_ATTEMPTS", "30"))
 STARTUP_CONNECT_DELAY_SECONDS = float(os.getenv("WORKER_STARTUP_CONNECT_DELAY_SECONDS", "2"))
+
+
+def clear_stale_health_marker() -> None:
+    """A failed restart must not inherit a briefly healthy old heartbeat."""
+
+    try:
+        HEALTH_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        structured_log(
+            "critical",
+            "worker_health_marker_reset_failed",
+            path=str(HEALTH_FILE),
+            errno=getattr(exc, "errno", None),
+            cause_type=type(exc).__name__,
+        )
+        raise
+
+
+async def ensure_evidence_storage_ready() -> tuple[str, ...]:
+    """Fail startup before any browser/task loop if evidence is unsafe."""
+
+    try:
+        checked = await asyncio.to_thread(
+            preflight_evidence_storage,
+            DEFAULT_EVIDENCE_DIRECTORIES,
+        )
+    except EvidenceStoragePreflightError as exc:
+        structured_log(
+            "critical",
+            "worker_evidence_storage_preflight_failed",
+            code=exc.code,
+            directory=exc.directory,
+            component=exc.component,
+            operation=exc.operation,
+            errno=exc.errno_value,
+            cause_type=exc.cause_type,
+            primary_code=exc.primary_code,
+        )
+        raise
+    except Exception as exc:
+        structured_log(
+            "critical",
+            "worker_evidence_storage_preflight_failed",
+            code="evidence_storage_preflight_unclassified",
+            directory="<unknown>",
+            operation="preflight",
+            errno=getattr(exc, "errno", None),
+            cause_type=type(exc).__name__,
+        )
+        raise
+
+    structured_log(
+        "info",
+        "worker_evidence_storage_preflight_succeeded",
+        directories=len(checked),
+        capabilities=(
+            "private_mode,openat,nofollow,flock,exclusive_create,"
+            "file_fsync,directory_fsync,identity_unlink"
+        ),
+    )
+    return checked
 
 
 async def connect_with_retry(name: str, connect_call) -> None:
@@ -101,6 +167,8 @@ async def reload_signal_loop(shutdown_event: asyncio.Event):
 
 
 async def main():
+    clear_stale_health_marker()
+    await ensure_evidence_storage_ready()
     await connect_with_retry("worker_db", database.connect)
     await connect_with_retry("worker_redis", redis_client.initialize)
     await ensure_event_schema()

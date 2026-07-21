@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import unittest
 
@@ -12,6 +13,7 @@ from app.governance.policy import (  # noqa: E402
     build_decision_record,
     evaluate_policy,
 )
+from app.services import real_run_gate  # noqa: E402
 from app.services.real_run_gate import failed_gate_codes, gate_inputs  # noqa: E402
 
 
@@ -85,6 +87,126 @@ class GateInputContractTests(unittest.TestCase):
         decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
         self.assertEqual(decision["outcome"], "block")
         self.assertIn("global_real_run_enabled", decision["failed"])
+
+    def test_action_plan_blockers_override_inconsistent_ready_flag(self):
+        blockers = (
+            "lottery_action_plan_required",
+            "lottery_rule_text_required",
+            "lottery_rule_review_required",
+            "lottery_required_actions_missing",
+            "lottery_action_plan_stale",
+            "lottery_action_plan_future_blocker",
+        )
+        for blocker in blockers:
+            with self.subTest(blocker=blocker):
+                gate = _full_pass_gate()
+                gate["blockers"] = [blocker]
+
+                inputs = gate_inputs(gate, breaker_allowed=True)
+                decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
+
+                self.assertFalse(inputs["action_plan_reviewed"])
+                self.assertEqual(decision["outcome"], "block")
+                self.assertIn("action_plan_reviewed", decision["failed"])
+
+    def test_permissive_active_policy_cannot_delete_probe_and_shadow_gates(self):
+        permissive_policy = {
+            "policy_key": "real_run_gate",
+            "version": 99,
+            "gates": [
+                {
+                    "code": "global_real_run_enabled",
+                    "required": True,
+                    "remediation": "enable_real_run",
+                }
+            ],
+        }
+        gate = _full_pass_gate()
+        gate["probe_ready"] = False
+        gate["shadow_ready"] = False
+        inputs = gate_inputs(gate, breaker_allowed=True)
+
+        record = build_decision_record(
+            policy=permissive_policy,
+            inputs=inputs,
+            subject_type="lottery",
+            subject_id="1",
+        )
+
+        self.assertEqual("block", record["outcome"])
+        self.assertEqual(
+            ["recent_complete_probe", "recent_shadow_run"],
+            failed_gate_codes(record),
+        )
+
+    def test_permissive_active_policy_cannot_relax_breaker_or_account_risk(self):
+        permissive_policy = {
+            "policy_key": "real_run_gate",
+            "version": 100,
+            "gates": [
+                {"code": "circuit_breaker_closed", "required": False},
+                {"code": "no_recent_account_risk", "required": False},
+            ],
+        }
+        gate = _full_pass_gate()
+        gate["blockers"] = ["recent_account_risk_event"]
+        inputs = gate_inputs(gate, breaker_allowed=False)
+
+        record = build_decision_record(
+            policy=permissive_policy,
+            inputs=inputs,
+            subject_type="lottery",
+            subject_id="1",
+        )
+
+        self.assertEqual("block", record["outcome"])
+        self.assertEqual(
+            ["circuit_breaker_closed", "no_recent_account_risk"],
+            failed_gate_codes(record),
+        )
+
+
+class ActivePolicyLoadingTests(unittest.IsolatedAsyncioTestCase):
+    async def load_with_row(self, row):
+        class FakeDatabase:
+            async def fetch_one(self, query, values=None):
+                return row
+
+        original_database = real_run_gate.database
+        real_run_gate.database = FakeDatabase()
+        try:
+            return await real_run_gate.load_active_policy()
+        finally:
+            real_run_gate.database = original_database
+
+    async def test_missing_active_row_uses_built_in_default(self):
+        policy = await self.load_with_row(None)
+        self.assertIs(policy, DEFAULT_REAL_RUN_POLICY)
+
+    async def test_malformed_active_definition_never_falls_back_to_default(self):
+        malformed_definitions = (None, "", "{not-json", "[]", b"\xff{}")
+        for definition in malformed_definitions:
+            with self.subTest(definition=definition):
+                with self.assertRaisesRegex(RuntimeError, "active_policy_definition_invalid"):
+                    await self.load_with_row({"definition": definition})
+
+    async def test_structurally_invalid_active_definition_fails_closed(self):
+        definition = {
+            "policy_key": "real_run_gate",
+            "version": 2,
+            "gates": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "active_policy_definition_invalid"):
+            await self.load_with_row({"definition": json.dumps(definition)})
+
+    async def test_valid_active_definition_is_returned(self):
+        definition = {
+            **DEFAULT_REAL_RUN_POLICY,
+            "version": 2,
+            "gates": [dict(gate) for gate in DEFAULT_REAL_RUN_POLICY["gates"]],
+        }
+        policy = await self.load_with_row({"definition": json.dumps(definition)})
+        self.assertEqual(policy, definition)
 
 
 class FailedGateCodesTests(unittest.TestCase):

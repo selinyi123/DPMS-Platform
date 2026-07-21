@@ -35,6 +35,21 @@ class ActionPlanFreshnessTests(unittest.TestCase):
 
         self.assertEqual(action_plan_missing_rule_actions(lottery, complete_plan), [])
 
+    def test_rejects_saved_plan_with_unrequested_extra_action(self):
+        lottery = {
+            "platform": "bilibili",
+            "rule_text": "抽奖：点赞本条动态",
+        }
+        overbroad_plan = {
+            "required_actions": ["liked", "reposted"],
+            "review_required": False,
+        }
+
+        self.assertEqual(
+            action_plan_missing_rule_actions(lottery, overbroad_plan),
+            ["reposted"],
+        )
+
 
 class AccountRiskPayloadTests(unittest.TestCase):
     def test_empty_risk_payload_is_not_recent_risk(self):

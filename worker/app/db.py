@@ -9,6 +9,21 @@ from app.utils.log import structured_log
 database = databases.Database(settings.database_url)
 
 
+async def execute_affected_rows(query, values=None, *, db=None) -> int:
+    """Execute MySQL DML and read the connection-local affected-row count."""
+
+    target = db or database
+    async with target.transaction():
+        await target.execute(query, values)
+        row = await target.fetch_one("SELECT ROW_COUNT() AS affected")
+    if row is None:
+        raise RuntimeError("database_affected_row_count_unavailable")
+    affected = int(row["affected"])
+    if affected < 0:
+        raise RuntimeError("database_affected_row_count_invalid")
+    return affected
+
+
 class RedisClient:
     def __init__(self):
         self._conn = None

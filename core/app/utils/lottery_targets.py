@@ -16,22 +16,54 @@ XIAOHONGSHU_NOTE_PATTERN = re.compile(r"[0-9a-fA-F]{24}")
 
 
 def validate_lottery_target(platform: str, raw_url: str) -> LotteryTargetValidation:
+    platform_key = str(platform or "").strip().lower()
     parsed = urlparse((raw_url or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return LotteryTargetValidation(False, reason="invalid_url")
-    if platform == "bilibili":
-        return validate_bilibili_target(parsed)
-    if platform == "weibo":
-        return validate_weibo_target(parsed)
-    if platform == "xiaohongshu":
-        return validate_xiaohongshu_target(parsed)
-    if platform == "douyin":
-        return validate_douyin_target(parsed)
-    return LotteryTargetValidation(True, kind="generic")
+    host = validated_url_host(parsed)
+    if host is None:
+        return LotteryTargetValidation(False, reason="invalid_url")
+
+    result: LotteryTargetValidation
+    if platform_key == "bilibili":
+        result = validate_bilibili_target(parsed, host)
+    elif platform_key == "weibo":
+        result = validate_weibo_target(parsed, host)
+    elif platform_key == "xiaohongshu":
+        result = validate_xiaohongshu_target(parsed, host)
+    elif platform_key == "douyin":
+        result = validate_douyin_target(parsed, host)
+    else:
+        return LotteryTargetValidation(True, kind="generic")
+
+    # Report HTTPS compatibility only for a URL that is otherwise an
+    # actionable target on the selected platform.  Checking this after the
+    # authority and target shape prevents unsafe or foreign HTTP URLs from
+    # being misdiagnosed as if changing only the scheme would make them safe.
+    if not result.valid:
+        return result
+    if parsed.scheme != "https":
+        return LotteryTargetValidation(False, kind=result.kind, reason="https_required")
+    return result
 
 
-def validate_bilibili_target(parsed) -> LotteryTargetValidation:
-    host = parsed.netloc.lower().split(":", 1)[0]
+def validated_url_host(parsed) -> str | None:
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port is not None and port != default_port:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    return host.rstrip(".").lower()
+
+
+def validate_bilibili_target(parsed, host: str) -> LotteryTargetValidation:
     path_parts = [part for part in parsed.path.split("/") if part]
 
     if host == "b23.tv" and path_parts:
@@ -56,8 +88,7 @@ def validate_bilibili_target(parsed) -> LotteryTargetValidation:
     return LotteryTargetValidation(False, reason="bilibili_actionable_url_required")
 
 
-def validate_weibo_target(parsed) -> LotteryTargetValidation:
-    host = parsed.netloc.lower().split(":", 1)[0]
+def validate_weibo_target(parsed, host: str) -> LotteryTargetValidation:
     path_parts = [part for part in parsed.path.split("/") if part]
 
     if host == "t.cn" and path_parts:
@@ -80,8 +111,7 @@ def is_weibo_status_id(value: str) -> bool:
     return bool(WEIBO_MID_PATTERN.fullmatch(value) or WEIBO_MBLOGID_PATTERN.fullmatch(value))
 
 
-def validate_xiaohongshu_target(parsed) -> LotteryTargetValidation:
-    host = parsed.netloc.lower().split(":", 1)[0]
+def validate_xiaohongshu_target(parsed, host: str) -> LotteryTargetValidation:
     path_parts = [part for part in parsed.path.split("/") if part]
 
     if host == "xhslink.com" and path_parts:
@@ -101,8 +131,7 @@ def validate_xiaohongshu_target(parsed) -> LotteryTargetValidation:
     return LotteryTargetValidation(False, reason="xiaohongshu_actionable_url_required")
 
 
-def validate_douyin_target(parsed) -> LotteryTargetValidation:
-    host = parsed.netloc.lower().split(":", 1)[0]
+def validate_douyin_target(parsed, host: str) -> LotteryTargetValidation:
     path_parts = [part for part in parsed.path.split("/") if part]
 
     if host == "v.douyin.com" and path_parts:

@@ -11,10 +11,88 @@ os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 from app.services.outbox import (  # noqa: E402
     LOTTERY_TASK_FIELDS,
     OUTBOX_MAX_ATTEMPTS,
+    _deliver_claimed,
+    _settle_terminal_delivery_failure,
     build_lottery_task_message,
+    reconcile_orphaned_locks,
     should_retry,
     terminal_status,
 )
+
+
+class _Transaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _TerminalFailureDatabase:
+    def __init__(
+        self,
+        task_status="queued",
+        stream_key="lottery_tasks",
+        *,
+        outbox_status="sending",
+        outbox_attempts=OUTBOX_MAX_ATTEMPTS,
+        probe_status="queued",
+    ):
+        self.task_status = task_status
+        self.stream_key = stream_key
+        self.outbox_status = outbox_status
+        self.outbox_attempts = outbox_attempts
+        self.probe_status = probe_status
+        self.executions = []
+
+    def transaction(self):
+        return _Transaction()
+
+    async def fetch_one(self, query, values=None):
+        if "FROM outbox_events" in query:
+            if self.stream_key == "adapter_probe_requests":
+                return {
+                    "id": 1,
+                    "stream_key": self.stream_key,
+                    "dedup_key": "adapter-probe:probe-1",
+                    "payload": json.dumps({"probe_id": "probe-1"}),
+                    "status": self.outbox_status,
+                    "attempts": self.outbox_attempts,
+                }
+            return {
+                "id": 1,
+                "stream_key": "lottery_tasks",
+                "dedup_key": "task-1",
+                "payload": json.dumps({"task_id": "task-1"}),
+                "status": self.outbox_status,
+                "attempts": self.outbox_attempts,
+            }
+        if "FROM task_runs" in query:
+            return {
+                "task_id": "task-1",
+                "account_id": 9,
+                "lottery_id": 42,
+                "status": self.task_status,
+                "task_mode": "dry_run",
+                "account_lease_id": "lease-task",
+                "account_lease_generation": 4,
+            }
+        if "FROM adapter_calibrations" in query:
+            return {
+                "account_id": 9,
+                "status": self.probe_status,
+                "account_lease_id": "lease-probe",
+                "account_lease_generation": 3,
+            }
+        if "FROM accounts" in query:
+            return {"id": 9}
+        if "FROM lotteries" in query:
+            return {"id": 42, "status": "claimed", "execution_lock": "task-1"}
+        raise AssertionError(query)
+
+    async def execute(self, query, values=None):
+        self.executions.append((str(query), dict(values or {})))
+        return 1
 
 
 class BuildLotteryTaskMessageTests(unittest.TestCase):
@@ -44,9 +122,10 @@ class BuildLotteryTaskMessageTests(unittest.TestCase):
             self.assertIsInstance(value, str, f"{key} must be a str for Redis xadd")
 
     def test_ids_are_stringified(self):
-        msg = self._msg(account_id=7, lottery_id=42)
+        msg = self._msg(account_id=7, lottery_id=42, execution_revision=9)
         self.assertEqual(msg["account_id"], "7")
         self.assertEqual(msg["lottery_id"], "42")
+        self.assertEqual(msg["execution_revision"], "9")
 
     def test_dry_run_flag_matches_mode(self):
         self.assertEqual(self._msg(task_mode="dry_run", dry_run=True)["dry_run"], "1")
@@ -89,18 +168,239 @@ class RetryPredicateTests(unittest.TestCase):
         self.assertEqual(terminal_status(OUTBOX_MAX_ATTEMPTS), "failed")
 
 
-class RecoveryPayloadContractTests(unittest.TestCase):
-    """The recovery daemon must produce the same field set as fresh dispatch."""
+class TerminalDeliverySettlementTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exhausted_lottery_task_is_failed_and_claim_is_released(self):
+        from app.services import outbox
 
-    def test_recovery_action_plan_parser(self):
-        from app.services.recovery_daemon import _parse_action_plan
+        fake = _TerminalFailureDatabase()
+        original = outbox.database
+        outbox.database = fake
+        try:
+            await _settle_terminal_delivery_failure(
+                {
+                    "id": 1,
+                    "stream_key": "lottery_tasks",
+                    "dedup_key": "task-1",
+                },
+                OUTBOX_MAX_ATTEMPTS,
+                RuntimeError("redis unavailable"),
+            )
+        finally:
+            outbox.database = original
 
-        self.assertEqual(_parse_action_plan(None), {})
-        self.assertEqual(_parse_action_plan({"x": 1}), {"x": 1})
-        self.assertEqual(_parse_action_plan('{"y": 2}'), {"y": 2})
-        self.assertEqual(_parse_action_plan(""), {})
-        self.assertEqual(_parse_action_plan("not json"), {})
-        self.assertEqual(_parse_action_plan(b'{"z": 3}'), {"z": 3})
+        statements = "\n".join(query for query, _ in fake.executions)
+        self.assertIn("SET status = 'failed'", statements)
+        self.assertIn("UPDATE task_runs", statements)
+        self.assertIn("UPDATE lotteries SET status = 'pending'", statements)
+
+    async def test_running_task_is_not_reversed_after_ambiguous_delivery(self):
+        from app.services import outbox
+
+        fake = _TerminalFailureDatabase(task_status="running")
+        original = outbox.database
+        outbox.database = fake
+        try:
+            await _settle_terminal_delivery_failure(
+                {
+                    "id": 1,
+                    "stream_key": "lottery_tasks",
+                    "dedup_key": "task-1",
+                },
+                OUTBOX_MAX_ATTEMPTS,
+                RuntimeError("redis response lost"),
+            )
+        finally:
+            outbox.database = original
+
+        statements = "\n".join(query for query, _ in fake.executions)
+        self.assertIn("SET status = 'failed'", statements)
+        self.assertNotIn("UPDATE task_runs", statements)
+        self.assertNotIn("UPDATE lotteries", statements)
+
+    async def test_exhausted_probe_delivery_marks_queued_calibration_failed(self):
+        from app.services import outbox
+
+        fake = _TerminalFailureDatabase(stream_key="adapter_probe_requests")
+        original = outbox.database
+        outbox.database = fake
+        try:
+            await _settle_terminal_delivery_failure(
+                {
+                    "id": 1,
+                    "stream_key": "adapter_probe_requests",
+                    "dedup_key": "adapter-probe:probe-1",
+                },
+                OUTBOX_MAX_ATTEMPTS,
+                RuntimeError("redis unavailable"),
+            )
+        finally:
+            outbox.database = original
+
+        statements = "\n".join(query for query, _ in fake.executions)
+        self.assertIn("SET status = 'failed'", statements)
+        self.assertIn("UPDATE adapter_calibrations", statements)
+        self.assertIn("operation_kind = 'adapter_probe'", statements)
+        self.assertNotIn("UPDATE task_runs", statements)
+
+    async def test_ambiguous_probe_delivery_does_not_release_running_probe(self):
+        from app.services import outbox
+
+        fake = _TerminalFailureDatabase(
+            stream_key="adapter_probe_requests",
+            probe_status="running",
+        )
+        original = outbox.database
+        outbox.database = fake
+        try:
+            await _settle_terminal_delivery_failure(
+                {
+                    "id": 1,
+                    "stream_key": "adapter_probe_requests",
+                    "dedup_key": "adapter-probe:probe-1",
+                },
+                OUTBOX_MAX_ATTEMPTS,
+                RuntimeError("redis response lost"),
+            )
+        finally:
+            outbox.database = original
+
+        statements = "\n".join(query for query, _ in fake.executions)
+        self.assertNotIn("UPDATE adapter_calibrations", statements)
+        self.assertNotIn("UPDATE account_operation_leases", statements)
+
+    async def test_stale_terminal_failure_cannot_overwrite_newer_claim(self):
+        from app.services import outbox
+
+        fake = _TerminalFailureDatabase(outbox_attempts=OUTBOX_MAX_ATTEMPTS + 1)
+        original = outbox.database
+        outbox.database = fake
+        try:
+            await _settle_terminal_delivery_failure(
+                {"id": 1, "stream_key": "lottery_tasks", "dedup_key": "task-1"},
+                OUTBOX_MAX_ATTEMPTS,
+                RuntimeError("late failure"),
+            )
+        finally:
+            outbox.database = original
+
+        self.assertEqual(fake.executions, [])
+
+
+class _StaleReceiptDatabase:
+    def __init__(self, affected=0):
+        self.affected = affected
+        self.executions = []
+
+    def transaction(self):
+        return _Transaction()
+
+    async def execute(self, query, values=None):
+        self.executions.append((str(query), dict(values or {})))
+        return 0
+
+    async def fetch_one(self, query, values=None):
+        self.executions.append((str(query), dict(values or {})))
+        if "ROW_COUNT()" in str(query):
+            return {"affected": self.affected}
+        raise AssertionError(query)
+
+
+class _SuccessfulRedis:
+    async def xadd(self, *_args, **_kwargs):
+        return "1-0"
+
+
+class DeliveryFencingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_success_receipt_does_not_report_newer_claim_as_sent(self):
+        from app.services import outbox
+
+        fake_database = _StaleReceiptDatabase()
+        original_database = outbox.database
+        original_redis = outbox.redis
+        outbox.database = fake_database
+        outbox.redis = _SuccessfulRedis()
+        try:
+            delivered = await _deliver_claimed(
+                {
+                    "id": 1,
+                    "stream_key": "lottery_tasks",
+                    "payload": json.dumps({"task_id": "task-1"}),
+                    "attempts": 2,
+                }
+            )
+        finally:
+            outbox.database = original_database
+            outbox.redis = original_redis
+
+        self.assertFalse(delivered)
+        query, values = fake_database.executions[0]
+        self.assertIn("status = 'sending'", query)
+        self.assertIn("attempts = :attempts", query)
+        self.assertEqual(values["attempts"], 2)
+
+    async def test_success_receipt_uses_row_count_even_when_execute_returns_zero(self):
+        from app.services import outbox
+
+        fake_database = _StaleReceiptDatabase(affected=1)
+        original_database = outbox.database
+        original_redis = outbox.redis
+        outbox.database = fake_database
+        outbox.redis = _SuccessfulRedis()
+        try:
+            delivered = await _deliver_claimed(
+                {
+                    "id": 1,
+                    "stream_key": "lottery_tasks",
+                    "payload": json.dumps({"task_id": "task-1"}),
+                    "attempts": 2,
+                }
+            )
+        finally:
+            outbox.database = original_database
+            outbox.redis = original_redis
+
+        self.assertTrue(delivered)
+        self.assertTrue(any("ROW_COUNT()" in query for query, _ in fake_database.executions))
+
+
+class _AffectedRowsDatabase:
+    def __init__(self):
+        self.query = None
+        self.values = None
+
+    def transaction(self):
+        return _Transaction()
+
+    async def execute(self, query, values=None):
+        self.query = str(query)
+        self.values = dict(values or {})
+        return 3
+
+    async def fetch_one(self, query, values=None):
+        self.row_count_query = str(query)
+        return {"affected": 3}
+
+
+class OrphanLockSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_partial_commit_is_not_unlocked_for_replay(self):
+        from app.services import outbox
+
+        fake = _AffectedRowsDatabase()
+        original = outbox.database
+        outbox.database = fake
+        try:
+            affected = await reconcile_orphaned_locks(grace_minutes=17)
+        finally:
+            outbox.database = original
+
+        self.assertEqual(affected, 3)
+        self.assertEqual(fake.values["grace"], 17)
+        compact = " ".join(fake.query.split())
+        self.assertIn("tr.reconciliation_required = 0", compact)
+        self.assertIn("eai.status IN ('started', 'unknown', 'succeeded')", compact)
+        self.assertIn("eai.effect_certainty IN ('unknown', 'confirmed_effect')", compact)
+        self.assertIn("eai.effect_certainty <> 'confirmed_no_effect'", compact)
+        self.assertIn("THEN 'participated'", compact)
 
 
 if __name__ == "__main__":

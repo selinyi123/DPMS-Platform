@@ -1,8 +1,16 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
 import { formatText } from '../i18n/format';
+import {
+  refreshedWorkflowBindings,
+  selectorExecutionEvidenceReady,
+  workflowActivityIdentity,
+} from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
+
+const REAL_RUN_EVIDENCE_TTL_MS = 65000;
+const REAL_RUN_EVIDENCE_REFRESH_MS = 60000;
 
 export default function Deploy() {
   const { notify: toast, t } = useUi();
@@ -21,6 +29,8 @@ export default function Deploy() {
   const [adapterConfig, setAdapterConfig] = useState(null);
   const [runtimeSettings, setRuntimeSettings] = useState(null);
   const [realRunEvidence, setRealRunEvidence] = useState([]);
+  const [externalIntents, setExternalIntents] = useState([]);
+  const [reconciliationItems, setReconciliationItems] = useState([]);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [realRunArmed, setRealRunArmed] = useState(false);
   const [rollbackArmed, setRollbackArmed] = useState(false);
@@ -30,38 +40,109 @@ export default function Deploy() {
   const [notify, setNotify] = useState({ channel: 'serverchan', title: 'DPMS test', content: 'Notification channel test' });
   const [platforms, setPlatforms] = useState([]);
   const [readinessPlatform, setReadinessPlatform] = useState('bilibili');
+  const workflowActivityIdentityRef = useRef('');
+  const evidenceBindingByPlatformRef = useRef(new Map());
+  const loadGenerationRef = useRef(0);
+  const evidenceLoadsInFlightRef = useRef(0);
+  const evidenceRefreshPendingRef = useRef(false);
+  const evidenceExpiryTimerRef = useRef(null);
+  const mountedRef = useRef(true);
 
-  const loadNotify = async () => {
-    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, taskRows, runtimeRows, evidenceRows, platformRows] = await Promise.all([
-      fetchJSON('/notify/channels'),
-      fetchJSON('/notify/status'),
-      fetchJSON('/notify/config-guide'),
-      fetchJSON('/notify/logs'),
-      fetchJSON('/lotteries/adapters/config'),
-      fetchJSON('/lotteries/probes'),
-      fetchJSON('/lotteries/tasks/runs'),
-      fetchJSON('/metrics/runtime/settings'),
-      fetchJSON('/lotteries/real-run/evidence'),
-      fetchJSON('/accounts/platforms'),
-    ]);
-    setChannels(channelRows);
-    setNotifyStatus(statusRows);
-    setNotifyGuide(guideRows);
-    setLogs(logRows);
-    setAdapterConfig(adapterRows);
-    setProbes(probeRows);
-    setTaskRuns(taskRows);
-    setRuntimeSettings(runtimeRows);
-    setRealRunEvidence(evidenceRows.items || []);
-    setPlatforms(platformRows);
+  const reportLoadError = (err) => {
+    if (!mountedRef.current) return;
+    const text = formatText(t('deploy.loadFailed'), { message: err.message });
+    setMessage(text);
+    toast(text, 'error');
+  };
+
+  const loadNotify = async (includeRealRunEvidence = true) => {
+    if (includeRealRunEvidence && evidenceLoadsInFlightRef.current > 0) {
+      evidenceRefreshPendingRef.current = true;
+      return;
+    }
+    if (!includeRealRunEvidence && evidenceLoadsInFlightRef.current > 0) return;
+    if (includeRealRunEvidence) {
+      evidenceLoadsInFlightRef.current += 1;
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+      if (mountedRef.current) setRealRunEvidence([]);
+    }
+    const generation = ++loadGenerationRef.current;
+    try {
+      const [
+        channelRows, statusRows, guideRows, logRows, adapterRows, probeRows,
+        taskRows, runtimeRows, evidenceRows, platformRows, intentRows,
+        reconciliationRows,
+      ] = await Promise.all([
+        fetchJSON('/notify/channels'),
+        fetchJSON('/notify/status'),
+        fetchJSON('/notify/config-guide'),
+        fetchJSON('/notify/logs'),
+        fetchJSON('/lotteries/adapters/config'),
+        fetchJSON('/lotteries/probes'),
+        fetchJSON('/lotteries/tasks/runs'),
+        fetchJSON('/metrics/runtime/settings'),
+        includeRealRunEvidence
+          ? fetchJSON('/lotteries/real-run/evidence')
+          : Promise.resolve(null),
+        fetchJSON('/accounts/platforms'),
+        fetchJSON('/metrics/external-action-intents?limit=50'),
+        fetchJSON('/metrics/reconciliation?limit=50'),
+      ]);
+      // A slow earlier poll must never overwrite a newer completion/evidence
+      // response. This also makes the active-light -> completed-heavy handoff
+      // deterministic without cancelling requests in the shared API wrapper.
+      if (generation !== loadGenerationRef.current) return;
+      setChannels(channelRows);
+      setNotifyStatus(statusRows);
+      setNotifyGuide(guideRows);
+      setLogs(logRows);
+      setAdapterConfig(adapterRows);
+      setProbes(probeRows);
+      setTaskRuns(taskRows);
+      setRuntimeSettings(runtimeRows);
+      setExternalIntents(intentRows.items || []);
+      setReconciliationItems(reconciliationRows.items || []);
+      if (evidenceRows) {
+        const evidenceItems = evidenceRows.items || [];
+        evidenceBindingByPlatformRef.current = refreshedWorkflowBindings(
+          evidenceBindingByPlatformRef.current,
+          evidenceItems,
+          probeRows,
+          taskRows,
+        );
+        setRealRunEvidence(evidenceItems);
+        window.clearTimeout(evidenceExpiryTimerRef.current);
+        evidenceExpiryTimerRef.current = window.setTimeout(() => {
+          if (mountedRef.current) setRealRunEvidence([]);
+        }, REAL_RUN_EVIDENCE_TTL_MS);
+      }
+      setPlatforms(platformRows);
+    } catch (err) {
+      if (generation !== loadGenerationRef.current) return;
+      throw err;
+    } finally {
+      if (includeRealRunEvidence) {
+        evidenceLoadsInFlightRef.current -= 1;
+        if (evidenceRefreshPendingRef.current && mountedRef.current) {
+          evidenceRefreshPendingRef.current = false;
+          void loadNotify(true).catch(reportLoadError);
+        }
+      }
+    }
   };
 
   useEffect(() => {
-    loadNotify().catch((err) => {
-      const text = formatText(t('deploy.loadFailed'), { message: err.message });
-      setMessage(text);
-      toast(text, 'error');
-    });
+    mountedRef.current = true;
+    const refreshEvidence = () => loadNotify(true).catch(reportLoadError);
+    void refreshEvidence();
+    const evidenceTimer = window.setInterval(refreshEvidence, REAL_RUN_EVIDENCE_REFRESH_MS);
+    return () => {
+      mountedRef.current = false;
+      evidenceRefreshPendingRef.current = false;
+      loadGenerationRef.current += 1;
+      window.clearInterval(evidenceTimer);
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+    };
   }, [t, toast]);
 
   const restart = async () => {
@@ -219,11 +300,17 @@ export default function Deploy() {
     .filter(item => item.draft && validTargetIds.has(item.probe.lottery_id));
 
   const buildPlatformWorkflow = (platform) => {
+    const boundLotteryId = evidenceBindingByPlatformRef.current.get(platform) || null;
     const evidence = realRunEvidence.find(item => (
       item.platform === platform
       && item.target_valid
       && ['pending', 'claimed'].includes(item.status)
-    ));
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
+    )) || (!boundLotteryId ? realRunEvidence.find(item => (
+      item.platform === platform
+      && item.target_valid
+      && ['pending', 'claimed'].includes(item.status)
+    )) : null);
     const platformEvidence = realRunEvidence.find(item => item.platform === platform);
     const invalidTarget = realRunEvidence.find(item => item.platform === platform && !item.target_valid);
     const adapter = adapterConfig?.platforms?.find(item => item.platform === platform);
@@ -235,20 +322,22 @@ export default function Deploy() {
     const nextAction = evidence?.next_action || 'add_target';
     const activeProbe = probes.find(item => (
       item.platform === platform
-      && item.lottery_id === evidence?.lottery_id
       && ['queued', 'running'].includes(item.status)
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
     ));
     const activeShadow = taskRuns.find(item => (
       item.platform === platform
-      && item.lottery_id === evidence?.lottery_id
       && item.task_mode === 'shadow_run'
       && ['queued', 'running'].includes(item.status)
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
     ));
     const workflowActive = Boolean(activeProbe || activeShadow);
+    const activityIdentity = workflowActivityIdentity(platform, activeProbe, activeShadow);
     const readiness = buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate });
     return {
       evidence, platformEvidence, invalidTarget, adapter, probeCandidate,
-      selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive, readiness,
+      selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive,
+      activityIdentity, readiness,
     };
   };
 
@@ -256,12 +345,34 @@ export default function Deploy() {
   const readinessPlatformLabel = platforms.find(item => item.id === readinessPlatform)?.label || readinessPlatform;
 
   useEffect(() => {
-    if (!workflow.workflowActive) return undefined;
-    const timer = window.setInterval(() => {
-      loadNotify().catch(err => setMessage(err.message));
-    }, 4000);
-    return () => window.clearInterval(timer);
-  }, [workflow.workflowActive]);
+    if (!workflow.activityIdentity) return undefined;
+    let cancelled = false;
+    let timer;
+    const poll = async () => {
+      // Active workflow status is lightweight; the completion transition below
+      // performs one authoritative evidence refresh instead of hashing files
+      // every four seconds.
+      try {
+        await loadNotify(false);
+      } catch (err) {
+        setMessage(err.message);
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 4000);
+    };
+    timer = window.setTimeout(poll, 4000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [workflow.activityIdentity]);
+
+  useEffect(() => {
+    const previousIdentity = workflowActivityIdentityRef.current;
+    workflowActivityIdentityRef.current = workflow.activityIdentity;
+    if (previousIdentity && previousIdentity !== workflow.activityIdentity) {
+      loadNotify(true).catch(err => setMessage(err.message));
+    }
+  }, [workflow.activityIdentity]);
 
   const useProbeDraft = (item) => {
     setSelectorJson(JSON.stringify(item.draft, null, 2));
@@ -582,6 +693,87 @@ export default function Deploy() {
       </div>
 
       <div className="panel">
+        <div className="notify-guide-head">
+          <div>
+            <div className="panel-title">{t('deploy.reconciliationTitle')}</div>
+            <p className="muted-text tight-text">{t('deploy.reconciliationHint')}</p>
+          </div>
+          <span className={`badge ${reconciliationItems.length ? 'badge-danger' : 'badge-ready'}`}>
+            {formatText(t('deploy.reconciliationCount'), { count: reconciliationItems.length })}
+          </span>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t('deploy.task')}</th>
+                <th>{t('deploy.platform')}</th>
+                <th>{t('deploy.result')}</th>
+                <th>{t('deploy.unknownIntents')}</th>
+                <th>{t('deploy.succeededIntents')}</th>
+                <th>{t('deploy.updated')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reconciliationItems.map(item => (
+                <tr key={item.task_id}>
+                  <td className="mono" title={item.task_id}>{String(item.task_id || '').slice(0, 12)}</td>
+                  <td>{item.platform || '-'}</td>
+                  <td>
+                    <span className="badge badge-danger">
+                      {item.reconciliation_required ? t('deploy.reconciliationRequired') : item.task_status}
+                    </span>
+                  </td>
+                  <td>{item.unknown_effect_count || item.unknown_intent_count || 0}</td>
+                  <td>{item.succeeded_intent_count || 0}</td>
+                  <td className="small-text">{item.latest_intent_at || item.finished_at || '-'}</td>
+                </tr>
+              ))}
+              {!reconciliationItems.length && (
+                <tr><td colSpan="6" className="empty-cell">{t('deploy.noReconciliationItems')}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="panel-title compact-title">{t('deploy.externalIntentTitle')}</div>
+        <p className="muted-text tight-text">{t('deploy.externalIntentHint')}</p>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t('deploy.task')}</th>
+                <th>{t('deploy.action')}</th>
+                <th>{t('deploy.result')}</th>
+                <th>{t('deploy.effectCertainty')}</th>
+                <th>{t('deploy.attempt')}</th>
+                <th>{t('deploy.payloadHash')}</th>
+                <th>{t('deploy.updated')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {externalIntents.map(item => (
+                <tr key={item.intent_id}>
+                  <td className="mono" title={item.task_id}>{String(item.task_id || '').slice(0, 12)}</td>
+                  <td>{item.action || '-'}</td>
+                  <td>
+                    <span className={`badge ${intentStatusClass(item.status)}`}>{item.status || '-'}</span>
+                  </td>
+                  <td className="mono">{item.effect_certainty || '-'}</td>
+                  <td>{item.attempt_no || 0}</td>
+                  <td className="mono" title={item.payload_hash}>{shortHash(item.payload_hash)}</td>
+                  <td className="small-text">{item.updated_at || '-'}</td>
+                </tr>
+              ))}
+              {!externalIntents.length && (
+                <tr><td colSpan="7" className="empty-cell">{t('deploy.noExternalIntents')}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="panel">
         <div className="panel-title">{t('deploy.notificationHealth')}</div>
         <div className="notify-health-grid">
           {notifyStatus?.channels?.map(channel => (
@@ -851,6 +1043,9 @@ function probeReadyPhaseCount(probe) {
 function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
   const blockers = new Set(evidence?.blockers || []);
   const phaseCount = probeCandidate ? probeReadyPhaseCount(probeCandidate.probe) : 0;
+  const selectorEvidenceReady = selectorExecutionEvidenceReady(adapter, evidence);
+  const selectorEvidenceUnbound = blockers.has('api_path_probe_evidence_not_implemented')
+    || blockers.has('selector_config_evidence_binding_not_implemented');
   return [
     {
       code: 'target',
@@ -872,9 +1067,11 @@ function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, 
     },
     {
       code: 'selector',
-      ready: Boolean(adapter?.configured || evidence?.selector_ready),
+      ready: selectorEvidenceReady,
       severity: 'warning',
-      meta: adapter?.configured || evidence?.selector_ready ? 'configured' : 'missing',
+      meta: selectorEvidenceUnbound
+        ? 'evidence binding required'
+        : (selectorEvidenceReady ? 'configured' : 'missing'),
     },
     {
       code: 'shadow',
@@ -902,6 +1099,18 @@ function safeJson(value) {
 function hasSelectorDraft(value, platform) {
   const parsed = safeJson(value);
   return Boolean(parsed?.[platform] && Object.keys(parsed[platform]).length);
+}
+
+function shortHash(value) {
+  const text = String(value || '');
+  return text ? `${text.slice(0, 12)}…` : '-';
+}
+
+function intentStatusClass(status) {
+  if (status === 'succeeded') return 'badge-ready';
+  if (['unknown', 'started'].includes(status)) return 'badge-danger';
+  if (status === 'failed') return 'badge-warn';
+  return 'badge-muted';
 }
 
 const secretFieldByEnv = {

@@ -55,8 +55,8 @@ def parse_detail_card(payload: dict, requested_dynamic_id: str) -> DynamicCard:
     data = payload.get("data") if isinstance(payload, dict) else None
     item = data.get("item") if isinstance(data, dict) else None
     card = parse_dynamic_card(item)
-    if not card.dynamic_id and requested_dynamic_id:
-        card.dynamic_id = requested_dynamic_id
+    if card.dynamic_id and requested_dynamic_id and card.dynamic_id != requested_dynamic_id:
+        raise BilibiliRuntimeError("bilibili_dynamic_detail_target_mismatch")
     if not card.dynamic_id:
         raise BilibiliRuntimeError("bilibili_dynamic_detail_unparseable")
     return card

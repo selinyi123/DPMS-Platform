@@ -2,6 +2,7 @@ import unittest
 
 from app.governance.policy import (
     DEFAULT_REAL_RUN_POLICY,
+    MANDATORY_REAL_RUN_GATE_CODES,
     build_decision_record,
     default_policies,
     diff_policies,
@@ -39,6 +40,43 @@ class ValidatePolicyTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("at_least_one_gate_required", errors)
 
+    def test_real_run_policy_cannot_remove_mandatory_gate(self):
+        gates = [
+            dict(gate)
+            for gate in DEFAULT_REAL_RUN_POLICY["gates"]
+            if gate["code"] != "no_recent_account_risk"
+        ]
+        valid, errors = validate_policy(
+            {"policy_key": "real_run_gate", "version": 2, "gates": gates}
+        )
+
+        self.assertFalse(valid)
+        self.assertIn(
+            "mandatory_real_run_gate_missing:no_recent_account_risk",
+            errors,
+        )
+
+    def test_real_run_policy_cannot_make_mandatory_gate_optional(self):
+        gates = [dict(gate) for gate in DEFAULT_REAL_RUN_POLICY["gates"]]
+        next(gate for gate in gates if gate["code"] == "recent_shadow_run")["required"] = False
+        valid, errors = validate_policy(
+            {"policy_key": "real_run_gate", "version": 2, "gates": gates}
+        )
+
+        self.assertFalse(valid)
+        self.assertIn(
+            "mandatory_real_run_gate_optional:recent_shadow_run",
+            errors,
+        )
+
+    def test_non_real_run_policy_is_not_forced_to_use_real_run_gates(self):
+        valid, errors = validate_policy(
+            {"policy_key": "another_policy", "version": 1, "gates": [{"code": "custom"}]}
+        )
+
+        self.assertTrue(valid)
+        self.assertEqual([], errors)
+
 
 class EvaluatePolicyTests(unittest.TestCase):
     def test_all_gates_pass_allows(self):
@@ -66,6 +104,59 @@ class EvaluatePolicyTests(unittest.TestCase):
     def test_default_policies_keyed_by_policy_key(self):
         policies = default_policies()
         self.assertIn("real_run_gate", policies)
+
+    def test_default_policy_contains_exact_mandatory_safety_floor(self):
+        codes = {gate["code"] for gate in DEFAULT_REAL_RUN_POLICY["gates"]}
+        self.assertEqual(MANDATORY_REAL_RUN_GATE_CODES, codes)
+
+    def test_legacy_policy_cannot_delete_failed_mandatory_gate_at_runtime(self):
+        policy = {
+            "policy_key": "real_run_gate",
+            "version": 2,
+            "gates": [{"code": "global_real_run_enabled", "required": True}],
+        }
+        inputs = {**ALL_GATES_PASS, "no_recent_account_risk": False}
+
+        decision = evaluate_policy(policy=policy, inputs=inputs)
+
+        self.assertEqual("block", decision["outcome"])
+        self.assertIn("no_recent_account_risk", decision["failed"])
+
+    def test_legacy_policy_cannot_relax_failed_mandatory_gate_at_runtime(self):
+        policy = {
+            "policy_key": "real_run_gate",
+            "version": 2,
+            "gates": [
+                {
+                    "code": "action_plan_reviewed",
+                    "required": False,
+                    "remediation": "ignore_review",
+                }
+            ],
+        }
+        inputs = {**ALL_GATES_PASS, "action_plan_reviewed": False}
+
+        decision = evaluate_policy(policy=policy, inputs=inputs)
+
+        self.assertEqual("block", decision["outcome"])
+        self.assertIn("action_plan_reviewed", decision["failed"])
+        self.assertEqual("review_rule", decision["next_action"])
+
+    def test_custom_policy_can_only_add_stricter_gate(self):
+        policy = {
+            "policy_key": "real_run_gate",
+            "version": 2,
+            "gates": [
+                *[dict(gate) for gate in DEFAULT_REAL_RUN_POLICY["gates"]],
+                {"code": "operator_window_open", "required": True, "remediation": "wait"},
+            ],
+        }
+        inputs = {**ALL_GATES_PASS, "operator_window_open": False}
+
+        decision = evaluate_policy(policy=policy, inputs=inputs)
+
+        self.assertEqual("block", decision["outcome"])
+        self.assertIn("operator_window_open", decision["failed"])
 
 
 class ReplayTests(unittest.TestCase):

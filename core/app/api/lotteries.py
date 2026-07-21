@@ -1,4 +1,5 @@
 import json
+import os
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -6,15 +7,30 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
+from app.action_plan import (
+    ACTION_ORDER,
+    ACTION_SET,
+    BILIBILI_API_EXECUTION_PATH,
+    ActionPlanV2Error,
+    compute_action_plan_hash,
+    compute_bilibili_api_config_hash,
+    compute_config_hash,
+    compute_target_hash,
+    semantic_requirement_status,
+    validate_action_payload,
+    validate_action_plan_v2,
+)
+
 from app.adapter_config import (
     PHASES as ADAPTER_PHASES,
     load_runtime_selector_config,
     platform_has_runtime_real_adapter,
+    platform_probe_ready_for_real_actions,
     platform_real_adapter_kind,
     recommended_config_from_probe,
     selector_config_complete,
 )
-from app.db import database, redis
+from app.db import database
 from app.event_store.service import record_event
 from app.knowledge.service import account_reputation
 from app.models.schemas import (
@@ -42,6 +58,11 @@ from app.strategy.engine import (
 )
 from app.services.discovery import run_discovery
 from app.services.lottery_rules import parse_lottery_rule
+from app.services.account_leases import (
+    AccountOperationLeaseConflict,
+    acquire_account_operation_lease,
+    bind_lease_to_task,
+)
 from app.services.outbox import build_lottery_task_message, enqueue_outbox, try_flush_dedup
 from app.services.real_run_gate import evaluate_real_run_decision
 from app.services.real_run_readiness import (
@@ -50,9 +71,17 @@ from app.services.real_run_readiness import (
     phase_configured,
     platform_selectors_complete,
     recent_account_risk,
+    load_real_run_evidence_batch,
+    load_exact_bilibili_execution_evidence,
+    real_run_account_risk_summaries,
     real_run_gate_status,
     validate_real_run_evidence,
 )
+from app.services.bilibili_preflight_evidence import (
+    BilibiliPreflightEvidenceError,
+    extract_bilibili_dynamic_id,
+)
+from app.services.rule_provenance import ensure_rule_snapshot
 from app.security import (
     audit_event,
     circuit_breaker_allows,
@@ -67,9 +96,44 @@ from app.utils.log import structured_log
 
 router = APIRouter()
 PHASES = ["followed", "liked", "commented", "reposted"]
-TASK_FAILURE_DIR = Path("/profiles/task-failures")
-TASK_SHADOW_DIR = Path("/profiles/shadow-runs")
-ADAPTER_PROBE_DIR = Path("/profiles/adapter-probes")
+EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/profiles"))
+TASK_FAILURE_DIR = EVIDENCE_ROOT / "task-failures"
+TASK_SHADOW_DIR = EVIDENCE_ROOT / "shadow-runs"
+ADAPTER_PROBE_DIR = EVIDENCE_ROOT / "adapter-probes"
+
+
+def validated_probe_navigation_url(raw_url: str) -> str:
+    target_url = str(raw_url or "").strip()
+    parsed = urlparse(target_url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise HTTPException(400, detail="Adapter probe target must use HTTPS")
+    return target_url
+
+
+def protected_source_rule_text(existing_rule_text, proposed_rule_text) -> str:
+    """Keep the captured source rule immutable once it has been stored.
+
+    The action-plan editor may classify the source rule, but it must not turn
+    into a second ingestion path that replaces a complex source rule with a
+    simpler executable summary.  An empty legacy record may be populated once;
+    subsequent source corrections need a dedicated, separately audited flow.
+    """
+
+    existing_raw = str(existing_rule_text or "")
+    existing = existing_raw.strip()
+    if proposed_rule_text is None:
+        candidate = existing
+    else:
+        candidate = str(proposed_rule_text).strip()
+    if not candidate:
+        raise HTTPException(400, detail="Source lottery rule text is required")
+    if existing and candidate != existing:
+        raise HTTPException(
+            409,
+            detail="Source lottery rule text cannot be replaced through action-plan review",
+        )
+    return existing_raw if existing else candidate
+
 
 STRATEGY_TARGET_METRICS_SQL = """(
                     SELECT COUNT(*)
@@ -127,10 +191,93 @@ STRATEGY_TARGET_METRICS_SQL = """(
 
 
 MAX_IMPORT_TARGET_LINES = 1000
+REPAIR_DISPATCH_INTENT_BINDING_READY = False
 
 
 def clamp_limit(value: int, minimum: int = 1, maximum: int = 200) -> int:
     return min(max(int(value or minimum), minimum), maximum)
+
+
+def _mysql_error_code(value) -> int | None:
+    """Extract a numeric MySQL error code without depending on one driver type."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (tuple, list)) and value:
+        return _mysql_error_code(value[0])
+    return None
+
+
+def _is_mysql_duplicate_entry(exc: Exception) -> bool:
+    """Return true only for MySQL duplicate-entry error 1062.
+
+    ``databases`` may expose the DB-API exception directly or through a wrapper,
+    so inspect the normal exception chain while avoiding message matching that
+    could misclassify a timeout or an application error containing the word
+    "duplicate".
+    """
+    pending = [exc]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+
+        if _mysql_error_code(getattr(current, "errno", None)) == 1062:
+            return True
+        if _mysql_error_code(getattr(current, "args", None)) == 1062:
+            return True
+
+        for attr in ("orig", "__cause__", "__context__"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
+async def _record_post_commit_event(**event) -> str | None:
+    """Record an event without turning a committed command into a false 500.
+
+    The event store already retries and dead-letters critical events. This
+    boundary also protects callers from an unexpected event-store exception and
+    makes a returned ``None`` explicit in logs. Cancellation is deliberately not
+    swallowed because ``CancelledError`` is not an ``Exception`` on supported
+    Python versions.
+    """
+    try:
+        event_id = await record_event(**event)
+    except Exception as exc:
+        structured_log(
+            "error",
+            "post_commit_event_record_failed",
+            aggregate=event.get("aggregate"),
+            aggregate_id=event.get("aggregate_id"),
+            event_type=event.get("event_type"),
+            error=str(exc),
+        )
+        return None
+    if event_id is None:
+        structured_log(
+            "error",
+            "post_commit_event_unrecorded",
+            aggregate=event.get("aggregate"),
+            aggregate_id=event.get("aggregate_id"),
+            event_type=event.get("event_type"),
+        )
+    return event_id
+
+
+def _sql_in_values(prefix: str, values) -> tuple[str, dict]:
+    parameters = {}
+    placeholders = []
+    for index, value in enumerate(values):
+        key = f"{prefix}_{index}"
+        placeholders.append(f":{key}")
+        parameters[key] = value
+    return ", ".join(placeholders), parameters
 
 
 @router.get("/adapters")
@@ -211,7 +358,7 @@ async def save_adapter_config(data: AdapterSelectorConfigUpdate, request: Reques
         detail={"saved": saved, "invalid_count": len(invalid)},
     )
     for item in saved:
-        await record_event(
+        await _record_post_commit_event(
             aggregate="platform",
             aggregate_id=item["platform"],
             event_type="AdapterSelectorConfigSaved",
@@ -237,7 +384,7 @@ async def clear_adapter_config(platform: str, request: Request):
         result="cleared",
         risk_level="high",
     )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="platform",
         aggregate_id=platform,
         event_type="AdapterSelectorConfigCleared",
@@ -262,7 +409,21 @@ async def list_lotteries(status: str = None, limit: int = 50):
 
 
 @router.get("/real-run/evidence")
-async def list_real_run_evidence(status: str = None, limit: int = 50):
+async def list_real_run_evidence(
+    status: str = None,
+    limit: int = 50,
+    account_id: int | None = None,
+):
+    selected_account = None
+    if account_id is not None:
+        if account_id <= 0:
+            raise HTTPException(400, detail="account_id must be positive")
+        selected_account = await database.fetch_one(
+            "SELECT id, platform FROM accounts WHERE id = :account_id",
+            {"account_id": account_id},
+        )
+        if not selected_account:
+            raise HTTPException(404, detail="Account not found")
     query = "SELECT * FROM lotteries"
     values = {"limit": min(max(limit, 1), 100)}
     if status:
@@ -272,14 +433,43 @@ async def list_real_run_evidence(status: str = None, limit: int = 50):
     rows = await database.fetch_all(query, values)
     selector_config = await load_runtime_selector_config()
     real_run_enabled = await is_real_run_enabled()
+    lottery_ids = [int(row["id"]) for row in rows]
+    evidence_batch = await load_real_run_evidence_batch(rows, account_id=account_id)
+    account_summaries = await real_run_account_risk_summaries(
+        dict.fromkeys(str(row["platform"]) for row in rows)
+    )
+    completed_actions = await completed_real_run_actions_for_lotteries(lottery_ids)
+    action_ledgers = await bilibili_action_ledgers_for_lotteries(lottery_ids, limit=12)
     items = []
     for row in rows:
         lottery = dict(row)
-        gate = await real_run_gate_status(lottery, selector_config=selector_config, real_run_enabled=real_run_enabled)
-        gate["repair_plan"] = await build_lottery_repair_plan(lottery)
-        gate["action_ledger"] = await bilibili_action_ledger_for_lottery(int(lottery["id"]), limit=12)
+        lottery_id = int(lottery["id"])
+        scoped_account_id = account_id
+        account_scope_matches = bool(
+            not selected_account
+            or str(selected_account["platform"]) == str(lottery["platform"])
+        )
+        gate = await real_run_gate_status(
+            lottery,
+            selector_config=selector_config,
+            real_run_enabled=real_run_enabled,
+            account_summary=account_summaries[str(lottery["platform"])],
+            evidence_batch=evidence_batch,
+            account_id=scoped_account_id,
+        )
+        if not account_scope_matches:
+            gate["allowed"] = False
+            gate["blockers"] = ["account_platform_mismatch", *gate.get("blockers", [])]
+            gate["next_action"] = "select_account"
+        gate["selected_account_id"] = account_id
+        gate["account_scope_matches_platform"] = account_scope_matches if account_id is not None else None
+        gate["repair_plan"] = await build_lottery_repair_plan(
+            lottery,
+            completed_actions=completed_actions[lottery_id],
+        )
+        gate["action_ledger"] = action_ledgers[lottery_id]
         items.append(gate)
-    return {"items": items}
+    return {"items": items, "selected_account_id": account_id}
 
 
 def ordered_actions(actions) -> list[str]:
@@ -292,6 +482,133 @@ def ordered_actions(actions) -> list[str]:
 def missing_repair_actions(required_actions: list[str], completed_actions: list[str]) -> list[str]:
     completed = set(completed_actions)
     return [action for action in ordered_actions(required_actions) if action not in completed]
+
+
+def require_dispatchable_lottery_state(locked, *, repair: bool = False) -> None:
+    """Fail closed unless a locked lottery row is safe to claim.
+
+    A terminal result is never a signal to replay the full action plan. Missing
+    actions must use the dedicated repair path, and an unknown external outcome
+    keeps ``execution_lock`` populated until an explicit reconciliation flow is
+    implemented.
+    """
+    if not locked:
+        raise HTTPException(404, detail="Lottery not found")
+    status = str(locked["status"] or "").strip().lower()
+    execution_lock = str(locked["execution_lock"] or "").strip()
+    if execution_lock:
+        raise HTTPException(409, detail="Lottery has an execution lock and requires settlement or reconciliation")
+    if status != "pending":
+        operation = "repair-dispatchable" if repair else "dispatchable"
+        raise HTTPException(409, detail=f"Lottery status '{status}' is not {operation}")
+
+
+def require_lottery_not_executing(locked, *, operation: str) -> None:
+    """Protect execution semantics from concurrent operator mutations."""
+    if not locked:
+        raise HTTPException(404, detail="Lottery not found")
+    status = str(locked["status"] or "").strip().lower()
+    execution_lock = str(locked["execution_lock"] or "").strip()
+    if execution_lock or status in {"claimed", "running"}:
+        raise HTTPException(409, detail=f"Lottery cannot {operation} while an execution is active or unresolved")
+
+
+def require_dispatch_snapshot_unchanged(locked, snapshot) -> None:
+    """Reject a dispatch if its preflight snapshot changed before row claim."""
+    locked_data = dict(locked)
+    snapshot_data = dict(snapshot)
+    for field in ("platform", "raw_url", "canonical_url", "rule_text"):
+        if str(locked_data.get(field) or "") != str(snapshot_data.get(field) or ""):
+            raise HTTPException(409, detail=f"Lottery {field} changed during dispatch preflight; retry review")
+    if parse_json_field(locked_data.get("action_plan")) != parse_json_field(snapshot_data.get("action_plan")):
+        raise HTTPException(409, detail="Lottery action plan changed during dispatch preflight; retry review")
+    for field in (
+        "authoritative_rule_snapshot_id",
+        "rule_hash",
+        "action_plan_hash",
+    ):
+        if str(locked_data.get(field) or "") != str(snapshot_data.get(field) or ""):
+            raise HTTPException(409, detail=f"Lottery {field} changed during dispatch preflight; retry review")
+
+
+def bilibili_plan_binding(
+    lottery,
+    *,
+    require_executable: bool,
+    execution_revision: int,
+) -> dict:
+    """Extract only a fully hash-bound v2 plan; legacy plans stay non-runnable."""
+
+    try:
+        plan = validate_action_plan_v2(
+            parse_json_field(lottery["action_plan"]),
+            require_executable=require_executable,
+        )
+        snapshot_id = int(lottery["authoritative_rule_snapshot_id"] or 0)
+    except (ActionPlanV2Error, TypeError, ValueError, KeyError) as exc:
+        code = exc.code if isinstance(exc, ActionPlanV2Error) else "action_plan_binding_invalid"
+        raise HTTPException(409, detail={"message": "Bilibili Action Plan v2 is not dispatchable", "blockers": [code]}) from exc
+    if (
+        snapshot_id != plan.rule_snapshot_id
+        or str(lottery["rule_hash"] or "") != plan.rule_hash
+        or str(lottery["action_plan_hash"] or "") != plan.plan_hash
+        or plan.execution_path_id != BILIBILI_API_EXECUTION_PATH
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Bilibili Action Plan v2 binding changed; review and preflight again",
+                "blockers": ["action_plan_rule_binding_mismatch"],
+            },
+        )
+    try:
+        target_hash = compute_target_hash(str(lottery["canonical_url"] or ""))
+        config_hash = compute_bilibili_api_config_hash(execution_revision)
+    except ActionPlanV2Error as exc:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Bilibili target or account revision is not hash-bindable",
+                "blockers": [exc.code],
+            },
+        ) from exc
+    return {
+        "rule_snapshot_id": plan.rule_snapshot_id,
+        "rule_hash": plan.rule_hash,
+        "action_plan_hash": plan.plan_hash,
+        "execution_path_id": plan.execution_path_id,
+        "target_hash": target_hash,
+        "config_hash": config_hash,
+        "execution_revision": execution_revision,
+        "required_actions": plan.required_actions,
+        "follow_target_handle": plan.follow_target_handle,
+        "action_plan": plan.plan,
+    }
+
+
+def require_no_completed_actions_for_full_real_dispatch(completed_actions: list[str]) -> None:
+    if completed_actions:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Lottery already has confirmed real actions; use repair or reconciliation instead of full dispatch",
+                "completed_actions": completed_actions,
+            },
+        )
+
+
+def require_repair_plan_unchanged(current_plan: dict, preflight_plan: dict) -> None:
+    if (
+        not current_plan.get("eligible")
+        or current_plan.get("repair_action_plan") != preflight_plan.get("repair_action_plan")
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Completed-action evidence changed during repair preflight; rebuild the repair plan",
+                "repair_plan": current_plan,
+            },
+        )
 
 
 def normalize_action_ledger_row(row) -> dict:
@@ -310,24 +627,70 @@ async def bilibili_action_ledger_for_lottery(lottery_id: int, limit: int = 20) -
         )
     except Exception as exc:
         structured_log("warning", "bilibili_action_ledger_query_failed", lottery_id=lottery_id, error=str(exc))
-        return []
+        raise
     return [normalize_action_ledger_row(row) for row in rows]
 
 
-async def completed_real_run_actions_from_ledger(lottery_id: int) -> list[str]:
+async def bilibili_action_ledgers_for_lotteries(lottery_ids, limit: int = 20) -> dict[int, list[dict]]:
+    """Load the newest N ledger rows per lottery with one MySQL 8 query."""
+    ids = list(dict.fromkeys(int(lottery_id) for lottery_id in lottery_ids))
+    ledgers = {lottery_id: [] for lottery_id in ids}
+    if not ids:
+        return ledgers
+    lottery_clause, values = _sql_in_values("ledger_lottery", ids)
+    values["ledger_limit"] = clamp_limit(limit)
     try:
         rows = await database.fetch_all(
-            """SELECT DISTINCT phase
-               FROM bilibili_action_ledger
-               WHERE lottery_id = :lottery_id
-                 AND task_mode = 'real_run'
-                 AND ok = 1
-                 AND phase IS NOT NULL""",
-            {"lottery_id": lottery_id},
+            f"""SELECT ranked_ledger.*
+                FROM (
+                  SELECT bal.*,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY bal.lottery_id
+                           ORDER BY bal.id DESC
+                         ) AS evidence_rank
+                  FROM bilibili_action_ledger bal
+                  WHERE bal.lottery_id IN ({lottery_clause})
+                ) ranked_ledger
+                WHERE evidence_rank <= :ledger_limit
+                ORDER BY lottery_id, id DESC""",
+            values,
         )
     except Exception as exc:
-        structured_log("warning", "bilibili_completed_actions_ledger_query_failed", lottery_id=lottery_id, error=str(exc))
-        return []
+        structured_log(
+            "warning",
+            "bilibili_action_ledger_batch_query_failed",
+            lottery_count=len(ids),
+            error=str(exc),
+        )
+        # This endpoint is an evidence view, so storage failure must not be
+        # rendered indistinguishably from a valid empty action history.
+        raise
+    for row in rows:
+        try:
+            lottery_id = int(row["lottery_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lottery_id not in ledgers:
+            continue
+        item = normalize_action_ledger_row(row)
+        item.pop("evidence_rank", None)
+        ledgers[lottery_id].append(item)
+    return ledgers
+
+
+async def completed_real_run_actions_from_ledger(lottery_id: int) -> list[str]:
+    # This evidence decides whether a full real-run can safely be replayed.
+    # Query failure is not equivalent to "no completed actions" and must
+    # propagate so dispatch/repair fail closed.
+    rows = await database.fetch_all(
+        """SELECT DISTINCT phase
+           FROM bilibili_action_ledger
+           WHERE lottery_id = :lottery_id
+             AND task_mode = 'real_run'
+             AND ok = 1
+             AND phase IS NOT NULL""",
+        {"lottery_id": lottery_id},
+    )
     completed = [row["phase"] for row in rows if row["phase"] in PHASES]
     return ordered_actions(completed)
 
@@ -353,9 +716,7 @@ async def list_bilibili_action_ledger(limit: int = 100, lottery_id: int = None, 
 
 async def completed_real_run_actions(lottery_id: int) -> list[str]:
     ledger_completed = await completed_real_run_actions_from_ledger(lottery_id)
-    if ledger_completed:
-        return ledger_completed
-    rows = await database.fetch_all(
+    event_rows = await database.fetch_all(
         """SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.phase')) AS phase
            FROM events e
            JOIN task_runs tr ON tr.task_id = e.correlation_id
@@ -364,15 +725,72 @@ async def completed_real_run_actions(lottery_id: int) -> list[str]:
              AND e.event_type = 'TaskPhaseCompleted'""",
         {"lottery_id": lottery_id},
     )
-    completed = [row["phase"] for row in rows if row["phase"] in PHASES]
-    return ordered_actions(completed)
+    legacy_rows = await database.fetch_all(
+        """SELECT DISTINCT tp.phase
+           FROM task_phases tp
+           JOIN task_runs tr ON tr.task_id = tp.task_id
+           WHERE tp.lottery_id = :lottery_id
+             AND tr.task_mode = 'real_run'""",
+        {"lottery_id": lottery_id},
+    )
+    event_completed = [row["phase"] for row in event_rows if row["phase"] in PHASES]
+    legacy_completed = [row["phase"] for row in legacy_rows if row["phase"] in PHASES]
+    return ordered_actions([*ledger_completed, *event_completed, *legacy_completed])
 
 
-async def build_lottery_repair_plan(lottery) -> dict:
+async def completed_real_run_actions_for_lotteries(lottery_ids) -> dict[int, list[str]]:
+    """Union completion evidence for many lotteries without per-row queries."""
+    ids = list(dict.fromkeys(int(lottery_id) for lottery_id in lottery_ids))
+    completed = {lottery_id: [] for lottery_id in ids}
+    if not ids:
+        return completed
+    lottery_clause, values = _sql_in_values("completed_lottery", ids)
+    ledger_rows = await database.fetch_all(
+        f"""SELECT DISTINCT lottery_id, phase
+            FROM bilibili_action_ledger
+            WHERE lottery_id IN ({lottery_clause})
+              AND task_mode = 'real_run'
+              AND ok = 1
+              AND phase IS NOT NULL""",
+        values,
+    )
+    event_rows = await database.fetch_all(
+        f"""SELECT DISTINCT tr.lottery_id,
+                   JSON_UNQUOTE(JSON_EXTRACT(e.payload, '$.phase')) AS phase
+            FROM events e
+            JOIN task_runs tr ON tr.task_id = e.correlation_id
+            WHERE tr.lottery_id IN ({lottery_clause})
+              AND tr.task_mode = 'real_run'
+              AND e.event_type = 'TaskPhaseCompleted'""",
+        values,
+    )
+    legacy_rows = await database.fetch_all(
+        f"""SELECT DISTINCT tp.lottery_id, tp.phase
+            FROM task_phases tp
+            JOIN task_runs tr ON tr.task_id = tp.task_id
+            WHERE tp.lottery_id IN ({lottery_clause})
+              AND tr.task_mode = 'real_run'""",
+        values,
+    )
+    for row in [*ledger_rows, *event_rows, *legacy_rows]:
+        try:
+            lottery_id = int(row["lottery_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        phase = row["phase"]
+        if lottery_id in completed and phase in PHASES:
+            completed[lottery_id].append(phase)
+    return {lottery_id: ordered_actions(phases) for lottery_id, phases in completed.items()}
+
+
+async def build_lottery_repair_plan(lottery, *, completed_actions: list[str] | None = None) -> dict:
     lottery_data = dict(lottery)
     action_plan = parse_json_field(lottery_data.get("action_plan")) or {}
     required_actions = ordered_actions(action_plan.get("required_actions") if isinstance(action_plan, dict) else [])
-    completed_actions = await completed_real_run_actions(int(lottery_data["id"]))
+    if completed_actions is None:
+        completed_actions = await completed_real_run_actions(int(lottery_data["id"]))
+    else:
+        completed_actions = ordered_actions(completed_actions)
     missing_actions = missing_repair_actions(required_actions, completed_actions)
 
     reason = "missing_actions_available"
@@ -387,12 +805,20 @@ async def build_lottery_repair_plan(lottery) -> dict:
     elif not missing_actions:
         reason = "no_missing_actions"
 
+    if reason == "missing_actions_available":
+        status = str(lottery_data.get("status") or "").strip().lower()
+        execution_lock = str(lottery_data.get("execution_lock") or "").strip()
+        if execution_lock or status in {"claimed", "running"}:
+            reason = "execution_in_flight_or_reconciliation_required"
+        elif status != "pending":
+            reason = "lottery_not_pending"
+
     eligible = reason == "missing_actions_available"
     repair_action_plan = None
     if eligible:
         repair_action_plan = {
             "version": 1,
-            "is_lottery": True,
+            "is_lottery": bool(parsed_rule.get("is_lottery")),
             "required_actions": missing_actions,
             "review_required": False,
             "confidence": 1.0,
@@ -497,7 +923,7 @@ async def create_tracked_source(data: TrackedSourceCreate, request: Request):
             "scan_interval_minutes": data.scan_interval_minutes,
         },
     )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="source",
         aggregate_id=source_id or f"{data.platform}:{data.source_type}:{data.source_value.strip()}",
         event_type="DiscoverySourceCreated",
@@ -516,7 +942,7 @@ async def create_tracked_source(data: TrackedSourceCreate, request: Request):
 async def scan_tracked_sources(request: Request):
     actor = require_min_role(request, "operator")
     stats = await run_discovery()
-    await record_event(
+    await _record_post_commit_event(
         aggregate="system",
         aggregate_id="discovery",
         event_type="DiscoveryScanCompleted",
@@ -555,31 +981,35 @@ async def create_lottery(data: LotteryCreate, request: Request):
                 "expires_at": data.expires_at,
             },
         )
-        await record_event(
-            aggregate="lottery",
-            aggregate_id=lottery_id,
-            event_type="LotteryDiscovered",
-            payload={
-                "platform": data.platform,
-                "source_type": data.source_type,
-                "source_id": data.source_id,
-                "raw_url": raw_url,
-                "canonical_url": canonical_url,
-                "value_score": data.value_score,
-                "manual": True,
-            },
-            actor_type="operator",
-            actor_id=actor["actor_id"],
-        )
-        return {"status": "created", "id": lottery_id}
-    except Exception:
+    except Exception as exc:
+        if not _is_mysql_duplicate_entry(exc):
+            raise
         row = await database.fetch_one(
-            "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
+            """SELECT id FROM lotteries
+               WHERE url_hash = SHA2(:canonical_url, 256)
+                 AND canonical_url = :canonical_url""",
             {"canonical_url": canonical_url},
         )
         if row:
             return {"status": "exists", "id": row["id"]}
         raise
+    await _record_post_commit_event(
+        aggregate="lottery",
+        aggregate_id=lottery_id,
+        event_type="LotteryDiscovered",
+        payload={
+            "platform": data.platform,
+            "source_type": data.source_type,
+            "source_id": data.source_id,
+            "raw_url": raw_url,
+            "canonical_url": canonical_url,
+            "value_score": data.value_score,
+            "manual": True,
+        },
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {"status": "created", "id": lottery_id}
 
 
 @router.post("/targets/import")
@@ -606,10 +1036,18 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
             continue
         try:
             target = validate_lottery_target(row["platform"], row["raw_url"])
-            if not target.valid:
-                invalid.append({"line": row["line"], "raw": row["raw"], "error": target.reason})
-                continue
+        except Exception as exc:
+            invalid.append({"line": row["line"], "raw": row["raw"], "error": str(exc) or "target validation failed"})
+            continue
+        if not target.valid:
+            invalid.append({"line": row["line"], "raw": row["raw"], "error": target.reason})
+            continue
+        try:
             canonical_url = await canonicalize_lottery_url(row["platform"], row["raw_url"])
+        except Exception as exc:
+            invalid.append({"line": row["line"], "raw": row["raw"], "error": str(exc) or "canonicalization failed"})
+            continue
+        try:
             lottery_id = await database.execute(
                 """INSERT INTO lotteries (platform, source_type, source_id, raw_url, canonical_url, value_score, expires_at, status)
                    VALUES (:platform, :source_type, :source_id, :raw_url, :canonical_url, :value_score, :expires_at, 'pending')""",
@@ -623,38 +1061,42 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
                     "expires_at": row["expires_at"],
                 },
             )
-            created.append({"line": row["line"], "id": lottery_id, "url": row["raw_url"], "platform": row["platform"]})
-            await record_event(
-                aggregate="lottery",
-                aggregate_id=lottery_id,
-                event_type="LotteryDiscovered",
-                payload={
-                    "platform": row["platform"],
-                    "source_type": data.source_type,
-                    "source_id": data.source_id,
-                    "raw_url": row["raw_url"],
-                    "canonical_url": canonical_url,
-                    "value_score": row["value_score"],
-                    "line": row["line"],
-                    "import_id": import_id,
-                },
-                correlation_id=import_id,
-                actor_type="operator",
-                actor_id=actor["actor_id"],
-            )
         except Exception as exc:
-            try:
-                canonical_url = await canonicalize_lottery_url(row["platform"], row["raw_url"])
-                existing = await database.fetch_one(
-                    "SELECT id FROM lotteries WHERE canonical_url = :canonical_url",
-                    {"canonical_url": canonical_url},
-                )
-            except Exception:
-                existing = None
+            existing = None
+            if _is_mysql_duplicate_entry(exc):
+                try:
+                    existing = await database.fetch_one(
+                        """SELECT id FROM lotteries
+                           WHERE url_hash = SHA2(:canonical_url, 256)
+                             AND canonical_url = :canonical_url""",
+                        {"canonical_url": canonical_url},
+                    )
+                except Exception:
+                    existing = None
             if existing:
                 duplicates.append({"line": row["line"], "id": existing["id"], "url": row["raw_url"], "platform": row["platform"]})
             else:
                 invalid.append({"line": row["line"], "raw": row["raw"], "error": str(exc) or "insert failed"})
+            continue
+        created.append({"line": row["line"], "id": lottery_id, "url": row["raw_url"], "platform": row["platform"]})
+        await _record_post_commit_event(
+            aggregate="lottery",
+            aggregate_id=lottery_id,
+            event_type="LotteryDiscovered",
+            payload={
+                "platform": row["platform"],
+                "source_type": data.source_type,
+                "source_id": data.source_id,
+                "raw_url": row["raw_url"],
+                "canonical_url": canonical_url,
+                "value_score": row["value_score"],
+                "line": row["line"],
+                "import_id": import_id,
+            },
+            correlation_id=import_id,
+            actor_type="operator",
+            actor_id=actor["actor_id"],
+        )
 
     result = {
         "status": "imported",
@@ -666,7 +1108,7 @@ async def import_lottery_targets(data: LotteryTargetImport, request: Request):
         "duplicates": duplicates[:50],
         "invalid": invalid[:50],
     }
-    await record_event(
+    await _record_post_commit_event(
         aggregate="lottery_import",
         aggregate_id=import_id,
         event_type="LotteryTargetImportCompleted",
@@ -704,6 +1146,20 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
     if task_mode in {"shadow_run", "real_run"} and not target.valid:
         raise HTTPException(400, detail=target.reason)
+    if task_mode == "shadow_run" and lottery["platform"] == "bilibili":
+        shadow_contract = await validate_real_run_evidence(lottery, account_id=None)
+        if not shadow_contract.get("action_plan_ready"):
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "Shadow-run requires an attested, exact Bilibili Action Plan v2",
+                    "blockers": [
+                        blocker
+                        for blocker in shadow_contract.get("blockers", [])
+                        if blocker not in {"execution_account_scope_required", "exact_execution_evidence_required"}
+                    ],
+                },
+            )
 
     if task_mode == "real_run":
         require_min_role(request, "admin")
@@ -721,9 +1177,6 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                     400,
                     detail=f"Real actions for {lottery['platform']} are not implemented yet. Use dry run or wait for adapter calibration.",
                 )
-            evidence = await validate_real_run_evidence(lottery, account_id=data.account_id)
-            if not evidence["allowed"]:
-                raise HTTPException(409, detail={"message": "Real-run evidence gate is not satisfied", "blockers": evidence["blockers"]})
         except HTTPException as exc:
             await audit_event(
                 request,
@@ -734,7 +1187,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 risk_level="critical",
                 detail={"platform": lottery["platform"], "reason": exc.detail},
             )
-            await record_event(
+            await _record_post_commit_event(
                 aggregate="lottery",
                 aggregate_id=lottery_id,
                 event_type="RealRunDenied",
@@ -757,7 +1210,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 risk_level="high",
                 detail={"platform": lottery["platform"], "reason": breaker_reason},
             )
-            await record_event(
+            await _record_post_commit_event(
                 aggregate="lottery",
                 aggregate_id=lottery_id,
                 event_type="ShadowRunDenied",
@@ -769,7 +1222,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
 
     account = await pick_account(data.account_id, lottery["platform"])
     if not account:
-        await record_event(
+        await _record_post_commit_event(
             aggregate="lottery",
             aggregate_id=lottery_id,
             event_type="TaskDispatchBlocked",
@@ -786,12 +1239,14 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     # decision that authorised it.
     decision_id = None
     policy_version = None
+    decision_gate: dict = {}
     if task_mode == "real_run":
         decision = await evaluate_real_run_decision(lottery, account_id=account["id"], record=True)
         decision_id = decision["decision_id"]
         policy_version = decision["policy_version"]
+        decision_gate = dict(decision.get("gate") or {})
         if not decision["allowed"]:
-            await record_event(
+            await _record_post_commit_event(
                 aggregate="lottery",
                 aggregate_id=lottery_id,
                 event_type="RealRunDenied",
@@ -831,31 +1286,122 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             )
 
     task_id = str(uuid.uuid4())
-    message = build_lottery_task_message(
-        task_id=task_id,
-        account_id=account["id"],
-        lottery_id=lottery_id,
-        platform=lottery["platform"],
-        raw_url=lottery["raw_url"],
-        canonical_url=lottery["canonical_url"],
-        task_mode=task_mode,
-        dry_run=dry_run,
-        platform_selectors=platform_selectors,
-        action_plan=parse_json_field(lottery["action_plan"]) or {},
+    action_plan = parse_json_field(lottery["action_plan"]) or {}
+    plan_binding = {
+        "rule_snapshot_id": None,
+        "rule_hash": None,
+        "action_plan_hash": None,
+        "execution_path_id": None,
+        "target_hash": None,
+        "config_hash": None,
+        "execution_revision": None,
+        "required_actions": (),
+        "follow_target_handle": "",
+        "action_plan": action_plan,
+    }
+    if lottery["platform"] == "bilibili" and task_mode in {"shadow_run", "real_run"}:
+        plan_binding = bilibili_plan_binding(
+            lottery,
+            require_executable=(task_mode == "real_run"),
+            execution_revision=int(account["execution_revision"] or 0),
+        )
+        action_plan = plan_binding["action_plan"]
+    execution_evidence_id = (
+        str(decision_gate.get("execution_evidence_id") or "").strip()
+        if task_mode == "real_run"
+        else ""
     )
+    if task_mode == "real_run" and lottery["platform"] == "bilibili" and not execution_evidence_id:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Real-run policy decision has no exact execution evidence binding",
+                "blockers": ["exact_execution_evidence_required"],
+            },
+        )
     # Atomic dispatch (P1-2): task_runs row, lottery claim, and the queued
-    # stream message (as an outbox row) commit together. A FOR UPDATE guard
-    # rejects a duplicate active dispatch for the same lottery.
+    # stream message (as an outbox row) commit together. The append-only account
+    # lease fences this account across every task type.
     async with database.transaction():
         locked = await database.fetch_one(
-            "SELECT status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            """SELECT status, execution_lock, platform, raw_url, canonical_url,
+                      rule_text, action_plan, authoritative_rule_snapshot_id,
+                      rule_hash, action_plan_hash
+               FROM lotteries WHERE id = :id FOR UPDATE""",
             {"id": lottery_id},
         )
-        if locked and locked["execution_lock"] and locked["status"] in {"claimed", "running"}:
-            raise HTTPException(409, detail="Lottery already has an active task in flight")
+        require_dispatchable_lottery_state(locked)
+        require_dispatch_snapshot_unchanged(locked, lottery)
+        if task_mode == "real_run":
+            completed_actions = await completed_real_run_actions(lottery_id)
+            require_no_completed_actions_for_full_real_dispatch(completed_actions)
+            try:
+                dynamic_id = extract_bilibili_dynamic_id(
+                    str(lottery["canonical_url"] or ""),
+                    str(lottery["raw_url"] or ""),
+                )
+            except BilibiliPreflightEvidenceError as exc:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "Bilibili target changed or is not an exact dynamic",
+                        "blockers": [exc.code],
+                    },
+                ) from exc
+            exact_evidence = await load_exact_bilibili_execution_evidence(
+                lottery_id=lottery_id,
+                account_id=int(account["id"]),
+                rule_snapshot_id=plan_binding["rule_snapshot_id"],
+                execution_path_id=plan_binding["execution_path_id"],
+                target_hash=plan_binding["target_hash"],
+                rule_hash=plan_binding["rule_hash"],
+                action_plan_hash=plan_binding["action_plan_hash"],
+                config_hash=plan_binding["config_hash"],
+                dynamic_id=dynamic_id,
+                required_actions=plan_binding["required_actions"],
+                execution_revision=plan_binding["execution_revision"],
+                follow_target_handle=plan_binding["follow_target_handle"],
+                evidence_id=execution_evidence_id,
+                for_update=True,
+            )
+            if not exact_evidence:
+                raise HTTPException(409, detail="Exact execution evidence expired or changed during dispatch")
+        try:
+            account_lease = await acquire_account_operation_lease(
+                int(account["id"]),
+                operation_kind=task_mode,
+                owner_id=task_id,
+                expected_execution_revision=int(account["execution_revision"] or 0),
+                expected_platform=str(lottery["platform"]),
+                db=database,
+            )
+        except AccountOperationLeaseConflict as exc:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": (
+                        "Account changed during dispatch preflight"
+                        if exc.code == "account_operation_account_changed"
+                        else "Account is already leased by another operation"
+                    ),
+                    "account_id": exc.account_id,
+                    "code": exc.code,
+                },
+            ) from exc
         await database.execute(
-            """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode, decision_id, policy_version)
-               VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode, :decision_id, :policy_version)""",
+            """INSERT INTO task_runs
+                 (task_id, account_id, lottery_id, status, dry_run, task_mode,
+                  decision_id, policy_version, rule_snapshot_id, rule_hash,
+                  action_plan_hash, execution_evidence_id, execution_path_id,
+                  target_hash, config_hash,
+                  account_lease_id, account_lease_generation,
+                  reconciliation_required)
+               VALUES
+                 (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode,
+                  :decision_id, :policy_version, :rule_snapshot_id, :rule_hash,
+                  :action_plan_hash, :execution_evidence_id, :execution_path_id,
+                  :target_hash, :config_hash,
+                  :account_lease_id, :account_lease_generation, 0)""",
             {
                 "task_id": task_id,
                 "account_id": account["id"],
@@ -864,46 +1410,95 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                 "task_mode": task_mode,
                 "decision_id": decision_id,
                 "policy_version": policy_version,
+                "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+                "rule_hash": plan_binding["rule_hash"],
+                "action_plan_hash": plan_binding["action_plan_hash"],
+                "execution_evidence_id": execution_evidence_id or None,
+                "execution_path_id": plan_binding["execution_path_id"],
+                "target_hash": plan_binding["target_hash"],
+                "config_hash": plan_binding["config_hash"],
+                "account_lease_id": account_lease.lease_id,
+                "account_lease_generation": account_lease.generation,
             },
+        )
+        await bind_lease_to_task(account_lease, task_id, db=database)
+        message = build_lottery_task_message(
+            task_id=task_id,
+            account_id=account["id"],
+            lottery_id=lottery_id,
+            platform=lottery["platform"],
+            raw_url=lottery["raw_url"],
+            canonical_url=lottery["canonical_url"],
+            task_mode=task_mode,
+            dry_run=dry_run,
+            platform_selectors=platform_selectors,
+            action_plan=action_plan,
+            rule_snapshot_id=plan_binding["rule_snapshot_id"],
+            rule_hash=plan_binding["rule_hash"],
+            action_plan_hash=plan_binding["action_plan_hash"],
+            execution_evidence_id=execution_evidence_id,
+            execution_path_id=plan_binding["execution_path_id"],
+            target_hash=plan_binding["target_hash"],
+            config_hash=plan_binding["config_hash"],
+            execution_revision=plan_binding["execution_revision"],
+            account_lease_id=account_lease.lease_id,
+            account_lease_generation=account_lease.generation,
         )
         await database.execute(
             "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
             {"task_id": task_id, "id": lottery_id},
         )
         await enqueue_outbox(message, "lottery_tasks", dedup_key=task_id)
+        if task_mode == "real_run":
+            await audit_event(
+                request,
+                action="lottery.dispatch.real",
+                resource_type="lottery",
+                resource_id=lottery_id,
+                result="queued",
+                risk_level="critical",
+                detail={
+                    "platform": lottery["platform"],
+                    "task_id": task_id,
+                    "account_id": account["id"],
+                    "decision_id": decision_id,
+                    "policy_version": policy_version,
+                    "execution_evidence_id": execution_evidence_id,
+                    "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+                    "action_plan_hash": plan_binding["action_plan_hash"],
+                    "config_hash": plan_binding["config_hash"],
+                    "execution_revision": plan_binding["execution_revision"],
+                    "account_lease_id": account_lease.lease_id,
+                    "account_lease_generation": account_lease.generation,
+                },
+            )
+        elif task_mode == "shadow_run":
+            await audit_event(
+                request,
+                action="lottery.dispatch.shadow",
+                resource_type="lottery",
+                resource_id=lottery_id,
+                result="queued",
+                risk_level="medium",
+                detail={
+                    "platform": lottery["platform"],
+                    "task_id": task_id,
+                    "account_id": account["id"],
+                    "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+                    "action_plan_hash": plan_binding["action_plan_hash"],
+                    "config_hash": plan_binding["config_hash"],
+                    "execution_revision": plan_binding["execution_revision"],
+                    "account_lease_id": account_lease.lease_id,
+                    "account_lease_generation": account_lease.generation,
+                },
+            )
     # Best-effort immediate relay so dispatch latency stays low; if Redis is
     # momentarily unavailable the outbox dispatcher loop retries the committed row.
     try:
         await try_flush_dedup(task_id)
     except Exception as exc:
         structured_log("warning", "dispatch_immediate_flush_failed", task_id=task_id, error=str(exc))
-    if task_mode == "real_run":
-        await audit_event(
-            request,
-            action="lottery.dispatch.real",
-            resource_type="lottery",
-            resource_id=lottery_id,
-            result="queued",
-            risk_level="critical",
-            detail={
-                "platform": lottery["platform"],
-                "task_id": task_id,
-                "account_id": account["id"],
-                "decision_id": decision_id,
-                "policy_version": policy_version,
-            },
-        )
-    elif task_mode == "shadow_run":
-        await audit_event(
-            request,
-            action="lottery.dispatch.shadow",
-            resource_type="lottery",
-            resource_id=lottery_id,
-            result="queued",
-            risk_level="medium",
-            detail={"platform": lottery["platform"], "task_id": task_id, "account_id": account["id"]},
-        )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="task",
         aggregate_id=task_id,
         event_type="TaskDispatched",
@@ -914,20 +1509,40 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             "dry_run": dry_run,
             "mode": task_mode,
             "raw_url": lottery["raw_url"],
-            "action_plan": parse_json_field(lottery["action_plan"]) or {},
+            "action_plan": action_plan,
             "decision_id": decision_id,
             "policy_version": policy_version,
+            "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+            "rule_hash": plan_binding["rule_hash"],
+            "action_plan_hash": plan_binding["action_plan_hash"],
+            "execution_evidence_id": execution_evidence_id or None,
+            "execution_path_id": plan_binding["execution_path_id"],
+            "target_hash": plan_binding["target_hash"],
+            "config_hash": plan_binding["config_hash"],
+            "execution_revision": plan_binding["execution_revision"],
+            "account_lease_id": account_lease.lease_id,
+            "account_lease_generation": account_lease.generation,
         },
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
         critical=(task_mode == "real_run"),
     )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="lottery",
         aggregate_id=lottery_id,
         event_type="LotteryDispatchQueued",
-        payload={"task_id": task_id, "account_id": account["id"], "dry_run": dry_run, "mode": task_mode},
+        payload={
+            "task_id": task_id,
+            "account_id": account["id"],
+            "dry_run": dry_run,
+            "mode": task_mode,
+            "execution_evidence_id": execution_evidence_id or None,
+            "config_hash": plan_binding["config_hash"],
+            "execution_revision": plan_binding["execution_revision"],
+            "account_lease_id": account_lease.lease_id,
+            "account_lease_generation": account_lease.generation,
+        },
         correlation_id=task_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
@@ -941,6 +1556,11 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         "mode": task_mode,
         "decision_id": decision_id,
         "policy_version": policy_version,
+        "execution_evidence_id": execution_evidence_id or None,
+        "config_hash": plan_binding["config_hash"],
+        "execution_revision": plan_binding["execution_revision"],
+        "account_lease_id": account_lease.lease_id,
+        "account_lease_generation": account_lease.generation,
     }
 
 
@@ -967,6 +1587,15 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
     repair_plan = await build_lottery_repair_plan(lottery)
     if not repair_plan["eligible"]:
         raise HTTPException(409, detail={"message": "Lottery has no safe missing-action repair plan", "repair_plan": repair_plan})
+    if not REPAIR_DISPATCH_INTENT_BINDING_READY:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "repair_intent_binding_not_implemented",
+                "message": "Repair dispatch is blocked until its exact action intent is durably bound",
+                "repair_plan": repair_plan,
+            },
+        )
 
     platform_cfg = get_platform(lottery["platform"])
     if not platform_cfg:
@@ -1006,7 +1635,7 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
             risk_level="critical",
             detail={"platform": lottery["platform"], "reason": exc.detail, "repair_plan": repair_plan},
         )
-        await record_event(
+        await _record_post_commit_event(
             aggregate="lottery",
             aggregate_id=lottery_id,
             event_type="LotteryRepairDenied",
@@ -1020,7 +1649,7 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
 
     account = await pick_account(data.account_id, lottery["platform"])
     if not account:
-        await record_event(
+        await _record_post_commit_event(
             aggregate="lottery",
             aggregate_id=lottery_id,
             event_type="LotteryRepairBlocked",
@@ -1035,7 +1664,7 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
     decision_id = decision["decision_id"]
     policy_version = decision["policy_version"]
     if not decision["allowed"]:
-        await record_event(
+        await _record_post_commit_event(
             aggregate="lottery",
             aggregate_id=lottery_id,
             event_type="LotteryRepairDenied",
@@ -1081,11 +1710,14 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
 
     async with database.transaction():
         locked = await database.fetch_one(
-            "SELECT status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            """SELECT id, status, execution_lock, platform, raw_url, canonical_url, rule_text, action_plan
+               FROM lotteries WHERE id = :id FOR UPDATE""",
             {"id": lottery_id},
         )
-        if locked and locked["execution_lock"] and locked["status"] in {"claimed", "running"}:
-            raise HTTPException(409, detail="Lottery already has an active task in flight")
+        require_dispatchable_lottery_state(locked, repair=True)
+        require_dispatch_snapshot_unchanged(locked, lottery)
+        current_repair_plan = await build_lottery_repair_plan(locked)
+        require_repair_plan_unchanged(current_repair_plan, repair_plan)
         await database.execute(
             """INSERT INTO task_runs (task_id, account_id, lottery_id, status, dry_run, task_mode, decision_id, policy_version)
                VALUES (:task_id, :account_id, :lottery_id, 'queued', :dry_run, :task_mode, :decision_id, :policy_version)""",
@@ -1104,29 +1736,29 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
             {"task_id": task_id, "id": lottery_id},
         )
         await enqueue_outbox(message, "lottery_tasks", dedup_key=task_id)
+        await audit_event(
+            request,
+            action="lottery.dispatch.repair",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="queued",
+            risk_level="critical",
+            detail={
+                "platform": lottery["platform"],
+                "task_id": task_id,
+                "account_id": account["id"],
+                "decision_id": decision_id,
+                "policy_version": policy_version,
+                "repair_plan": repair_plan,
+            },
+        )
 
     try:
         await try_flush_dedup(task_id)
     except Exception as exc:
         structured_log("warning", "repair_dispatch_immediate_flush_failed", task_id=task_id, error=str(exc))
 
-    await audit_event(
-        request,
-        action="lottery.dispatch.repair",
-        resource_type="lottery",
-        resource_id=lottery_id,
-        result="queued",
-        risk_level="critical",
-        detail={
-            "platform": lottery["platform"],
-            "task_id": task_id,
-            "account_id": account["id"],
-            "decision_id": decision_id,
-            "policy_version": policy_version,
-            "repair_plan": repair_plan,
-        },
-    )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="task",
         aggregate_id=task_id,
         event_type="TaskDispatched",
@@ -1147,7 +1779,7 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
         actor_id=actor["actor_id"],
         critical=True,
     )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="lottery",
         aggregate_id=lottery_id,
         event_type="LotteryRepairQueued",
@@ -1184,51 +1816,179 @@ async def suggest_lottery_action_plan(lottery_id: int, request: Request, rule_te
 @router.put("/{lottery_id}/action-plan")
 async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpdate, request: Request):
     actor = require_min_role(request, "operator")
-    lottery = await database.fetch_one("SELECT id, platform, rule_text FROM lotteries WHERE id = :id", {"id": lottery_id})
-    if not lottery:
-        raise HTTPException(404, detail="Lottery not found")
+    submitted_actions = [str(action).strip() for action in data.required_actions]
+    invalid = [action for action in submitted_actions if action not in ACTION_SET]
+    async with database.transaction():
+        lottery = await database.fetch_one(
+            """SELECT id, platform, source_type, source_id, raw_url, canonical_url,
+                      rule_text, status, execution_lock
+               FROM lotteries WHERE id = :id FOR UPDATE""",
+            {"id": lottery_id},
+        )
+        if not lottery:
+            raise HTTPException(404, detail="Lottery not found")
+        require_lottery_not_executing(lottery, operation="change its action plan")
+        if invalid:
+            raise HTTPException(400, detail={"message": "Unsupported lottery actions", "actions": invalid})
+        if not submitted_actions:
+            raise HTTPException(400, detail="At least one required action must be selected")
+        if len(submitted_actions) != len(set(submitted_actions)):
+            raise HTTPException(400, detail="Required actions must not contain duplicates")
+        required_actions = [action for action in ACTION_ORDER if action in set(submitted_actions)]
 
-    required_actions = list(dict.fromkeys(str(action).strip() for action in data.required_actions if str(action).strip()))
-    invalid = [action for action in required_actions if action not in PHASES]
-    if invalid:
-        raise HTTPException(400, detail={"message": "Unsupported lottery actions", "actions": invalid})
-    if not required_actions:
-        raise HTTPException(400, detail="At least one required action must be selected")
+        rule_text = protected_source_rule_text(lottery["rule_text"], data.rule_text)
+        parsed_rule = parse_lottery_rule(rule_text, lottery["platform"])
+        unsupported_actions = list(parsed_rule.get("unsupported_actions") or [])
+        content_requirements = dict(
+            parsed_rule.get("content_requirements")
+            or {
+                "follow_targets": [],
+                "commented": {"topic_tags": [], "mentions": []},
+                "reposted": {"topic_tags": [], "mentions": []},
+            }
+        )
+        ambiguity_patterns = list(parsed_rule.get("ambiguity_patterns") or [])
+        parsed_required_actions = {
+            str(action)
+            for action in (parsed_rule.get("required_actions") or [])
+            if str(action)
+        }
+        selected_required_actions = set(required_actions)
 
-    plan = {
-        "version": 1,
-        "is_lottery": True,
-        "required_actions": required_actions,
-        "review_required": not data.reviewed,
-        "confidence": 1.0 if data.reviewed else 0.5,
-        "source": "operator_review",
-        "reviewed_by": actor["actor_id"] if data.reviewed else None,
-    }
-    rule_text = data.rule_text if data.rule_text is not None else lottery["rule_text"]
-    await database.execute(
-        """UPDATE lotteries
-           SET rule_text = :rule_text, action_plan = :action_plan
-           WHERE id = :id""",
-        {
-            "id": lottery_id,
-            "rule_text": rule_text,
-            "action_plan": json.dumps(plan, ensure_ascii=False),
-        },
-    )
-    await audit_event(
-        request,
-        action="lottery.action_plan.update",
-        resource_type="lottery",
-        resource_id=lottery_id,
-        result="saved",
-        risk_level="high",
-        detail={"platform": lottery["platform"], "required_actions": required_actions, "reviewed": data.reviewed},
-    )
-    await record_event(
+        raw_payloads = dict(data.action_payloads or {})
+        payload_validation_errors: list[str] = []
+        if set(raw_payloads) != selected_required_actions:
+            payload_validation_errors.append("action_plan_payload_binding_mismatch")
+        if set(raw_payloads) - ACTION_SET:
+            payload_validation_errors.append("action_plan_payload_unknown_action")
+        action_payloads: dict[str, dict] = {}
+        for action in required_actions:
+            raw_payload = raw_payloads.get(action, {})
+            try:
+                action_payloads[action] = validate_action_payload(action, raw_payload)
+            except ActionPlanV2Error as exc:
+                action_payloads[action] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+                payload_validation_errors.append(exc.code)
+        payload_validation_errors = list(dict.fromkeys(payload_validation_errors))
+
+        represented_requirements, unresolved_requirements, capability_blockers = (
+            semantic_requirement_status(
+                unsupported_actions,
+                action_payloads,
+                content_requirements,
+            )
+        )
+        execution_path_id = str(data.execution_path_id or "").strip()
+        if lottery["platform"] != "bilibili":
+            capability_blockers.append("platform_execution_path_not_bound")
+        elif execution_path_id != BILIBILI_API_EXECUTION_PATH:
+            capability_blockers.append("bilibili_execution_path_not_supported")
+        capability_blockers = list(dict.fromkeys(capability_blockers))
+
+        snapshot = await ensure_rule_snapshot(
+            dict(lottery),
+            rule_text,
+            complete=bool(data.rule_complete_confirmed),
+            actor_id=actor["actor_id"],
+            db=database,
+        )
+        semantic_review_blocked = bool(
+            not parsed_rule.get("is_lottery")
+            or parsed_required_actions != selected_required_actions
+            or ambiguity_patterns
+            or unresolved_requirements
+            or payload_validation_errors
+        )
+        review_required = bool(
+            not data.reviewed
+            or not snapshot["is_complete"]
+            or semantic_review_blocked
+        )
+        executable = bool(not review_required and not capability_blockers)
+        plan = {
+            "version": 2,
+            "platform": lottery["platform"],
+            "is_lottery": True,
+            "required_actions": required_actions,
+            "action_payloads": action_payloads,
+            "content_requirements": content_requirements,
+            "execution_path_id": execution_path_id,
+            "rule_snapshot_id": snapshot["id"],
+            "rule_hash": snapshot["rule_hash"],
+            "review_required": review_required,
+            "executable": executable,
+            "confidence": 1.0 if not review_required else 0.5,
+            "source": "operator_complete_attestation" if snapshot["is_complete"] else "operator_draft",
+            "reviewed_by": actor["actor_id"] if data.reviewed else None,
+            "rule_complete_confirmed": bool(snapshot["is_complete"]),
+            "unsupported_actions": unsupported_actions,
+            "represented_requirements": represented_requirements,
+            "unresolved_requirements": unresolved_requirements,
+            "ambiguity_patterns": ambiguity_patterns,
+            "payload_validation_errors": payload_validation_errors,
+            "capability_blockers": capability_blockers,
+        }
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+        await database.execute(
+            """UPDATE lotteries
+               SET rule_text = :rule_text,
+                   action_plan = :action_plan,
+                   authoritative_rule_snapshot_id = :authoritative_rule_snapshot_id,
+                   rule_hash = :rule_hash,
+                   action_plan_hash = :action_plan_hash
+               WHERE id = :id""",
+            {
+                "id": lottery_id,
+                "rule_text": rule_text,
+                "action_plan": json.dumps(plan, ensure_ascii=False),
+                "authoritative_rule_snapshot_id": snapshot["id"] if snapshot["is_complete"] else None,
+                "rule_hash": snapshot["rule_hash"],
+                "action_plan_hash": plan["plan_hash"],
+            },
+        )
+        # The high-risk review write and its audit record commit atomically.
+        # Otherwise an audit failure returns 500 after the plan already changed,
+        # making an operator retry ambiguous and leaving an unaudited approval.
+        await audit_event(
+            request,
+            action="lottery.action_plan.update",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="saved",
+            risk_level="high",
+            detail={
+                "platform": lottery["platform"],
+                "required_actions": required_actions,
+                "reviewed": data.reviewed,
+                "rule_complete_confirmed": bool(snapshot["is_complete"]),
+                "semantic_review_blocked": semantic_review_blocked,
+                "unsupported_actions": unsupported_actions,
+                "unresolved_requirements": unresolved_requirements,
+                "payload_validation_errors": payload_validation_errors,
+                "capability_blockers": capability_blockers,
+                "rule_snapshot_id": snapshot["id"],
+                "rule_hash": snapshot["rule_hash"],
+                "action_plan_hash": plan["plan_hash"],
+            },
+        )
+    await _record_post_commit_event(
         aggregate="lottery",
         aggregate_id=lottery_id,
-        event_type="LotteryActionPlanReviewed" if data.reviewed else "LotteryActionPlanUpdated",
-        payload={"required_actions": required_actions, "reviewed": data.reviewed, "rule_text": rule_text},
+        event_type="LotteryActionPlanReviewed" if not plan["review_required"] else "LotteryActionPlanUpdated",
+        payload={
+            "required_actions": required_actions,
+            "reviewed": data.reviewed,
+            "review_required": plan["review_required"],
+            "executable": plan["executable"],
+            "unsupported_actions": unsupported_actions,
+            "represented_requirements": represented_requirements,
+            "unresolved_requirements": unresolved_requirements,
+            "capability_blockers": capability_blockers,
+            "rule_snapshot_id": snapshot["id"],
+            "rule_hash": snapshot["rule_hash"],
+            "action_plan_hash": plan["plan_hash"],
+            "rule_text": rule_text,
+        },
         actor_type="operator",
         actor_id=actor["actor_id"],
     )
@@ -1282,39 +2042,159 @@ async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, requ
     if not account:
         raise HTTPException(400, detail=f"No calibrated ready account is available for {lottery['platform']}")
 
+    plan_binding = {
+        "rule_snapshot_id": None,
+        "rule_hash": None,
+        "action_plan_hash": None,
+        "execution_path_id": f"{lottery['platform']}_selector_v1",
+        "execution_revision": int(account["execution_revision"] or 0),
+    }
+    config_hash = compute_config_hash({})
+    if lottery["platform"] == "bilibili":
+        plan_readiness = await validate_real_run_evidence(lottery, account_id=None)
+        if not plan_readiness.get("action_plan_ready"):
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "Bilibili API-path probe requires an attested exact Action Plan v2",
+                    "blockers": [
+                        blocker
+                        for blocker in plan_readiness.get("blockers", [])
+                        if blocker not in {"execution_account_scope_required", "exact_execution_evidence_required"}
+                    ],
+                },
+            )
+        plan_binding = bilibili_plan_binding(
+            lottery,
+            require_executable=False,
+            execution_revision=int(account["execution_revision"] or 0),
+        )
+        config_hash = plan_binding["config_hash"]
+
     probe_id = str(uuid.uuid4())
-    target_url = lottery["canonical_url"] or lottery["raw_url"]
-    await database.execute(
-        """INSERT INTO adapter_calibrations (probe_id, platform, account_id, lottery_id, target_url, status)
-           VALUES (:probe_id, :platform, :account_id, :lottery_id, :target_url, 'queued')""",
-        {
-            "probe_id": probe_id,
-            "platform": lottery["platform"],
-            "account_id": account["id"],
-            "lottery_id": lottery_id,
-            "target_url": target_url,
-        },
-    )
-    await redis.xadd(
-        "adapter_probe_requests",
-        {
-            "probe_id": probe_id,
-            "platform": lottery["platform"],
-            "account_id": str(account["id"]),
-            "lottery_id": str(lottery_id),
-            "target_url": target_url,
-        },
-    )
-    await record_event(
+    target_url = validated_probe_navigation_url(lottery["raw_url"])
+    target_hash = compute_target_hash(str(lottery["canonical_url"] or ""))
+    message = {
+        "probe_id": probe_id,
+        "platform": lottery["platform"],
+        "account_id": str(account["id"]),
+        "lottery_id": str(lottery_id),
+        "target_url": target_url,
+        "canonical_url": str(lottery["canonical_url"] or ""),
+        "execution_path_id": str(plan_binding["execution_path_id"] or ""),
+        "target_hash": target_hash,
+        "rule_snapshot_id": str(plan_binding["rule_snapshot_id"] or ""),
+        "rule_hash": str(plan_binding["rule_hash"] or ""),
+        "action_plan_hash": str(plan_binding["action_plan_hash"] or ""),
+        "config_hash": config_hash,
+        "execution_revision": str(plan_binding["execution_revision"] or ""),
+    }
+    outbox_key = f"adapter-probe:{probe_id}"
+    # The canonical queued row and its stream intent commit together. Redis can
+    # be temporarily unavailable without stranding a probe that can never be
+    # reclaimed or safely retried.
+    async with database.transaction():
+        locked = await database.fetch_one(
+            """SELECT id, platform, raw_url, canonical_url, rule_text, action_plan,
+                      authoritative_rule_snapshot_id, rule_hash, action_plan_hash
+               FROM lotteries WHERE id = :id FOR UPDATE""",
+            {"id": lottery_id},
+        )
+        require_dispatch_snapshot_unchanged(locked, lottery)
+        try:
+            account_lease = await acquire_account_operation_lease(
+                int(account["id"]),
+                operation_kind="adapter_probe",
+                owner_id=probe_id,
+                expected_execution_revision=int(account["execution_revision"] or 0),
+                expected_platform=str(lottery["platform"]),
+                db=database,
+            )
+        except AccountOperationLeaseConflict as exc:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": (
+                        "Account changed during probe preflight"
+                        if exc.code == "account_operation_account_changed"
+                        else "Account is already leased by another operation"
+                    ),
+                    "account_id": exc.account_id,
+                    "code": exc.code,
+                },
+            ) from exc
+        message["account_lease_id"] = account_lease.lease_id
+        message["account_lease_generation"] = str(account_lease.generation)
+        await database.execute(
+            """INSERT INTO adapter_calibrations
+                 (probe_id, platform, account_id, lottery_id, target_url, status,
+                  execution_path_id, target_hash, rule_snapshot_id, rule_hash,
+                  action_plan_hash, config_hash, account_lease_id,
+                  account_lease_generation)
+               VALUES
+                 (:probe_id, :platform, :account_id, :lottery_id, :target_url, 'queued',
+                  :execution_path_id, :target_hash, :rule_snapshot_id, :rule_hash,
+                  :action_plan_hash, :config_hash, :account_lease_id,
+                  :account_lease_generation)""",
+            {
+                "probe_id": probe_id,
+                "platform": lottery["platform"],
+                "account_id": account["id"],
+                "lottery_id": lottery_id,
+                "target_url": target_url,
+                "execution_path_id": plan_binding["execution_path_id"],
+                "target_hash": target_hash,
+                "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+                "rule_hash": plan_binding["rule_hash"],
+                "action_plan_hash": plan_binding["action_plan_hash"],
+                "config_hash": config_hash,
+                "account_lease_id": account_lease.lease_id,
+                "account_lease_generation": account_lease.generation,
+            },
+        )
+        await enqueue_outbox(message, "adapter_probe_requests", dedup_key=outbox_key)
+    try:
+        await try_flush_dedup(outbox_key)
+    except Exception as exc:
+        structured_log(
+            "warning",
+            "adapter_probe_immediate_flush_failed",
+            probe_id=probe_id,
+            error=str(exc),
+        )
+    await _record_post_commit_event(
         aggregate="lottery",
         aggregate_id=lottery_id,
         event_type="AdapterProbeQueued",
-        payload={"probe_id": probe_id, "platform": lottery["platform"], "account_id": account["id"], "target_url": target_url},
+        payload={
+            "probe_id": probe_id,
+            "platform": lottery["platform"],
+            "account_id": account["id"],
+            "target_url": target_url,
+            "execution_path_id": plan_binding["execution_path_id"],
+            "target_hash": target_hash,
+            "rule_snapshot_id": plan_binding["rule_snapshot_id"],
+            "rule_hash": plan_binding["rule_hash"],
+            "action_plan_hash": plan_binding["action_plan_hash"],
+            "config_hash": config_hash,
+            "execution_revision": plan_binding["execution_revision"],
+            "account_lease_id": account_lease.lease_id,
+            "account_lease_generation": account_lease.generation,
+        },
         correlation_id=probe_id,
         actor_type="operator",
         actor_id=actor["actor_id"],
     )
-    return {"status": "queued", "probe_id": probe_id, "account_id": account["id"]}
+    return {
+        "status": "queued",
+        "probe_id": probe_id,
+        "account_id": account["id"],
+        "execution_path_id": plan_binding["execution_path_id"],
+        "config_hash": config_hash,
+        "execution_revision": plan_binding["execution_revision"],
+        "account_lease_id": account_lease.lease_id,
+        "account_lease_generation": account_lease.generation,
+    }
 
 
 @router.post("/probes/{probe_id}/apply-config")
@@ -1363,7 +2243,7 @@ async def apply_probe_recommended_config(probe_id: str, request: Request):
         risk_level="high",
         detail={"probe_id": probe_id, "platform": platform, "phases": phase_status},
     )
-    await record_event(
+    await _record_post_commit_event(
         aggregate="platform",
         aggregate_id=platform,
         event_type="AdapterSelectorConfigSaved",
@@ -1412,19 +2292,30 @@ async def update_lottery_result(lottery_id: int, data: LotteryResultUpdate, requ
     if data.status not in {"participated", "won", "lost", "expired"}:
         raise HTTPException(400, detail="status must be participated, won, lost, or expired")
 
-    lottery = await database.fetch_one("SELECT id FROM lotteries WHERE id = :id", {"id": lottery_id})
-    if not lottery:
-        raise HTTPException(404, detail="Lottery not found")
-
-    await database.execute(
-        "UPDATE lotteries SET status = :status WHERE id = :id",
-        {"id": lottery_id, "status": data.status},
-    )
-    if data.note:
+    async with database.transaction():
+        lottery = await database.fetch_one(
+            "SELECT id, status, execution_lock FROM lotteries WHERE id = :id FOR UPDATE",
+            {"id": lottery_id},
+        )
+        require_lottery_not_executing(lottery, operation="record a result")
         await database.execute(
-            """INSERT INTO notify_logs (channel, title, content, success)
-               VALUES ('manual', :title, :content, 1)""",
-            {"title": f"Lottery {lottery_id} result", "content": data.note},
+            "UPDATE lotteries SET status = :status WHERE id = :id",
+            {"id": lottery_id, "status": data.status},
+        )
+        if data.note:
+            await database.execute(
+                """INSERT INTO notify_logs (channel, title, content, success)
+                   VALUES ('manual', :title, :content, 1)""",
+                {"title": f"Lottery {lottery_id} result", "content": data.note},
+            )
+        await audit_event(
+            request,
+            action="lottery.result.update",
+            resource_type="lottery",
+            resource_id=lottery_id,
+            result="saved",
+            risk_level="high",
+            detail={"status": data.status},
         )
     event_type = {
         "participated": "LotteryJoined",
@@ -1432,7 +2323,7 @@ async def update_lottery_result(lottery_id: int, data: LotteryResultUpdate, requ
         "lost": "LotteryLost",
         "expired": "LotteryExpired",
     }[data.status]
-    await record_event(
+    await _record_post_commit_event(
         aggregate="lottery",
         aggregate_id=lottery_id,
         event_type=event_type,
@@ -1456,7 +2347,13 @@ async def pick_account(account_id: int | None, platform: str):
                    WHERE c.account_id = a.id
                    ORDER BY c.created_at DESC
                    LIMIT 1
-                 ) = 'succeeded'""",
+                 ) = 'succeeded'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = a.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
             {"id": account_id, "platform": platform},
         )
 
@@ -1474,7 +2371,13 @@ async def pick_account(account_id: int | None, platform: str):
                    WHERE c.account_id = a.id
                    ORDER BY c.created_at DESC
                    LIMIT 1
-                 ) = 'succeeded'""",
+                 ) = 'succeeded'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = a.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
             {"id": recommended["account_id"], "platform": platform},
         )
         if row and not (await recent_account_risk(int(row["id"])))["has_recent_risk"]:
@@ -1491,6 +2394,12 @@ async def pick_account(account_id: int | None, platform: str):
                ORDER BY c.created_at DESC
                LIMIT 1
              ) = 'succeeded'
+             AND NOT EXISTS (
+               SELECT 1 FROM account_operation_leases lease
+               WHERE lease.account_id = a.id
+                 AND lease.released_at IS NULL
+                 AND lease.expires_at > NOW()
+             )
            ORDER BY daily_task_count ASC, id ASC
            LIMIT 25""",
         {"platform": platform},
@@ -1510,6 +2419,12 @@ async def pick_account(account_id: int | None, platform: str):
                ORDER BY c.created_at DESC
                LIMIT 1
              ) = 'succeeded'
+             AND NOT EXISTS (
+               SELECT 1 FROM account_operation_leases lease
+               WHERE lease.account_id = a.id
+                 AND lease.released_at IS NULL
+                 AND lease.expires_at > NOW()
+             )
            ORDER BY daily_task_count ASC, id ASC
            LIMIT 1""",
         {"platform": platform},
@@ -1553,7 +2468,7 @@ async def compute_strategy_item(
     breaker_allowed, breaker_reason = await circuit_breaker_allows(platform)
     target = validate_lottery_target(platform, item["raw_url"])
     target_real_valid = target.valid and not (adapter_kind == "api" and target.kind != "dynamic")
-    probe_ready = adapter_kind == "api" or bool(probe_summary and probe_summary.get("ready_for_real_actions"))
+    probe_ready = platform_probe_ready_for_real_actions(platform, probe_summary)
 
     if target_real_valid:
         recommended_mode, reason_codes, blockers = choose_strategy_mode(

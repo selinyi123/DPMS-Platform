@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app.db import database, redis
+from app.db import database, execute_affected_rows, redis
 from app.event_store.service import record_event
 from app.adapter_config import load_runtime_selector_config, selector_config_complete
 from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart
@@ -21,6 +21,54 @@ from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
 PROFILES_DIR = Path("/profiles")
 CALIBRATION_DIR = PROFILES_DIR / "account-calibrations"
 router = APIRouter()
+
+
+async def lock_account_for_execution_contract_mutation(account_id: int):
+    """Fence credential/proxy identity changes against every active operation.
+
+    Operation acquisition locks the same account row before inserting its
+    append-only lease.  Taking that lock first here makes the active-lease
+    check and the subsequent revision bump one serializable decision.
+    """
+
+    row = await database.fetch_one(
+        """SELECT id, platform, status, proxy_id, deleted_at
+           FROM accounts
+           WHERE id = :id
+           FOR UPDATE""",
+        {"id": account_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+    active_lease = await database.fetch_one(
+        """SELECT lease_id
+           FROM account_operation_leases
+           WHERE account_id = :account_id
+             AND released_at IS NULL
+             AND expires_at > NOW()
+           ORDER BY generation DESC
+           LIMIT 1
+           FOR UPDATE""",
+        {"account_id": account_id},
+    )
+    if active_lease:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Account has an active operation lease",
+                "code": "account_operation_lease_active",
+                "account_id": account_id,
+            },
+        )
+    return row
+
+
+async def execute_locked_account_update(query: str, values: dict) -> int:
+    await database.execute(query, values)
+    affected = await database.fetch_one("SELECT ROW_COUNT() AS affected")
+    if affected is None:
+        raise RuntimeError("database_affected_row_count_unavailable")
+    return int(affected["affected"] or 0)
 
 
 @router.get("/platforms")
@@ -370,21 +418,49 @@ async def get_qr_login_image(session_id: str):
 @router.put("/{account_id}/credential")
 async def update_credential(account_id: int, data: AccountCredentialUpdate, request: Request):
     actor = require_min_role(request, "operator")
-    row = await database.fetch_one("SELECT platform FROM accounts WHERE id = :id", {"id": account_id})
+    row = await database.fetch_one(
+        "SELECT platform, status FROM accounts WHERE id = :id",
+        {"id": account_id},
+    )
     if not row:
         raise HTTPException(404, detail="Account not found")
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot replace a credential while the account is executing")
+    if row["status"] == "banned":
+        raise HTTPException(409, detail="Cannot replace a credential on a banned account")
 
     try:
         normalized = normalize_and_validate_credential(row["platform"], data.encrypted_credential)
     except Exception as e:
         raise HTTPException(400, detail=str(e))
 
-    await database.execute(
-        """UPDATE accounts
-           SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "credential": cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)},
-    )
+    encrypted_credential = cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)
+    async with database.transaction():
+        locked = await lock_account_for_execution_contract_mutation(account_id)
+        if locked["deleted_at"]:
+            raise HTTPException(409, detail="Cannot replace a credential on a deleted account")
+        if locked["status"] in {"executing", "banned"}:
+            raise HTTPException(
+                409, detail=f"Cannot replace a credential while account is {locked['status']}"
+            )
+        if str(locked["platform"]) != str(row["platform"]):
+            raise HTTPException(409, detail="Account platform changed; retry credential update")
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(),
+                   version = version + 1, execution_revision = execution_revision + 1
+               WHERE id = :id AND status NOT IN ('executing', 'banned')
+                 AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "credential": encrypted_credential},
+        )
+    if int(updated or 0) != 1:
+        raise HTTPException(409, detail="Account changed; credential update was not applied")
     calibration = await queue_account_calibration(account_id, row["platform"])
     await audit_event(
         request,
@@ -448,17 +524,38 @@ async def change_status(account_id: int, data: AccountUpdateStatus, request: Req
 @router.put("/{account_id}/proxy")
 async def update_account_proxy(account_id: int, data: AccountProxyUpdate, request: Request):
     actor = require_min_role(request, "operator")
-    row = await database.fetch_one("SELECT id, status FROM accounts WHERE id = :id", {"id": account_id})
-    if not row:
-        raise HTTPException(404, detail="Account not found")
-    if row["status"] == "executing":
-        raise HTTPException(409, detail="Cannot change proxy while account is executing")
+    async with database.transaction():
+        row = await lock_account_for_execution_contract_mutation(account_id)
+        if row["deleted_at"]:
+            raise HTTPException(409, detail="Cannot change proxy on a deleted account")
+        if row["status"] == "executing":
+            raise HTTPException(409, detail="Cannot change proxy while account is executing")
+        if row["proxy_id"] == data.proxy_id:
+            return {
+                "status": "proxy_unassigned" if data.proxy_id is None else "proxy_assigned",
+                "id": account_id,
+                "proxy_id": data.proxy_id,
+                "changed": False,
+            }
+        if data.proxy_id is not None:
+            await validate_proxy_assignment(data.proxy_id, account_id)
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET proxy_id = :proxy_id, updated_at = NOW(), version = version + 1,
+                   execution_revision = execution_revision + 1
+               WHERE id = :id AND status <> 'executing' AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "proxy_id": data.proxy_id},
+        )
+        if int(updated or 0) != 1:
+            raise HTTPException(409, detail="Account changed; proxy update was not applied")
 
     if data.proxy_id is None:
-        await database.execute(
-            "UPDATE accounts SET proxy_id = NULL, updated_at = NOW(), version = version + 1 WHERE id = :id",
-            {"id": account_id},
-        )
         await record_event(
             aggregate="account",
             aggregate_id=account_id,
@@ -469,13 +566,6 @@ async def update_account_proxy(account_id: int, data: AccountProxyUpdate, reques
         )
         return {"status": "proxy_unassigned", "id": account_id, "proxy_id": None}
 
-    await validate_proxy_assignment(data.proxy_id, account_id)
-    await database.execute(
-        """UPDATE accounts
-           SET proxy_id = :proxy_id, updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "proxy_id": data.proxy_id},
-    )
     await record_event(
         aggregate="account",
         aggregate_id=account_id,
@@ -491,23 +581,33 @@ async def update_account_proxy(account_id: int, data: AccountProxyUpdate, reques
 async def delete_account(account_id: int, request: Request):
     actor = require_min_role(request, "admin")
     require_confirmation(request)
-    row = await database.fetch_one("SELECT id, status, deleted_at FROM accounts WHERE id = :id", {"id": account_id})
-    if not row:
-        raise HTTPException(404, detail="Account not found")
-    if row["deleted_at"]:
-        return {"status": "already_deleted", "id": account_id}
-    if row["status"] == "executing":
-        raise HTTPException(409, detail="Cannot delete an account while it is executing")
-
-    await database.execute(
-        """UPDATE accounts
-           SET status = 'frozen', encrypted_credential = '', proxy_id = NULL,
-               deleted_at = NOW(), deleted_by = :deleted_by,
-               delete_reason = 'operator soft delete', updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "deleted_by": actor["actor_id"]},
-    )
-    await database.execute("UPDATE login_sessions SET account_id = NULL WHERE account_id = :id", {"id": account_id})
+    async with database.transaction():
+        row = await lock_account_for_execution_contract_mutation(account_id)
+        if row["deleted_at"]:
+            return {"status": "already_deleted", "id": account_id}
+        if row["status"] == "executing":
+            raise HTTPException(409, detail="Cannot delete an account while it is executing")
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET status = 'frozen', encrypted_credential = '', proxy_id = NULL,
+                   deleted_at = NOW(), deleted_by = :deleted_by,
+                   delete_reason = 'operator soft delete', updated_at = NOW(), version = version + 1,
+                   execution_revision = execution_revision + 1
+               WHERE id = :id AND status <> 'executing' AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "deleted_by": actor["actor_id"]},
+        )
+        if int(updated or 0) != 1:
+            raise HTTPException(409, detail="Account changed; delete was not applied")
+        await database.execute(
+            "UPDATE login_sessions SET account_id = NULL WHERE account_id = :id",
+            {"id": account_id},
+        )
     await audit_event(
         request,
         action="account.delete",
@@ -565,14 +665,22 @@ async def calibrate_account(account_id: int, data: AccountCalibrationRequest, re
         raise HTTPException(404, detail="Account not found")
     if row["credential_size"] == 0:
         raise HTTPException(400, detail="Cannot calibrate an account before importing a credential")
-    if row["status"] in {"executing", "banned"} and not data.force:
-        raise HTTPException(409, detail=f"Cannot calibrate account while status is {row['status']}")
-    await database.execute(
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot calibrate an account while it is executing")
+    if row["status"] == "banned":
+        if not data.force:
+            raise HTTPException(409, detail="Cannot calibrate a banned account without an admin override")
+        require_min_role(request, "admin")
+        require_confirmation(request)
+    updated = await execute_affected_rows(
         """UPDATE accounts
            SET status = 'warming', updated_at = NOW(), version = version + 1
-           WHERE id = :id AND status NOT IN ('executing', 'banned')""",
+           WHERE id = :id AND status <> 'executing'""",
         {"id": account_id},
+        db=database,
     )
+    if int(updated or 0) != 1:
+        raise HTTPException(409, detail="Account started executing; calibration was not queued")
     calibration = await queue_account_calibration(account_id, row["platform"])
     await record_event(
         aggregate="account",
