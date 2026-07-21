@@ -716,6 +716,13 @@ def validate_shadow_task_binding(task: dict | None, lottery) -> None:
         raise TaskClaimConflict("shadow_task_action_plan_mismatch")
 
     if str(row_get(lottery, "platform") or "").strip().lower() == "xiaohongshu":
+        if any(
+            str(plan.get("platform") or "").strip().lower() != "xiaohongshu"
+            for plan in (authoritative_plan, message_plan)
+        ):
+            raise TaskClaimConflict(
+                "shadow_task_action_plan_platform_mismatch"
+            )
         try:
             validate_action_plan_v2(
                 authoritative_plan,

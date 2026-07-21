@@ -341,6 +341,29 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
         task["action_plan"] = copy.deepcopy(plan)
         task_runner.validate_shadow_task_binding(task, lottery)
 
+    def test_shadow_binding_rejects_missing_or_forged_plan_platform(self):
+        for forged_platform in (None, "bilibili"):
+            with self.subTest(forged_platform=forged_platform):
+                plan = xiaohongshu_plan()
+                if forged_platform is None:
+                    plan.pop("platform")
+                else:
+                    plan["platform"] = forged_platform
+                plan["plan_hash"] = compute_action_plan_hash(plan)
+                lottery = {
+                    "platform": "xiaohongshu",
+                    "raw_url": "https://www.xiaohongshu.com/explore/abc123",
+                    "canonical_url": "canonical://xiaohongshu/note/abc123",
+                    "action_plan": plan,
+                }
+                task = dict(lottery)
+                task["action_plan"] = copy.deepcopy(plan)
+                with self.assertRaisesRegex(
+                    task_runner.TaskClaimConflict,
+                    "shadow_task_action_plan_platform_mismatch",
+                ):
+                    task_runner.validate_shadow_task_binding(task, lottery)
+
     async def test_shadow_observes_four_phases_without_clicking(self):
         adapter = XiaohongshuAdapter(selector_config=complete_observation_config())
 
