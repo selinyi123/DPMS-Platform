@@ -9,7 +9,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.action_plan import (
+    ACTION_ORDER,
     BILIBILI_API_EXECUTION_PATH,
+    XIAOHONGSHU_ACTION_ORDER,
+    XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+    XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
     compute_bilibili_api_config_hash,
     compute_config_hash,
@@ -41,7 +45,7 @@ from app.utils.lottery_targets import validate_lottery_target
 
 ACCOUNT_RISK_COOLDOWN_HOURS = 24
 MAX_ACCOUNT_RISK_COOLDOWN_HOURS = 24
-SHADOW_PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
+SHADOW_PHASE_ORDER = list(ACTION_ORDER)
 EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/profiles"))
 SHADOW_SCREENSHOT_ROOT = EVIDENCE_ROOT / "shadow-runs"
 EVIDENCE_HASH_CHUNK_SIZE = 1024 * 1024
@@ -150,6 +154,45 @@ def qualified_shadow_observation(payload, required_actions: list[str]) -> bool:
         elif not observation:
             return False
     return bool(expected and payload.get("screenshot_path"))
+
+
+def qualified_xiaohongshu_manual_shadow_observation(payload) -> bool:
+    """Validate XHS selector evidence without upgrading it to real-ready.
+
+    The Worker deliberately reports ``qualified=false`` because no official
+    interaction API exists.  This independent contract records that all four
+    selectors were observed while preserving the manual-confirmation boundary;
+    the generic real-run validator above must remain strict.
+    """
+
+    if not isinstance(payload, dict):
+        return False
+    if (
+        payload.get("side_effects") is not False
+        or payload.get("qualified") is not False
+        or payload.get("selector_observation_complete") is not True
+        or payload.get("manual_confirmation_required") is not True
+        or payload.get("real_run_capable") is not False
+        or payload.get("capability_block_reason")
+        != XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER
+        or payload.get("required_phases") != list(XIAOHONGSHU_ACTION_ORDER)
+    ):
+        return False
+    visible = payload.get("visible_phases")
+    if not isinstance(visible, dict):
+        return False
+    for phase in XIAOHONGSHU_ACTION_ORDER:
+        observation = visible.get(phase)
+        if phase == "commented":
+            if (
+                not isinstance(observation, dict)
+                or not observation.get("input")
+                or not observation.get("submit")
+            ):
+                return False
+        elif not observation:
+            return False
+    return bool(payload.get("screenshot_path"))
 
 
 def shadow_screenshot_integrity_matches(
@@ -1188,6 +1231,320 @@ async def validate_bilibili_v2_evidence(lottery, account_id: int | None) -> dict
     }
 
 
+async def validate_xiaohongshu_manual_contract(
+    lottery,
+    account_id: int | None = None,
+    *,
+    evidence_batch: RealRunEvidenceBatch | None = None,
+) -> dict:
+    """Validate an exact XHS manual checklist while always denying real-run.
+
+    Selector observations may support a side-effect-free shadow run, but they
+    cannot establish an official mutation capability.  Keeping plan readiness
+    separate from execution capability lets operators review an exact four-
+    action checklist without ever turning that checklist into real-run proof.
+    """
+
+    blockers: list[str] = [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER]
+    lottery_data = dict(lottery)
+    target = validate_lottery_target(
+        lottery_data.get("platform"), lottery_data.get("raw_url")
+    )
+    if not target.valid:
+        _append_blocker(blockers, "invalid_lottery_target")
+
+    raw_plan = parse_json_field(lottery_data.get("action_plan"))
+    plan = None
+    try:
+        plan = validate_action_plan_v2(raw_plan, require_executable=False)
+    except ActionPlanV2Error as exc:
+        if exc.code == "action_plan_version_unsupported":
+            _append_blocker(blockers, "lottery_action_plan_v2_required")
+        elif exc.code == "action_plan_review_required":
+            _append_blocker(blockers, "lottery_rule_review_required")
+        else:
+            _append_blocker(blockers, exc.code)
+
+    rule_snapshot_ready = False
+    semantic_ready = False
+    capability_binding_ready = False
+    if plan is not None:
+        if plan.plan.get("platform") != "xiaohongshu":
+            _append_blocker(blockers, "action_plan_platform_mismatch")
+        if plan.execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH:
+            _append_blocker(
+                blockers, "xiaohongshu_execution_path_not_supported"
+            )
+        if tuple(plan.required_actions) != XIAOHONGSHU_ACTION_ORDER:
+            _append_blocker(blockers, "xiaohongshu_four_action_plan_required")
+        if plan.plan.get("executable") is not False:
+            _append_blocker(
+                blockers, "xiaohongshu_manual_plan_must_be_non_executable"
+            )
+
+        rule_text = str(lottery_data.get("rule_text") or "")
+        if not rule_text.strip():
+            _append_blocker(blockers, "lottery_rule_text_required")
+        else:
+            try:
+                exact_rule_hash = compute_rule_hash(rule_text)
+            except ActionPlanV2Error as exc:
+                _append_blocker(blockers, exc.code)
+                exact_rule_hash = ""
+            try:
+                authoritative_snapshot_id = int(
+                    lottery_data.get("authoritative_rule_snapshot_id") or 0
+                )
+            except (TypeError, ValueError):
+                authoritative_snapshot_id = 0
+            if (
+                not exact_rule_hash
+                or plan.rule_hash != exact_rule_hash
+                or str(lottery_data.get("rule_hash") or "") != exact_rule_hash
+                or str(lottery_data.get("action_plan_hash") or "")
+                != plan.plan_hash
+                or authoritative_snapshot_id != plan.rule_snapshot_id
+            ):
+                _append_blocker(blockers, "action_plan_rule_binding_mismatch")
+            else:
+                snapshot = await database.fetch_one(
+                    """SELECT id, platform, rule_hash, is_complete, attested_by, attested_at
+                       FROM lottery_rule_snapshots
+                       WHERE id = :snapshot_id
+                         AND lottery_id = :lottery_id
+                         AND platform = 'xiaohongshu'
+                         AND rule_hash = :rule_hash
+                         AND BINARY rule_text = BINARY :rule_text
+                         AND is_complete = 1
+                         AND attested_by IS NOT NULL
+                         AND attested_at IS NOT NULL
+                       LIMIT 1""",
+                    {
+                        "snapshot_id": plan.rule_snapshot_id,
+                        "lottery_id": lottery_data.get("id"),
+                        "rule_hash": exact_rule_hash,
+                        "rule_text": rule_text,
+                    },
+                )
+                rule_snapshot_ready = bool(snapshot)
+                if not rule_snapshot_ready:
+                    _append_blocker(
+                        blockers, "authoritative_rule_snapshot_required"
+                    )
+
+            parsed_rule = parse_lottery_rule(rule_text, "xiaohongshu")
+            parsed_actions = tuple(
+                action
+                for action in XIAOHONGSHU_ACTION_ORDER
+                if action in set(parsed_rule.get("required_actions") or [])
+            )
+            represented, unresolved, semantic_capability = (
+                semantic_requirement_status(
+                    list(parsed_rule.get("unsupported_actions") or []),
+                    plan.action_payloads,
+                    parsed_rule.get("content_requirements") or {},
+                )
+            )
+            if not parsed_rule.get("is_lottery"):
+                _append_blocker(blockers, "lottery_rule_not_recognized")
+            if parsed_actions != XIAOHONGSHU_ACTION_ORDER:
+                _append_blocker(blockers, "lottery_action_plan_stale")
+            if parsed_rule.get("ambiguity_patterns"):
+                _append_blocker(blockers, "lottery_rule_ambiguous")
+            if unresolved:
+                _append_blocker(
+                    blockers, "lottery_rule_requirements_unresolved"
+                )
+            for code in semantic_capability:
+                _append_blocker(blockers, code)
+
+            expected_capability = list(
+                dict.fromkeys(
+                    [*semantic_capability, XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER]
+                )
+            )
+            capability_binding_ready = (
+                list(plan.plan.get("capability_blockers") or [])
+                == expected_capability
+            )
+            if not capability_binding_ready:
+                _append_blocker(
+                    blockers, "action_plan_capability_binding_mismatch"
+                )
+            if set(represented) != set(
+                plan.plan.get("represented_requirements") or []
+            ):
+                _append_blocker(
+                    blockers, "action_plan_requirement_binding_mismatch"
+                )
+            if set(unresolved) != set(
+                plan.plan.get("unresolved_requirements") or []
+            ):
+                _append_blocker(
+                    blockers, "action_plan_requirement_binding_mismatch"
+                )
+            expected_content_requirements = dict(
+                parsed_rule.get("content_requirements")
+                or {
+                    "follow_targets": [],
+                    "commented": {"topic_tags": [], "mentions": []},
+                    "reposted": {"topic_tags": [], "mentions": []},
+                }
+            )
+            if plan.content_requirements != expected_content_requirements:
+                _append_blocker(
+                    blockers, "action_plan_requirement_binding_mismatch"
+                )
+            semantic_ready = bool(
+                parsed_rule.get("is_lottery")
+                and parsed_actions == XIAOHONGSHU_ACTION_ORDER
+                and not parsed_rule.get("ambiguity_patterns")
+                and not unresolved
+                and not semantic_capability
+            )
+
+    action_plan_ready = bool(
+        plan is not None
+        and plan.plan.get("executable") is False
+        and plan.execution_path_id == XIAOHONGSHU_MANUAL_EXECUTION_PATH
+        and tuple(plan.required_actions) == XIAOHONGSHU_ACTION_ORDER
+        and rule_snapshot_ready
+        and semantic_ready
+        and capability_binding_ready
+        and not any(
+            blocker.startswith("action_plan_")
+            or blocker.startswith("lottery_action_plan_")
+            or blocker.startswith("lottery_rule_")
+            or blocker.startswith("authoritative_rule_")
+            or blocker.startswith("xiaohongshu_four_")
+            or blocker.startswith("xiaohongshu_execution_path_")
+            or blocker.startswith("xiaohongshu_manual_plan_")
+            for blocker in blockers
+        )
+    )
+    task_values = {"lottery_id": lottery_data.get("id")}
+    account_filter = ""
+    if account_id is not None:
+        account_filter = "AND account_id = :account_id"
+        task_values["account_id"] = account_id
+    if evidence_batch is None:
+        shadow = await database.fetch_one(
+            f"""SELECT task_id, account_id, finished_at, screenshot_path
+                FROM task_runs
+                WHERE lottery_id = :lottery_id
+                  AND task_mode = 'shadow_run'
+                  AND status = 'succeeded'
+                  AND finished_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                  {account_filter}
+                ORDER BY id DESC
+                LIMIT 1""",
+            task_values,
+        )
+    else:
+        shadow = evidence_batch.shadows.get(int(lottery_data.get("id")))
+
+    selector_observation_complete = False
+    if plan is not None and shadow and row_value(shadow, "screenshot_path"):
+        shadow_task_id = row_value(shadow, "task_id")
+        shadow_account_id = row_value(shadow, "account_id")
+        expected_account_id = (
+            account_id if account_id is not None else shadow_account_id
+        )
+        if evidence_batch is None:
+            observation = await database.fetch_one(
+                """SELECT payload
+                   FROM events
+                   WHERE aggregate = 'task'
+                     AND aggregate_id = :task_id
+                     AND correlation_id = :task_id
+                     AND event_type = 'TaskShadowRunObserved'
+                   ORDER BY occurred_at DESC
+                   LIMIT 1""",
+                {"task_id": shadow_task_id},
+            )
+            evidence_file = await database.fetch_one(
+                """SELECT file_path, sha256
+                   FROM evidence_files
+                   WHERE task_id = :task_id
+                     AND account_id = :account_id
+                     AND lottery_id = :lottery_id
+                     AND evidence_type = 'shadow_run_screenshot'
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                {
+                    "task_id": shadow_task_id,
+                    "account_id": expected_account_id,
+                    "lottery_id": lottery_data.get("id"),
+                },
+            )
+        else:
+            observation = evidence_batch.observations.get(
+                str(shadow_task_id).casefold()
+            )
+            evidence_file = None
+            if expected_account_id is not None:
+                evidence_file = evidence_batch.evidence_files.get(
+                    (
+                        str(shadow_task_id).casefold(),
+                        str(expected_account_id),
+                        int(lottery_data.get("id")),
+                    )
+                )
+        observation_payload = parse_json_field(row_value(observation, "payload"))
+        screenshot_path = str(row_value(shadow, "screenshot_path") or "")
+        evidence_path = str(row_value(evidence_file, "file_path") or "")
+        evidence_hash = str(row_value(evidence_file, "sha256") or "").lower()
+        metadata_matches = bool(
+            qualified_xiaohongshu_manual_shadow_observation(
+                observation_payload
+            )
+            and str(observation_payload.get("account_id"))
+            == str(expected_account_id)
+            and str(observation_payload.get("lottery_id"))
+            == str(lottery_data.get("id"))
+            and str(observation_payload.get("platform")) == "xiaohongshu"
+            and screenshot_path
+            == str(observation_payload.get("screenshot_path") or "")
+            and screenshot_path == evidence_path
+        )
+        if metadata_matches:
+            selector_observation_complete = await asyncio.to_thread(
+                shadow_screenshot_integrity_matches,
+                evidence_path,
+                evidence_hash,
+                integrity_cache=(
+                    evidence_batch.screenshot_integrity_cache
+                    if evidence_batch is not None
+                    else None
+                ),
+                hash_budget=(
+                    evidence_batch.screenshot_hash_budget
+                    if evidence_batch is not None
+                    else None
+                ),
+            )
+
+    return {
+        "allowed": False,
+        "blockers": blockers,
+        "probe_ready": False,
+        "shadow_ready": False,
+        "action_plan_ready": action_plan_ready,
+        "rule_snapshot_ready": rule_snapshot_ready,
+        "execution_evidence_bound": False,
+        "execution_evidence_id": None,
+        "execution_evidence": None,
+        "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        "execution_mode": "manual_assisted",
+        "real_run_supported": False,
+        "capability_reason": XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
+        "manual_shadow_supported": True,
+        "selector_observation_complete": selector_observation_complete,
+        "manual_confirmation_required": True,
+        "account_risk": None,
+    }
+
+
 async def validate_real_run_evidence(
     lottery,
     account_id: int | None = None,
@@ -1196,6 +1553,12 @@ async def validate_real_run_evidence(
 ) -> dict:
     if evidence_batch is not None and evidence_batch.account_id != account_id:
         raise ValueError("real-run evidence batch account scope mismatch")
+    if lottery["platform"] == "xiaohongshu":
+        return await validate_xiaohongshu_manual_contract(
+            lottery,
+            account_id=account_id,
+            evidence_batch=evidence_batch,
+        )
     if platform_has_api_real_adapter(lottery["platform"]):
         # Bilibili's API execution path has a stronger v2 contract.  Browser
         # selector observations and legacy v1 plans can never substitute for
@@ -1478,6 +1841,8 @@ def next_action_for_blockers(blockers: list[str]) -> str:
         )
     ):
         return "review_rule"
+    if XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER in blockers:
+        return "manual_assisted"
     if "no_calibrated_ready_account" in blockers:
         return "add_account"
     if "recent_account_risk_event" in blockers:
@@ -1585,5 +1950,17 @@ async def real_run_gate_status(
         "execution_evidence_id": evidence.get("execution_evidence_id"),
         "execution_evidence": evidence.get("execution_evidence"),
         "execution_path_id": evidence.get("execution_path_id"),
+        "execution_mode": evidence.get("execution_mode"),
+        "real_run_supported": evidence.get("real_run_supported", True),
+        "capability_reason": evidence.get("capability_reason"),
+        "manual_shadow_supported": bool(
+            evidence.get("manual_shadow_supported")
+        ),
+        "selector_observation_complete": bool(
+            evidence.get("selector_observation_complete")
+        ),
+        "manual_confirmation_required": bool(
+            evidence.get("manual_confirmation_required")
+        ),
         "action_plan": parse_json_field(dict(lottery).get("action_plan")),
     }

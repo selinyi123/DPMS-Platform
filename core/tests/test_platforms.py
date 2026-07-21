@@ -11,8 +11,8 @@ os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 from app.adapter_config import SELECTOR_B64_ENV, SELECTOR_ENV  # noqa: E402
 from app.platforms import get_platform  # noqa: E402
 
-STRUCTURED = ("bilibili", "weibo", "douyin", "xiaohongshu")
-SELECTOR_GATED = ("weibo", "douyin", "xiaohongshu")
+STRUCTURED = ("bilibili", "weibo", "douyin")
+SELECTOR_GATED = ("weibo", "douyin")
 
 
 def _complete_config(platform):
@@ -55,14 +55,26 @@ class PlatformAdapterStatusTests(unittest.TestCase):
         self.assertEqual(cfg["adapter_status"], "configured")
 
     def test_complete_selector_config_enables_adapter(self):
-        """A complete selector config flips action_adapter on for EVERY structured
-        platform, including bilibili (previously special-cased off)."""
+        """Complete selectors enable supported structured mutation adapters."""
         for platform in STRUCTURED:
             os.environ[SELECTOR_ENV] = json.dumps(_complete_config(platform))
             cfg = get_platform(platform)
             self.assertTrue(cfg["action_adapter"], platform)
             self.assertEqual(cfg["adapter_status"], "configured", platform)
             os.environ.pop(SELECTOR_ENV, None)
+
+    def test_xiaohongshu_selectors_never_enable_real_actions(self):
+        os.environ[SELECTOR_ENV] = json.dumps(_complete_config("xiaohongshu"))
+
+        cfg = get_platform("xiaohongshu")
+
+        self.assertFalse(cfg["action_adapter"])
+        self.assertFalse(cfg["real_run_supported"])
+        self.assertEqual("manual_assisted_only", cfg["adapter_status"])
+        self.assertEqual(
+            "xiaohongshu_no_official_interaction_api",
+            cfg["real_run_blocker"],
+        )
 
     def test_bilibili_no_longer_depends_on_selector_config(self):
         os.environ[SELECTOR_ENV] = json.dumps({"bilibili": {}})

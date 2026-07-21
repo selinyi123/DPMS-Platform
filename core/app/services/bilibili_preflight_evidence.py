@@ -14,7 +14,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from app.action_plan import (
-    ACTION_ORDER,
+    BILIBILI_ACTION_ORDER,
     BILIBILI_API_EXECUTION_PATH,
     BILIBILI_API_PREFLIGHT_CONTRACT_VERSION,
     HANDLE_PATTERN,
@@ -140,7 +140,11 @@ def validate_preflight_observation(
     if (
         not expected_action_list
         or expected_action_list
-        != [action for action in ACTION_ORDER if action in set(expected_action_list)]
+        != [
+            action
+            for action in BILIBILI_ACTION_ORDER
+            if action in set(expected_action_list)
+        ]
         or any(action not in DPMS_TO_API_ACTION for action in expected_action_list)
     ):
         raise BilibiliPreflightEvidenceError(

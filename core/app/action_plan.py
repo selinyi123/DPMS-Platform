@@ -14,8 +14,18 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-ACTION_ORDER = ("followed", "liked", "commented", "reposted")
+LEGACY_ACTION_ORDER = ("followed", "liked", "commented", "reposted")
+# Preserve the relative order of every existing action while adding collection
+# before repost.  The global order is used for deterministic presentation and
+# hashes; platform validators still enforce their own supported subset.
+ACTION_ORDER = ("followed", "liked", "commented", "favorited", "reposted")
 ACTION_SET = frozenset(ACTION_ORDER)
+BILIBILI_ACTION_ORDER = LEGACY_ACTION_ORDER
+XIAOHONGSHU_ACTION_ORDER = ("followed", "liked", "commented", "favorited")
+PLATFORM_ACTION_ORDERS = {
+    "bilibili": BILIBILI_ACTION_ORDER,
+    "xiaohongshu": XIAOHONGSHU_ACTION_ORDER,
+}
 TEXT_ACTIONS = frozenset({"commented", "reposted"})
 OPTIONAL_TEXT_METADATA = frozenset(
     {"topic_tags", "mentions", "media_refs", "translation"}
@@ -26,6 +36,10 @@ CONTENT_REQUIREMENT_FIELDS = ("topic_tags", "mentions")
 HANDLE_PATTERN = re.compile(r"@[\w\u4e00-\u9fff-]{1,64}\Z")
 BILIBILI_API_EXECUTION_PATH = "bilibili_api_v2"
 BILIBILI_API_PREFLIGHT_CONTRACT_VERSION = 1
+XIAOHONGSHU_MANUAL_EXECUTION_PATH = "xiaohongshu_manual_v1"
+XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER = (
+    "xiaohongshu_no_official_interaction_api"
+)
 
 
 class ActionPlanV2Error(ValueError):
@@ -53,6 +67,25 @@ class ValidatedActionPlanV2:
     @property
     def follow_target_handle(self) -> str:
         return str(self.action_payloads.get("followed", {}).get("target_handle") or "")
+
+
+def action_order_for_platform(platform: str) -> tuple[str, ...]:
+    """Return the canonical action subset for a platform.
+
+    Unknown and existing non-Xiaohongshu platforms retain the legacy four
+    actions.  This prevents the new ``favorited`` action from silently becoming
+    valid for Bilibili, Weibo or Douyin plans.
+    """
+
+    key = str(platform or "").strip().casefold()
+    return PLATFORM_ACTION_ORDERS.get(key, LEGACY_ACTION_ORDER)
+
+
+def default_execution_path_for_platform(platform: str) -> str:
+    if str(platform or "").strip().casefold() == "xiaohongshu":
+        return XIAOHONGSHU_MANUAL_EXECUTION_PATH
+    # Preserve the previous request-model default for every existing caller.
+    return BILIBILI_API_EXECUTION_PATH
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -187,10 +220,13 @@ def validate_action_payload(action: str, value: Any) -> dict[str, Any]:
 
 
 def normalize_action_payloads(
-    required_actions: list[str], value: Mapping[str, Any] | None
+    required_actions: list[str],
+    value: Mapping[str, Any] | None,
+    *,
+    allowed_actions: frozenset[str] = ACTION_SET,
 ) -> dict[str, dict[str, Any]]:
     raw = dict(value or {})
-    if set(raw) - ACTION_SET:
+    if set(raw) - allowed_actions:
         raise ActionPlanV2Error("action_plan_payload_unknown_action")
     if set(raw) != set(required_actions):
         raise ActionPlanV2Error("action_plan_payload_binding_mismatch")
@@ -332,20 +368,33 @@ def validate_action_plan_v2(
         if len(value_hash) != 64 or any(ch not in "0123456789abcdef" for ch in value_hash):
             raise ActionPlanV2Error(f"action_plan_{field}_invalid")
 
+    platform = _required_string(plan, "platform")
+    platform_order = action_order_for_platform(platform)
+    platform_action_set = frozenset(platform_order)
     raw_actions = plan.get("required_actions")
     if not isinstance(raw_actions, list) or not raw_actions:
         raise ActionPlanV2Error("action_plan_required_actions_invalid")
     actions: list[str] = []
     for action in raw_actions:
-        if not isinstance(action, str) or action not in ACTION_SET or action in actions:
+        if (
+            not isinstance(action, str)
+            or action not in platform_action_set
+            or action in actions
+        ):
             raise ActionPlanV2Error("action_plan_required_actions_invalid")
         actions.append(action)
-    normalized = tuple(action for action in ACTION_ORDER if action in set(actions))
+    normalized = tuple(action for action in platform_order if action in set(actions))
     if tuple(actions) != normalized:
         raise ActionPlanV2Error("action_plan_action_order_invalid")
+    if platform.casefold() == "xiaohongshu" and normalized != XIAOHONGSHU_ACTION_ORDER:
+        raise ActionPlanV2Error("xiaohongshu_four_action_plan_required")
     if compute_action_plan_hash(plan) != plan_hash:
         raise ActionPlanV2Error("action_plan_hash_mismatch")
-    payloads = normalize_action_payloads(actions, plan.get("action_payloads"))
+    payloads = normalize_action_payloads(
+        actions,
+        plan.get("action_payloads"),
+        allowed_actions=platform_action_set,
+    )
     content_requirements = _validated_content_requirements(
         plan.get("content_requirements")
     )

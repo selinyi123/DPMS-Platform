@@ -252,19 +252,38 @@ class WeiboLotteryRuleTests(unittest.TestCase):
 
 
 class XiaohongshuLotteryRuleTests(unittest.TestCase):
-    def test_extracts_required_actions_without_review(self):
-        plan = parse_lottery_rule("福利来啦，关注点赞评论分享，抽2位包邮送同款", "xiaohongshu")
+    def test_extracts_strict_four_actions_without_review(self):
+        plan = parse_lottery_rule(
+            "福利来啦，关注点赞评论收藏，抽2位包邮送同款",
+            "xiaohongshu",
+        )
 
         self.assertTrue(plan["is_lottery"])
-        self.assertEqual({"followed", "liked", "commented", "reposted"}, set(plan["required_actions"]))
+        self.assertEqual(
+            ["followed", "liked", "commented", "favorited"],
+            plan["required_actions"],
+        )
         self.assertFalse(plan["review_required"])
         self.assertEqual([], plan["unsupported_actions"])
 
-    def test_flags_favorite_as_unsupported(self):
+    def test_favorite_is_a_required_action(self):
         plan = parse_lottery_rule("抽奖时间到：关注+点赞+收藏+评论，评论区抽1位送同款", "xiaohongshu")
 
         self.assertTrue(plan["is_lottery"])
-        self.assertIn("favorited", plan["unsupported_actions"])
+        self.assertIn("favorited", plan["required_actions"])
+        self.assertNotIn("favorited", plan["unsupported_actions"])
+
+    def test_share_is_unresolved_and_never_substitutes_for_favorite(self):
+        plan = parse_lottery_rule(
+            "抽奖：关注、点赞、评论、收藏并分享本篇笔记",
+            "xiaohongshu",
+        )
+
+        self.assertEqual(
+            ["followed", "liked", "commented", "favorited"],
+            plan["required_actions"],
+        )
+        self.assertIn("reposted", plan["unsupported_actions"])
         self.assertTrue(plan["review_required"])
 
     def test_flags_required_comment_text_and_friend_mention_as_unsupported(self):

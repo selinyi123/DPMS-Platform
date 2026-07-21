@@ -8,6 +8,7 @@ from app.db import database
 PHASES = ("followed", "liked", "commented", "reposted")
 STRUCTURED_SELECTOR_PLATFORMS = ("bilibili", "weibo", "xiaohongshu", "douyin")
 API_REAL_ADAPTER_PLATFORMS = ("bilibili",)
+MANUAL_ASSISTED_ONLY_PLATFORMS = ("xiaohongshu",)
 SELECTOR_ENV = "DPMS_ADAPTER_SELECTORS"
 SELECTOR_B64_ENV = "DPMS_ADAPTER_SELECTORS_B64"
 
@@ -46,6 +47,8 @@ def decode_b64(value: str) -> str:
 
 
 def platform_has_real_adapter(platform: str) -> bool:
+    if platform in MANUAL_ASSISTED_ONLY_PLATFORMS:
+        return False
     if platform_has_api_real_adapter(platform):
         return True
     configured = load_selector_config().get(platform, {})
@@ -53,6 +56,8 @@ def platform_has_real_adapter(platform: str) -> bool:
 
 
 async def platform_has_real_adapter_async(platform: str) -> bool:
+    if platform in MANUAL_ASSISTED_ONLY_PLATFORMS:
+        return False
     if platform_has_api_real_adapter(platform):
         return True
     configured = (await load_runtime_selector_config()).get(platform, {})
@@ -64,6 +69,11 @@ def platform_has_api_real_adapter(platform: str) -> bool:
 
 
 def platform_has_runtime_real_adapter(selector_config: dict, platform: str) -> bool:
+    # A selector configuration is useful for read-only shadow validation, but
+    # it is not an official Xiaohongshu interaction API and cannot authorize
+    # external mutations.
+    if platform in MANUAL_ASSISTED_ONLY_PLATFORMS:
+        return False
     if platform_has_api_real_adapter(platform):
         return True
     configured = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
@@ -71,6 +81,8 @@ def platform_has_runtime_real_adapter(selector_config: dict, platform: str) -> b
 
 
 def platform_real_adapter_kind(selector_config: dict, platform: str) -> str:
+    if platform in MANUAL_ASSISTED_ONLY_PLATFORMS:
+        return "manual_assisted"
     if platform_has_api_real_adapter(platform):
         return "api"
     configured = selector_config.get(platform, {}) if isinstance(selector_config, dict) else {}
