@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-ACTION_ORDER = ("followed", "liked", "commented", "reposted")
+ACTION_ORDER = ("followed", "liked", "commented", "favorited", "reposted")
 ACTION_SET = frozenset(ACTION_ORDER)
 TEXT_ACTIONS = frozenset({"commented", "reposted"})
 OPTIONAL_TEXT_METADATA = frozenset(
@@ -26,6 +26,8 @@ CONTENT_REQUIREMENT_FIELDS = ("topic_tags", "mentions")
 HANDLE_PATTERN = re.compile(r"@[\w\u4e00-\u9fff-]{1,64}\Z")
 BILIBILI_API_EXECUTION_PATH = "bilibili_api_v2"
 BILIBILI_PREFLIGHT_CONTRACT_VERSION = 1
+XIAOHONGSHU_MANUAL_EXECUTION_PATH = "xiaohongshu_manual_v1"
+XIAOHONGSHU_REQUIRED_ACTIONS = ("followed", "liked", "commented", "favorited")
 
 
 class ActionPlanV2Error(ValueError):
@@ -251,13 +253,16 @@ def validate_action_plan_v2(
     value: Any,
     *,
     reject_media: bool = False,
+    require_executable: bool = True,
 ) -> ValidatedActionPlanV2:
     plan = _json_object(value, code="action_plan_v2_invalid")
     # bool is a subclass of int, so compare both type and value.
     if type(plan.get("version")) is not int or plan.get("version") != 2:
         raise ActionPlanV2Error("action_plan_version_unsupported")
-    if plan.get("executable") is not True:
+    if require_executable and plan.get("executable") is not True:
         raise ActionPlanV2Error("action_plan_not_executable")
+    if not require_executable and type(plan.get("executable")) is not bool:
+        raise ActionPlanV2Error("action_plan_executable_flag_invalid")
     if plan.get("review_required") is not False:
         raise ActionPlanV2Error("action_plan_review_required")
     reviewed_by = plan.get("reviewed_by")
@@ -329,6 +334,28 @@ def validate_action_plan_v2(
             raise ActionPlanV2Error("action_plan_follow_target_mismatch")
     elif follow_targets:
         raise ActionPlanV2Error("action_plan_follow_target_without_action")
+
+    platform = str(plan.get("platform") or "").strip().lower()
+    if platform == "xiaohongshu":
+        if plan.get("executable") is not False:
+            raise ActionPlanV2Error(
+                "xiaohongshu_no_official_interaction_api"
+            )
+        if execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH:
+            raise ActionPlanV2Error("xiaohongshu_execution_path_invalid")
+        if normalized_actions != XIAOHONGSHU_REQUIRED_ACTIONS:
+            raise ActionPlanV2Error("xiaohongshu_four_action_plan_required")
+        # Keep the legacy repost bucket in the canonical envelope for v2
+        # compatibility; Xiaohongshu's fourth requirement is collection.
+        if content_requirements["reposted"] != {
+            "topic_tags": [],
+            "mentions": [],
+        }:
+            raise ActionPlanV2Error(
+                "xiaohongshu_legacy_reposted_requirement_must_be_empty"
+            )
+    elif "favorited" in normalized_actions:
+        raise ActionPlanV2Error("action_plan_required_actions_invalid")
     if reject_media:
         for payload in payloads.values():
             if payload.get("media_refs"):

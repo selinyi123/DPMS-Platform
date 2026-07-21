@@ -31,12 +31,12 @@ REAL_RUN_POLICY_KEY = "real_run_gate"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _EXPLICIT_FALSE = frozenset({"0", "false", "no", "off"})
 _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE = frozenset(
-    {"weibo", "xiaohongshu", "douyin"}
+    {"weibo", "douyin"}
 )
 _BILIBILI_API_EXECUTION_PATH = BILIBILI_API_EXECUTION_PATH
 _SUPPORTED_REAL_RUN_PLATFORMS = frozenset({"bilibili"}) | (
     _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE
-)
+) | frozenset({"xiaohongshu"})
 
 
 class GateDatabase(Protocol):
@@ -660,6 +660,10 @@ async def enforce_real_run_gate(
 
         if platform not in _SUPPORTED_REAL_RUN_PLATFORMS:
             raise RealRunGateBlocked("unsupported_real_run_platform")
+        if platform == "xiaohongshu":
+            # Respect the process and durable global opt-ins first, then stop
+            # before loading a page, selector config, evidence or credentials.
+            raise RealRunGateBlocked("xiaohongshu_no_official_interaction_api")
         if platform in _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE:
             raise RealRunGateBlocked("selector_evidence_binding_required")
 

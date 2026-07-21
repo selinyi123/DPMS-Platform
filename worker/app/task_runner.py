@@ -13,6 +13,7 @@ from app.adapters.registry import get_adapter
 from app.adapter_config import load_selector_config
 from app.action_plan import (
     BILIBILI_API_EXECUTION_PATH,
+    XIAOHONGSHU_REQUIRED_ACTIONS,
     ActionPlanV2Error,
     canonical_json_bytes,
     compute_bilibili_api_config_hash,
@@ -79,6 +80,7 @@ GROUP_NAME = "workers"
 WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
 CONSUMER_NAME = WORKER_ID
 PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
+XIAOHONGSHU_PHASE_ORDER = list(XIAOHONGSHU_REQUIRED_ACTIONS)
 TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 TASK_LEASE_SECONDS = 900
 SCREENSHOT_DIR = TASK_FAILURE_EVIDENCE_DIR
@@ -713,6 +715,20 @@ def validate_shadow_task_binding(task: dict | None, lottery) -> None:
     if message_plan != authoritative_plan:
         raise TaskClaimConflict("shadow_task_action_plan_mismatch")
 
+    if str(row_get(lottery, "platform") or "").strip().lower() == "xiaohongshu":
+        try:
+            validate_action_plan_v2(
+                authoritative_plan,
+                require_executable=False,
+            )
+            validate_action_plan_v2(
+                message_plan,
+                require_executable=False,
+            )
+        except ActionPlanV2Error as exc:
+            raise TaskClaimConflict(f"shadow_task_{exc.code}") from exc
+
+
 def validate_task_selector_binding(task: dict | None, authoritative_selectors: dict) -> None:
     if not isinstance(task, dict):
         raise TaskClaimConflict("task_selector_message_missing")
@@ -1040,7 +1056,16 @@ async def mark_task_finished(
     return True
 
 
-async def execute_dry_run(task_id: str, account_id: int, lottery_id: int, phases: list[str]):
+async def execute_dry_run(
+    task_id: str,
+    account_id: int,
+    lottery_id: int,
+    phases: list[str],
+    *,
+    platform: str = "",
+):
+    if str(platform or "").strip().lower() == "xiaohongshu":
+        raise RuntimeError("xiaohongshu_manual_shadow_only")
     for phase_name in phases:
         await asyncio.sleep(0.2)
         await save_phase(task_id, account_id, lottery_id, phase_name)
@@ -1259,7 +1284,13 @@ async def execute_shadow_run(task: dict, adapter, pool):
         )
         validated_platform_content_url(platform, page.url, canonical_uri)
         missing_phases = [phase for phase in phases if not phase_readiness.get(phase)]
-        qualified = bool(phases) and not missing_phases and bool(screenshot_path)
+        selector_observation_complete = (
+            bool(phases) and not missing_phases and bool(screenshot_path)
+        )
+        xiaohongshu_manual_only = (
+            str(platform or "").strip().lower() == "xiaohongshu"
+        )
+        qualified = selector_observation_complete and not xiaohongshu_manual_only
         observation_event_id = await record_event(
             aggregate="task",
             aggregate_id=task_id,
@@ -1272,6 +1303,14 @@ async def execute_shadow_run(task: dict, adapter, pool):
                 "visible_phases": visible_phases,
                 "screenshot_path": screenshot_path,
                 "qualified": qualified,
+                "selector_observation_complete": selector_observation_complete,
+                "manual_confirmation_required": xiaohongshu_manual_only,
+                "real_run_capable": not xiaohongshu_manual_only,
+                "capability_block_reason": (
+                    "xiaohongshu_no_official_interaction_api"
+                    if xiaohongshu_manual_only
+                    else None
+                ),
                 "side_effects": False,
             },
             correlation_id=task_id,
@@ -2539,6 +2578,11 @@ def validate_task_message(task: dict) -> dict:
     task["lottery_id"] = str(lottery_id)
     task["platform"] = platform
     task["mode"] = mode
+    if mode == "dry_run" and platform.lower() == "xiaohongshu":
+        # The deployed task_phases ENUM has no ``favorited`` member. Reject all
+        # Xiaohongshu dry runs before claim/save_phase so a missing or tampered
+        # plan cannot bypass the fourth-action storage limitation.
+        raise InvalidTaskMessage("xiaohongshu_manual_shadow_only")
     return task
 
 
@@ -2570,10 +2614,18 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     completion_screenshot_path = None
     claimed = False
     try:
-        if task_mode == "real_run" and not uses_bilibili_api_real_task(task) and not getattr(adapter, "REAL_ACTIONS", False):
-            raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
+        if (
+            task_mode == "dry_run"
+            and str(task.get("platform") or "").strip().lower() == "xiaohongshu"
+        ):
+            raise RuntimeError("xiaohongshu_manual_shadow_only")
         if task_mode == "real_run":
             await enforce_task_real_run_gate(task)
+            if (
+                not uses_bilibili_api_real_task(task)
+                and not getattr(adapter, "REAL_ACTIONS", False)
+            ):
+                raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
             await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         binding = await mark_task_started(
             task_id,
@@ -2588,7 +2640,13 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
         lottery_id = binding.lottery_id
         task_mode = binding.task_mode
         if task_mode == "dry_run":
-            await execute_dry_run(task_id, account_id, lottery_id, requested_phases(task, require_plan=False))
+            await execute_dry_run(
+                task_id,
+                account_id,
+                lottery_id,
+                requested_phases(task, require_plan=False),
+                platform=task.get("platform", ""),
+            )
         elif task_mode == "shadow_run":
             completion_screenshot_path = await execute_shadow_run(task, adapter, pool)
         elif uses_bilibili_api_real_task(task):
@@ -2777,10 +2835,19 @@ def requested_phases(task: dict, require_plan: bool) -> list[str]:
     if not isinstance(plan, dict):
         plan = {}
     actions = plan.get("required_actions")
-    phases = [phase for phase in PHASE_ORDER if isinstance(actions, list) and phase in actions]
+    phase_order = (
+        XIAOHONGSHU_PHASE_ORDER
+        if str(task.get("platform") or "").strip().lower() == "xiaohongshu"
+        else PHASE_ORDER
+    )
+    phases = [
+        phase
+        for phase in phase_order
+        if isinstance(actions, list) and phase in actions
+    ]
     if require_plan:
         if plan.get("review_required"):
             raise RuntimeError("Lottery rule requires review before real-run")
         if not phases:
             raise RuntimeError("Lottery action plan is missing required actions")
-    return phases or list(PHASE_ORDER)
+    return phases or list(phase_order)

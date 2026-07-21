@@ -35,6 +35,11 @@ def selectors_for(platform: str) -> dict:
 
 
 def has_complete_selectors(platform: str) -> bool:
+    # Selector observations may assist Shadow/manual review, but Xiaohongshu
+    # has no supported official four-interaction write API. Configuration must
+    # therefore never become an executable capability signal.
+    if str(platform or "").strip().lower() == "xiaohongshu":
+        return False
     configured = selectors_for(platform)
     if platform not in STRUCTURED_SELECTOR_PLATFORMS:
         return all(bool(configured.get(phase)) for phase in PHASES)
