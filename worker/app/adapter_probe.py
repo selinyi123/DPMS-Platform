@@ -823,12 +823,12 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
     """Summarize selector visibility without claiming execution readiness.
 
     ``ready_for_real_actions`` is retained as a compatibility alias because
-    Core and previously persisted probe results still consume that key. Its
-    value only means that selectors for every required phase were observed; it
-    is not evidence that an action succeeded or that the real-run gate passed.
-    New consumers should prefer ``selector_observation_complete``.
+    Core and previously persisted probe results still consume that key. For
+    supported platforms its value only means all phase selectors were seen;
+    for Xiaohongshu it is always false. New consumers should prefer
+    ``selector_observation_complete`` plus the capability metadata.
     """
-    phases = ["followed", "liked", "commented", "reposted"]
+    phases = probe_phases_for_platform(platform)
     phase_status = {}
     visible_phases = []
     for phase in phases:
@@ -849,6 +849,9 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
         if ready:
             visible_phases.append(phase)
     selector_observation_complete = len(visible_phases) == len(phases)
+    xiaohongshu_manual_only = (
+        str(platform or "").strip().lower() == "xiaohongshu"
+    )
     return {
         "platform": platform,
         "required_phases": phases,
@@ -856,15 +859,29 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
         "missing_phases": [phase for phase in phases if phase not in visible_phases],
         "ready_phase_count": len(visible_phases),
         "selector_observation_complete": selector_observation_complete,
-        # Compatibility only. Do not present this legacy name to operators.
-        "ready_for_real_actions": selector_observation_complete,
+        # Compatibility only. Xiaohongshu visibility can never assert real
+        # readiness because no supported official interaction API exists.
+        "ready_for_real_actions": (
+            selector_observation_complete and not xiaohongshu_manual_only
+        ),
+        "manual_confirmation_required": xiaohongshu_manual_only,
+        "capability_block_reason": (
+            "xiaohongshu_no_official_interaction_api"
+            if xiaohongshu_manual_only
+            else None
+        ),
         "phase_status": phase_status,
     }
 
 
 def build_recommended_config(platform: str, result: dict) -> dict:
     phases = {}
-    for phase in ["followed", "liked", "reposted"]:
+    non_comment_phases = (
+        ["followed", "liked", "favorited"]
+        if str(platform or "").strip().lower() == "xiaohongshu"
+        else ["followed", "liked", "reposted"]
+    )
+    for phase in non_comment_phases:
         selector = first_visible_selector(result.get(phase))
         if selector:
             phases[phase] = [selector]
@@ -876,6 +893,12 @@ def build_recommended_config(platform: str, result: dict) -> dict:
         phases["commented"] = {"input": [input_selector], "submit": [submit_selector], "text": "\u53c2\u4e0e\u62bd\u5956"}
 
     return {platform: phases} if phases else {}
+
+
+def probe_phases_for_platform(platform: str) -> list[str]:
+    if str(platform or "").strip().lower() == "xiaohongshu":
+        return ["followed", "liked", "commented", "favorited"]
+    return ["followed", "liked", "commented", "reposted"]
 
 
 def first_visible_selector(candidates) -> str | None:

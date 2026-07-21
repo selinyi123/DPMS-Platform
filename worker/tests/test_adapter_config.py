@@ -143,7 +143,14 @@ class HasCompleteSelectorsTests(unittest.TestCase):
         for platform in STRUCTURED_SELECTOR_PLATFORMS:
             with self.subTest(platform=platform):
                 self._set({platform: complete_structured_config()})
-                self.assertTrue(has_complete_selectors(platform))
+                self.assertEqual(
+                    has_complete_selectors(platform),
+                    platform != "xiaohongshu",
+                )
+
+    def test_xiaohongshu_selectors_are_observation_only(self):
+        self._set({"xiaohongshu": complete_structured_config()})
+        self.assertFalse(has_complete_selectors("xiaohongshu"))
 
     def test_missing_phase_is_incomplete(self):
         config = complete_structured_config()
