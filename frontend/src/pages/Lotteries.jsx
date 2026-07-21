@@ -7,19 +7,25 @@ import {
   actionPlanHasMediaRequirement,
   actionPlanV2Blockers,
   actionPlanV2Ready,
-  BILIBILI_EXECUTION_PATH_ID,
+  actionPlanV2ReviewBlockers,
+  actionPlanV2ReviewReady,
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
   executionEvidencePresentation,
+  isManualAssistedPlatform,
+  lotteryActionsForPlatform,
+  platformDispatchBlocker,
+  platformExecutionPathId,
   realRunEvidencePath,
   sourceRuleCorrectionPath,
   targetTransportCompatibilityIssue,
   targetValidationErrorCode,
   unresolvedRuleRequirements,
+  xiaohongshuManualChecklist,
+  xiaohongshuShadowObservation,
 } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
 
-const LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
 const API_ACTION_PHASES = {
   follow: 'followed',
   like: 'liked',
@@ -257,11 +263,16 @@ export default function Lotteries() {
     try {
       const result = await putJSON(
         `/lotteries/${lottery.id}/action-plan`,
-        buildActionPlanV2Update(draft),
+        buildActionPlanV2Update({ ...draft, platform: lottery.platform }),
       );
-      const stillBlocked = !actionPlanV2Ready(result?.action_plan, lottery.platform);
+      const manualAssisted = isManualAssistedPlatform(lottery.platform);
+      const stillBlocked = manualAssisted
+        ? !actionPlanV2ReviewReady(result?.action_plan, lottery.platform)
+        : !actionPlanV2Ready(result?.action_plan, lottery.platform);
       notify(
-        stillBlocked ? t('lotteries.ruleNeedsReview') : t('lotteries.ruleSaved'),
+        stillBlocked
+          ? t('lotteries.ruleNeedsReview')
+          : t(manualAssisted ? 'lotteries.manualRuleSaved' : 'lotteries.ruleSaved'),
         stillBlocked ? 'warning' : 'success',
       );
       await load();
@@ -284,6 +295,8 @@ export default function Lotteries() {
   });
 
   const dispatchBlockerMessage = (blocker, lottery) => {
+    if (blocker === 'xiaohongshu_manual_only') return t('lotteries.xiaohongshuManualOnlyHint');
+    if (blocker === 'xiaohongshu_manual_shadow_only') return t('lotteries.xiaohongshuManualShadowOnlyHint');
     if (blocker === 'legacy_http_target') return t('lotteries.legacyHttpTargetHint');
     if (blocker === 'no_safe_account') return t('lotteries.noSafeAccount');
     if (blocker === 'account_scope_required') return t('lotteries.accountScopeRequired');
@@ -667,6 +680,8 @@ export default function Lotteries() {
               {lotteries.map(lottery => {
                 const gate = gateByLotteryId[lottery.id];
                 const repairPlan = gate?.repair_plan;
+                const manualAssisted = isManualAssistedPlatform(lottery.platform);
+                const platformModeBlocker = platformDispatchBlocker(lottery.platform, dispatchMode);
                 const targetIssue = targetTransportCompatibilityIssue(lottery.platform, lottery.raw_url);
                 const transportBlocksSelectedMode = Boolean(targetIssue && dispatchMode !== 'dry_run');
                 const safeAccountAvailable = safeAccountCount(lottery.platform) > 0;
@@ -674,35 +689,46 @@ export default function Lotteries() {
                   selectedSafeAccount && selectedSafeAccount.platform === lottery.platform
                 );
                 const accountScopeBlocked = dispatchMode !== 'dry_run' && !accountScopeReady;
-                const actionPlanReady = actionPlanV2Ready(lottery.action_plan, lottery.platform);
+                const actionPlanReady = manualAssisted
+                  ? actionPlanV2ReviewReady(lottery.action_plan, lottery.platform)
+                  : actionPlanV2Ready(lottery.action_plan, lottery.platform);
                 const actionPlanBlocked = dispatchMode !== 'dry_run' && !actionPlanReady;
-                const gateBlocked = dispatchMode === 'real_run' && (!gate?.allowed || actionPlanBlocked);
+                const gateBlocked = dispatchMode === 'real_run'
+                  && (Boolean(platformModeBlocker) || !gate?.allowed || actionPlanBlocked);
                 const gateCanRunNext = gateBlocked
+                  && !platformModeBlocker
                   && !actionPlanBlocked
                   && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
                 const repairAvailable = Boolean(repairPlan?.eligible);
                 const repairBlocked = repairAvailable && (
-                  Boolean(targetIssue)
+                  manualAssisted
+                  || Boolean(platformModeBlocker)
+                  || Boolean(targetIssue)
                   || !gate?.allowed
                   || !safeAccountAvailable
                   || !accountScopeReady
                   || !actionPlanReady
                 );
-                const repairBlockReason = targetIssue
-                  ? t('lotteries.legacyHttpTargetHint')
+                const repairBlockReason = manualAssisted
+                  ? t('lotteries.xiaohongshuManualOnlyHint')
+                  : (targetIssue ? t('lotteries.legacyHttpTargetHint')
                   : (!accountScopeReady
                     ? t('lotteries.accountScopeRequired')
-                    : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : (repairBlocked ? gateTitle(gate, t) : '')));
-                const dispatchDisabled = transportBlocksSelectedMode
+                    : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : (repairBlocked ? gateTitle(gate, t) : ''))));
+                const dispatchDisabled = Boolean(platformModeBlocker)
+                  || transportBlocksSelectedMode
                   || !safeAccountAvailable
                   || accountScopeBlocked
                   || actionPlanBlocked
                   || (gateBlocked && !gateCanRunNext);
-                const dispatchTitle = transportBlocksSelectedMode
-                  ? t('lotteries.legacyHttpTargetHint')
-                  : (actionPlanBlocked ? t('lotteries.actionPlanV2Required') : (gateBlocked ? gateTitle(gate, t) : ''));
+                let dispatchTitle = '';
+                if (platformModeBlocker) dispatchTitle = dispatchBlockerMessage(platformModeBlocker, lottery);
+                else if (transportBlocksSelectedMode) dispatchTitle = t('lotteries.legacyHttpTargetHint');
+                else if (actionPlanBlocked) dispatchTitle = t('lotteries.actionPlanV2Required');
+                else if (gateBlocked) dispatchTitle = gateTitle(gate, t);
                 let dispatchLabel = t(`lotteries.dispatch_${dispatchMode}`);
-                if (transportBlocksSelectedMode) dispatchLabel = t('lotteries.compatibilityBlocked');
+                if (platformModeBlocker) dispatchLabel = t('lotteries.manualAssistedOnly');
+                else if (transportBlocksSelectedMode) dispatchLabel = t('lotteries.compatibilityBlocked');
                 else if (!safeAccountAvailable) dispatchLabel = t('lotteries.noSafeAccount');
                 else if (accountScopeBlocked) dispatchLabel = t('lotteries.selectAccount');
                 else if (actionPlanBlocked) dispatchLabel = t('lotteries.nextActions.review_rule');
@@ -716,11 +742,11 @@ export default function Lotteries() {
                     <div className="small-text">{lottery.raw_url}</div>
                     {targetIssue && <span className="badge badge-danger">{t('lotteries.legacyHttpTarget')}</span>}
                   </td>
-                  <td><RulePlanEditor lottery={lottery} onSave={saveActionPlan} t={t} /></td>
+                  <td><RulePlanEditor lottery={lottery} gate={gate} onSave={saveActionPlan} t={t} /></td>
                   <td><StatusBadge status={lottery.status} /></td>
                   <td>{lottery.value_score}</td>
                   <td>
-                    <RealGateCell gate={gate} targetIssue={targetIssue} t={t} />
+                    <RealGateCell gate={gate} platform={lottery.platform} targetIssue={targetIssue} t={t} />
                   </td>
                   <td className="small-text">{lottery.expires_at || '-'}</td>
                   <td className="action-cell">
@@ -728,7 +754,7 @@ export default function Lotteries() {
                       onClick={() => gateBlocked ? runGateNextAction(lottery, gate) : dispatch(lottery.id)}
                       disabled={dispatchDisabled}
                       title={dispatchTitle}
-                      className={transportBlocksSelectedMode || (dispatchMode === 'real_run' && !gateCanRunNext) ? 'btn-danger' : 'btn-primary'}
+                      className={platformModeBlocker || transportBlocksSelectedMode || (dispatchMode === 'real_run' && !gateCanRunNext) ? 'btn-danger' : 'btn-primary'}
                     >
                       {dispatchLabel}
                     </button>
@@ -942,7 +968,7 @@ function riskCooldownText(gate, t) {
   });
 }
 
-function RealGateCell({ gate, targetIssue, t }) {
+function RealGateCell({ gate, platform, targetIssue, t }) {
   if (targetIssue) {
     return (
       <div className="gate-cell">
@@ -954,6 +980,33 @@ function RealGateCell({ gate, targetIssue, t }) {
               <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
             ))}
           </div>
+        )}
+      </div>
+    );
+  }
+  if (isManualAssistedPlatform(platform)) {
+    const shadowObservation = xiaohongshuShadowObservation(gate);
+    return (
+      <div className="gate-cell">
+        <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
+        <div className="small-text warning-text">{t('lotteries.xiaohongshuManualOnlyHint')}</div>
+        <div className="capability-row">
+          <span>{t('lotteries.shadowEvidence')}</span>
+          <span className={`badge ${shadowObservation.complete ? 'badge-ready' : 'badge-muted'}`}>
+            {shadowObservation.complete
+              ? t('lotteries.shadowEvidenceReady')
+              : t('lotteries.shadowEvidenceMissing')}
+          </span>
+        </div>
+        {!!gate?.blockers?.length && (
+          <div className="blocker-list compact-blockers">
+            {gate.blockers.slice(0, 4).map(code => (
+              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+            ))}
+          </div>
+        )}
+        {!!shadowObservation.taskId && (
+          <div className="small-text mono">Shadow {shortIdentity(shadowObservation.taskId)}</div>
         )}
       </div>
     );
@@ -1079,14 +1132,28 @@ function ledgerOutcomeClass(row) {
   return 'badge-muted';
 }
 
-function RulePlanEditor({ lottery, onSave, t }) {
+function RulePlanEditor({ lottery, gate, onSave, t }) {
   const { notify } = useUi();
   const plan = lottery.action_plan || {};
-  const initialActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
-  const initialPayloads = actionPayloadDraft(initialActions, plan.action_payloads);
+  const manualAssisted = isManualAssistedPlatform(lottery.platform);
+  const availableActions = lotteryActionsForPlatform(lottery.platform);
+  const savedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+  const initialActions = manualAssisted ? availableActions : savedActions;
+  const savedPayloads = actionPayloadDraft(
+    savedActions,
+    plan.action_payloads,
+    null,
+    lottery.platform,
+  );
+  const initialPayloads = actionPayloadDraft(
+    initialActions,
+    plan.action_payloads,
+    null,
+    lottery.platform,
+  );
   const planSignature = JSON.stringify({
-    actions: initialActions,
-    payloads: initialPayloads,
+    actions: savedActions,
+    payloads: savedPayloads,
     contentRequirements: plan.content_requirements,
     version: plan.version,
     hash: plan.plan_hash,
@@ -1099,46 +1166,57 @@ function RulePlanEditor({ lottery, onSave, t }) {
   const [suggestion, setSuggestion] = useState(null);
   const [suggesting, setSuggesting] = useState(false);
   const suggestionActions = Array.isArray(suggestion?.required_actions) ? suggestion.required_actions : [];
-  const draftPayloads = actionPayloadDraft(actions, payloads);
+  const draftPayloads = actionPayloadDraft(actions, payloads, null, lottery.platform);
   const semanticSource = suggestion || plan;
   const unresolvedRequirements = unresolvedRuleRequirements(semanticSource, draftPayloads);
   const payloadErrors = exactPayloadErrors(actions, draftPayloads);
-  const executionPathId = lottery.platform === 'bilibili'
-    ? BILIBILI_EXECUTION_PATH_ID
-    : String(plan.execution_path_id || '');
+  const executionPathId = platformExecutionPathId(lottery.platform, plan.execution_path_id);
   const planBlockers = [...new Set([
-    ...actionPlanV2Blockers(plan, lottery.platform),
+    ...(manualAssisted
+      ? actionPlanV2ReviewBlockers(plan, lottery.platform)
+      : actionPlanV2Blockers(plan, lottery.platform)),
     ...(Array.isArray(plan.payload_validation_errors) ? plan.payload_validation_errors : []),
     ...(Array.isArray(plan.capability_blockers) ? plan.capability_blockers : []),
   ])];
-  const planReady = actionPlanV2Ready(plan, lottery.platform);
-  const draftChanged = !sameActionSet(actions, initialActions)
-    || JSON.stringify(draftPayloads) !== JSON.stringify(initialPayloads);
-  const missingSuggestedActions = suggestionActions.filter(action => !initialActions.includes(action));
+  const planReady = manualAssisted
+    ? actionPlanV2ReviewReady(plan, lottery.platform)
+    : actionPlanV2Ready(plan, lottery.platform);
+  const draftChanged = !sameActionSet(actions, savedActions)
+    || JSON.stringify(draftPayloads) !== JSON.stringify(savedPayloads);
+  const missingSuggestedActions = suggestionActions.filter(action => !savedActions.includes(action));
   const sourceRuleLocked = Boolean(String(lottery.rule_text || '').trim());
   const discoveryManagedSource = sourceRuleCorrectionPath(lottery.platform, lottery.source_type) === 'discovery_refresh';
   const sourceRuleHelpId = `lottery-${lottery.id}-source-rule-help`;
   const mediaRequired = actionPlanHasMediaRequirement({ action_payloads: draftPayloads });
+  const mediaRequirementNotice = t(manualAssisted
+    ? 'lotteries.xiaohongshuMediaRequirementManual'
+    : 'lotteries.mediaRuleStoredButUnsupported');
+  const requiredActionSetComplete = !manualAssisted
+    || (actions.length === availableActions.length && sameActionSet(actions, availableActions));
   const saveDisabled = !actions.length
     || !ruleText.trim()
     || !executionPathId
     || !ruleCompleteConfirmed
     || !reviewedConfirmed
+    || !requiredActionSetComplete
     || unresolvedRequirements.length > 0
     || payloadErrors.length > 0;
 
   useEffect(() => {
-    const nextActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+    const persistedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+    const nextActions = isManualAssistedPlatform(lottery.platform)
+      ? lotteryActionsForPlatform(lottery.platform)
+      : persistedActions;
     setActions(nextActions);
-    setPayloads(actionPayloadDraft(nextActions, plan.action_payloads));
+    setPayloads(actionPayloadDraft(nextActions, plan.action_payloads, null, lottery.platform));
     setRuleText(lottery.rule_text || '');
     setRuleCompleteConfirmed(false);
     setReviewedConfirmed(false);
     setSuggestion(null);
-  }, [lottery.id, lottery.rule_text, planSignature]);
+  }, [lottery.id, lottery.platform, lottery.rule_text, planSignature]);
 
   const toggle = action => {
-    setActions(current => LOTTERY_ACTIONS.filter(candidate => (
+    setActions(current => availableActions.filter(candidate => (
       candidate === action ? !current.includes(candidate) : current.includes(candidate)
     )));
     setPayloads(current => ({
@@ -1181,12 +1259,18 @@ function RulePlanEditor({ lottery, onSave, t }) {
     try {
       const response = await fetchJSON(`/lotteries/${lottery.id}/action-plan/suggest?rule_text=${encodeURIComponent(ruleText)}`);
       const suggested = response.suggested_action_plan || {};
-      const nextActions = Array.isArray(suggested.required_actions) ? suggested.required_actions : [];
+      const suggestedActions = Array.isArray(suggested.required_actions)
+        ? suggested.required_actions
+        : [];
+      const nextActions = manualAssisted
+        ? availableActions
+        : availableActions.filter(action => suggestedActions.includes(action));
       setActions(nextActions);
       setPayloads(current => actionPayloadDraft(
         nextActions,
         current,
         suggested.content_requirements,
+        lottery.platform,
       ));
       setRuleCompleteConfirmed(false);
       setReviewedConfirmed(false);
@@ -1202,19 +1286,21 @@ function RulePlanEditor({ lottery, onSave, t }) {
     <details className="rule-plan-editor">
       <summary>
         <span className={`badge ${planReady && !draftChanged ? 'badge-ready' : 'badge-warn'}`}>
-          {planReady ? t('lotteries.ruleReady') : t('lotteries.ruleNeedsReview')}
+          {planReady
+            ? t(manualAssisted ? 'lotteries.manualRuleReady' : 'lotteries.ruleReady')
+            : t('lotteries.ruleNeedsReview')}
         </span>
-        <span className="small-text">{actionSummary(initialActions, t)}</span>
+        <span className="small-text">{actionSummary(savedActions, t)}</span>
         {draftChanged && <span className="badge badge-warn">{t('lotteries.ruleDraftUnsavedBadge')}</span>}
       </summary>
       <div className="rule-plan-body">
         <div className="rule-plan-snapshots">
           <div className="rule-plan-snapshot">
-            <span>{t('lotteries.savedExecutionPlan')}</span>
-            <strong>{actionSummary(initialActions, t)}</strong>
+            <span>{t(manualAssisted ? 'lotteries.manualSavedPlan' : 'lotteries.savedExecutionPlan')}</span>
+            <strong>{actionSummary(savedActions, t)}</strong>
           </div>
           <div className={`rule-plan-snapshot ${draftChanged ? 'is-dirty' : ''}`}>
-            <span>{t('lotteries.draftExecutionPlan')}</span>
+            <span>{t(manualAssisted ? 'lotteries.manualDraftPlan' : 'lotteries.draftExecutionPlan')}</span>
             <strong>{actionSummary(actions, t)}</strong>
           </div>
           {!!suggestionActions.length && (
@@ -1239,11 +1325,18 @@ function RulePlanEditor({ lottery, onSave, t }) {
           </div>
         )}
         {actionPlanHasMediaRequirement(plan) && (
-          <div className="notice notice-warning">{t('lotteries.mediaRuleStoredButUnsupported')}</div>
+          <div className="notice notice-warning">{mediaRequirementNotice}</div>
         )}
-        <SavedExactPayloads payloads={initialPayloads} t={t} />
+        <SavedExactPayloads payloads={savedPayloads} t={t} />
+        {manualAssisted && (
+          <ManualAssistedChecklist plan={plan} gate={gate} platform={lottery.platform} t={t} />
+        )}
 
-        {draftChanged && <div className="notice notice-warning">{t('lotteries.ruleDraftNotSaved')}</div>}
+        {draftChanged && (
+          <div className="notice notice-warning">
+            {t(manualAssisted ? 'lotteries.manualRuleDraftNotSaved' : 'lotteries.ruleDraftNotSaved')}
+          </div>
+        )}
         {!!missingSuggestedActions.length && (
           <div className="notice notice-warning">
             {formatText(t('lotteries.suggestedActionsMissingSaved'), { actions: actionSummary(missingSuggestedActions, t) })}
@@ -1288,13 +1381,21 @@ function RulePlanEditor({ lottery, onSave, t }) {
           </div>
         )}
         <div className="rule-action-grid">
-          {LOTTERY_ACTIONS.map(action => (
+          {availableActions.map(action => (
             <label key={action}>
-              <input type="checkbox" checked={actions.includes(action)} onChange={() => toggle(action)} />
+              <input
+                type="checkbox"
+                checked={actions.includes(action)}
+                disabled={manualAssisted}
+                onChange={() => toggle(action)}
+              />
               <span>{t(`lotteries.actions.${action}`)}</span>
             </label>
           ))}
         </div>
+        {manualAssisted && (
+          <div className="small-text muted-text">{t('lotteries.xiaohongshuFourActionsFixed')}</div>
+        )}
 
         {actions.includes('followed') && (
           <fieldset className="exact-payload-editor">
@@ -1320,7 +1421,7 @@ function RulePlanEditor({ lottery, onSave, t }) {
             <fieldset className="exact-payload-editor" key={`payload-${action}`}>
               <legend>{t(`lotteries.exactPayloads.${action}`)}</legend>
               <label>
-                <span>{t('lotteries.exactText')}</span>
+                <span>{t(manualAssisted ? 'lotteries.manualExactText' : 'lotteries.exactText')}</span>
                 <textarea
                   className="input textarea"
                   value={payload.text || ''}
@@ -1364,8 +1465,13 @@ function RulePlanEditor({ lottery, onSave, t }) {
             {payloadErrors.map(code => actionPlanBlockerText(code, t)).join(' / ')}
           </div>
         )}
+        {manualAssisted && !requiredActionSetComplete && (
+          <div className="notice notice-warning" role="alert">
+            {t('lotteries.xiaohongshuFourActionsRequired')}
+          </div>
+        )}
         {mediaRequired && (
-          <div className="notice notice-warning">{t('lotteries.mediaRuleStoredButUnsupported')}</div>
+          <div className="notice notice-warning">{mediaRequirementNotice}</div>
         )}
         <label className="notice notice-warning">
           <input
@@ -1381,7 +1487,9 @@ function RulePlanEditor({ lottery, onSave, t }) {
             checked={reviewedConfirmed}
             onChange={event => setReviewedConfirmed(event.target.checked)}
           />
-          <span>{t('lotteries.reviewedPlanConfirmation')}</span>
+          <span>{t(manualAssisted
+            ? 'lotteries.manualReviewedPlanConfirmation'
+            : 'lotteries.reviewedPlanConfirmation')}</span>
         </label>
         <button
           className="btn-primary"
@@ -1395,6 +1503,7 @@ function RulePlanEditor({ lottery, onSave, t }) {
             ruleCompleteConfirmed,
             reviewed: reviewedConfirmed,
             executionPathId,
+            platform: lottery.platform,
           })}
         >
           {t('lotteries.saveCurrentRule')}
@@ -1404,12 +1513,12 @@ function RulePlanEditor({ lottery, onSave, t }) {
   );
 }
 
-function actionPayloadDraft(actions, payloads, contentRequirements = null) {
+function actionPayloadDraft(actions, payloads, contentRequirements = null, platform = 'bilibili') {
   const source = payloads && typeof payloads === 'object' ? payloads : {};
   const requirements = contentRequirements && typeof contentRequirements === 'object'
     ? contentRequirements
     : {};
-  return LOTTERY_ACTIONS.reduce((result, action) => {
+  return lotteryActionsForPlatform(platform).reduce((result, action) => {
     if (!actions.includes(action)) return result;
     if (action === 'followed') {
       const followTargets = Array.isArray(requirements.follow_targets)
@@ -1493,6 +1602,38 @@ function exactPayloadErrors(actions, payloads) {
 
 function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value || '')).length;
+}
+
+function ManualAssistedChecklist({ plan, gate, platform, t }) {
+  const items = xiaohongshuManualChecklist(plan, platform);
+  const shadowObservation = xiaohongshuShadowObservation(gate);
+  return (
+    <section className="manual-assisted-checklist" aria-label={t('lotteries.manualChecklistTitle')}>
+      <div className="capability-row">
+        <strong>{t('lotteries.manualChecklistTitle')}</strong>
+        <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
+      </div>
+      <p className="small-text muted-text">{t('lotteries.manualChecklistHint')}</p>
+      <ol>
+        {items.map(item => (
+          <li key={item.action}>
+            <span className={`badge ${item.required ? 'badge-ready' : 'badge-danger'}`}>
+              {item.required ? t('lotteries.planIncluded') : t('lotteries.planMissing')}
+            </span>
+            <strong>{t(`lotteries.actions.${item.action}`)}</strong>
+            {item.exactValue && <span className="small-text manual-exact-value">{item.exactValue}</span>}
+          </li>
+        ))}
+      </ol>
+      <div className="small-text mono">
+        {t('lotteries.shadowEvidence')}: {shadowObservation.complete
+          ? t('lotteries.shadowEvidenceReady')
+          : t('lotteries.shadowEvidenceMissing')}
+        {shadowObservation.taskId ? ` / ${shortIdentity(shadowObservation.taskId)}` : ''}
+      </div>
+      <p className="small-text warning-text">{t('lotteries.manualChecklistNoMutation')}</p>
+    </section>
+  );
 }
 
 function SavedExactPayloads({ payloads, t }) {

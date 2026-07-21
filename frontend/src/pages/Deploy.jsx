@@ -3,9 +3,12 @@ import { useEffect, useRef, useState } from 'react';
 import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
 import { formatText } from '../i18n/format';
 import {
+  isManualAssistedPlatform,
+  lotteryActionsForPlatform,
   refreshedWorkflowBindings,
   selectorExecutionEvidenceReady,
   workflowActivityIdentity,
+  xiaohongshuShadowObservation,
 } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
 
@@ -300,6 +303,7 @@ export default function Deploy() {
     .filter(item => item.draft && validTargetIds.has(item.probe.lottery_id));
 
   const buildPlatformWorkflow = (platform) => {
+    const manualAssisted = isManualAssistedPlatform(platform);
     const boundLotteryId = evidenceBindingByPlatformRef.current.get(platform) || null;
     const evidence = realRunEvidence.find(item => (
       item.platform === platform
@@ -319,7 +323,10 @@ export default function Deploy() {
       && item.probe.lottery_id === evidence?.lottery_id
     ));
     const selectorDraftReady = hasSelectorDraft(selectorJson, platform);
-    const nextAction = evidence?.next_action || 'add_target';
+    const reportedNextAction = evidence?.next_action || 'add_target';
+    const nextAction = manualAssisted && ['enable_real_run', 'real_run'].includes(reportedNextAction)
+      ? 'manual_assisted'
+      : reportedNextAction;
     const activeProbe = probes.find(item => (
       item.platform === platform
       && ['queued', 'running'].includes(item.status)
@@ -333,15 +340,24 @@ export default function Deploy() {
     ));
     const workflowActive = Boolean(activeProbe || activeShadow);
     const activityIdentity = workflowActivityIdentity(platform, activeProbe, activeShadow);
-    const readiness = buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate });
+    const readiness = buildReadiness({
+      platform,
+      evidence,
+      platformEvidence,
+      adapter,
+      runtimeSettings,
+      probeCandidate,
+    });
     return {
       evidence, platformEvidence, invalidTarget, adapter, probeCandidate,
       selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive,
-      activityIdentity, readiness,
+      activityIdentity, readiness, manualAssisted,
     };
   };
 
   const workflow = buildPlatformWorkflow(readinessPlatform);
+  const workflowReadyForReal = Boolean(!workflow.manualAssisted && workflow.evidence?.allowed);
+  const manualShadowObservation = xiaohongshuShadowObservation(workflow.evidence);
   const readinessPlatformLabel = platforms.find(item => item.id === readinessPlatform)?.label || readinessPlatform;
 
   useEffect(() => {
@@ -391,8 +407,14 @@ export default function Deploy() {
       return;
     }
 
-    const action = evidence.next_action;
+    const action = workflow.nextAction;
     const lotteryId = evidence.lottery_id;
+    if (workflow.manualAssisted && ['manual_assisted', 'enable_real_run', 'real_run'].includes(action)) {
+      const text = t('deploy.xiaohongshuManualOnlyHint');
+      setMessage(text);
+      toast(text, 'warning');
+      return;
+    }
     setWorkflowBusy(true);
     try {
       let result;
@@ -590,11 +612,23 @@ export default function Deploy() {
       <div className="panel">
         <div className="notify-guide-head">
           <div>
-            <div className="panel-title">{formatText(t('deploy.realRunReadiness'), { platform: readinessPlatformLabel })}</div>
-            <p className="muted-text tight-text">{t('deploy.realRunReadinessHint')}</p>
+            <div className="panel-title">
+              {workflow.manualAssisted
+                ? formatText(t('deploy.manualAssistedReadiness'), { platform: readinessPlatformLabel })
+                : formatText(t('deploy.realRunReadiness'), { platform: readinessPlatformLabel })}
+            </div>
+            <p className="muted-text tight-text">
+              {t(workflow.manualAssisted
+                ? 'deploy.xiaohongshuManualOnlyHint'
+                : 'deploy.realRunReadinessHint')}
+            </p>
           </div>
-          <span className={`badge ${workflow.evidence?.allowed ? 'badge-ready' : 'badge-warn'}`}>
-            {workflow.evidence?.allowed ? t('deploy.readyForReal') : t(`lotteries.nextActions.${workflow.nextAction}`)}
+          <span className={`badge ${workflowReadyForReal ? 'badge-ready' : 'badge-warn'}`}>
+            {workflow.manualAssisted
+              ? t('lotteries.manualAssistedOnly')
+              : (workflowReadyForReal
+                ? t('deploy.readyForReal')
+                : t(`lotteries.nextActions.${workflow.nextAction}`))}
           </span>
         </div>
         <div className="segmented platform-tabs">
@@ -634,6 +668,27 @@ export default function Deploy() {
             </div>
           </div>
         </div>
+        {workflow.manualAssisted && (
+          <div className="manual-assisted-checklist" role="note">
+            <div className="capability-row">
+              <strong>{t('deploy.manualChecklistTitle')}</strong>
+              <span className={`badge ${manualShadowObservation.complete ? 'badge-ready' : 'badge-muted'}`}>
+                {manualShadowObservation.complete
+                  ? t('lotteries.shadowEvidenceReady')
+                  : t('lotteries.shadowEvidenceMissing')}
+              </span>
+            </div>
+            <p className="small-text muted-text">{t('deploy.manualChecklistHint')}</p>
+            <ol>
+              {lotteryActionsForPlatform(readinessPlatform).map(action => (
+                <li key={action}>
+                  <span className="badge badge-warn">{t('lotteries.manualPending')}</span>
+                  <strong>{t(`lotteries.actions.${action}`)}</strong>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
         <div className="bilibili-readiness-grid">
           {workflow.readiness.map(step => (
             <div className="bilibili-readiness-step" key={step.code}>
@@ -657,6 +712,7 @@ export default function Deploy() {
               || Boolean(workflow.activeProbe)
               || Boolean(workflow.activeShadow)
               || !workflow.evidence
+              || workflow.nextAction === 'manual_assisted'
               || ['add_account', 'review_risk', 'blocked'].includes(workflow.evidence?.next_action)
             }
             onClick={advanceWorkflow}
@@ -667,7 +723,9 @@ export default function Deploy() {
                 ? t('deploy.probeRunning')
                 : workflow.activeShadow
                   ? t('deploy.shadowRunning')
-                  : workflow.evidence?.next_action === 'real_run'
+                  : workflow.nextAction === 'manual_assisted'
+                    ? t('lotteries.manualAssistedOnly')
+                    : workflow.evidence?.next_action === 'real_run'
                     ? t('deploy.reviewRealRunTask')
                     : workflow.evidence?.next_action === 'enable_real_run'
                       ? t('deploy.reviewRealRunSwitchButton')
@@ -1026,7 +1084,7 @@ function buildDraftFromProbe(probe) {
     return parsed._recommended_config;
   }
   const phases = {};
-  for (const phase of ['followed', 'liked', 'commented', 'reposted']) {
+  for (const phase of lotteryActionsForPlatform(probe.platform)) {
     const candidates = Array.isArray(parsed?.[phase]) ? parsed[phase] : [];
     const visible = candidates.find(item => item?.visible && item?.selector);
     if (visible) phases[phase] = [visible.selector];
@@ -1040,13 +1098,15 @@ function probeReadyPhaseCount(probe) {
   return result?._summary?.ready_phase_count ?? Object.keys(buildDraftFromProbe(probe)?.[probe.platform] || {}).length;
 }
 
-function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
+function buildReadiness({ platform, evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
   const blockers = new Set(evidence?.blockers || []);
+  const manualAssisted = isManualAssistedPlatform(platform);
+  const manualShadowObservation = xiaohongshuShadowObservation(evidence);
   const phaseCount = probeCandidate ? probeReadyPhaseCount(probeCandidate.probe) : 0;
   const selectorEvidenceReady = selectorExecutionEvidenceReady(adapter, evidence);
   const selectorEvidenceUnbound = blockers.has('api_path_probe_evidence_not_implemented')
     || blockers.has('selector_config_evidence_binding_not_implemented');
-  return [
+  const readiness = [
     {
       code: 'target',
       ready: Boolean(evidence?.target_valid),
@@ -1075,17 +1135,29 @@ function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, 
     },
     {
       code: 'shadow',
-      ready: Boolean(evidence?.shadow_ready),
+      ready: manualAssisted
+        ? manualShadowObservation.complete
+        : Boolean(evidence?.shadow_ready),
       severity: 'warning',
-      meta: evidence?.shadow_ready ? '24h ok' : blockers.has('recent_shadow_run_required') ? 'required' : 'unknown',
-    },
-    {
-      code: 'global',
-      ready: Boolean(runtimeSettings?.real_run_enabled),
-      severity: 'danger',
-      meta: runtimeSettings?.real_run_enabled ? 'enabled' : 'disabled',
+      meta: manualAssisted
+        ? (manualShadowObservation.complete ? 'observation complete' : 'observation required')
+        : (evidence?.shadow_ready
+          ? '24h ok'
+          : blockers.has('recent_shadow_run_required') ? 'required' : 'unknown'),
     },
   ];
+  readiness.push(isManualAssistedPlatform(platform) ? {
+    code: 'manual',
+    ready: false,
+    severity: 'warning',
+    meta: 'manual only',
+  } : {
+    code: 'global',
+    ready: Boolean(runtimeSettings?.real_run_enabled),
+    severity: 'danger',
+    meta: runtimeSettings?.real_run_enabled ? 'enabled' : 'disabled',
+  });
+  return readiness;
 }
 
 function safeJson(value) {

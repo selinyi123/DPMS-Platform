@@ -5,9 +5,15 @@ import {
   actionPlanHasMediaRequirement,
   actionPlanV2Blockers,
   actionPlanV2Ready,
+  actionPlanV2ReviewBlockers,
+  actionPlanV2ReviewReady,
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
   executionEvidencePresentation,
+  isManualAssistedPlatform,
+  lotteryActionsForPlatform,
+  platformDispatchBlocker,
+  platformExecutionPathId,
   realRunEvidencePath,
   refreshedWorkflowBindings,
   rulePlanHasUnrepresentableRequirements,
@@ -17,6 +23,8 @@ import {
   targetValidationErrorCode,
   unresolvedRuleRequirements,
   workflowActivityIdentity,
+  xiaohongshuManualChecklist,
+  xiaohongshuShadowObservation,
 } from './lotteryCompatibility.js';
 
 function planV2(overrides = {}) {
@@ -42,6 +50,34 @@ function planV2(overrides = {}) {
     executable: true,
     review_required: false,
     rule_complete_confirmed: true,
+    ...overrides,
+  };
+}
+
+function xiaohongshuPlanV2(overrides = {}) {
+  return {
+    version: 2,
+    platform: 'xiaohongshu',
+    execution_path_id: 'xiaohongshu_manual_v1',
+    rule_snapshot_id: 11,
+    rule_hash: 'c'.repeat(64),
+    plan_hash: 'd'.repeat(64),
+    required_actions: ['followed', 'liked', 'commented', 'favorited'],
+    action_payloads: {
+      followed: { target_handle: '@creator' },
+      liked: {},
+      commented: { text: '#giveaway# exact comment', topic_tags: ['#giveaway#'] },
+      favorited: {},
+    },
+    content_requirements: {
+      follow_targets: ['@creator'],
+      commented: { topic_tags: ['#giveaway#'], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    executable: false,
+    review_required: false,
+    rule_complete_confirmed: true,
+    capability_blockers: ['xiaohongshu_no_official_interaction_api'],
     ...overrides,
   };
 }
@@ -152,6 +188,155 @@ test('builds an exact v2 update without carrying payloads for unselected actions
     rule_text: '完整规则原文',
     reviewed: true,
     rule_complete_confirmed: true,
+  });
+});
+
+test('uses the exact Xiaohongshu four-action contract and manual execution path', () => {
+  assert.deepEqual(
+    lotteryActionsForPlatform('xiaohongshu'),
+    ['followed', 'liked', 'commented', 'favorited'],
+  );
+  assert.deepEqual(
+    lotteryActionsForPlatform('bilibili'),
+    ['followed', 'liked', 'commented', 'reposted'],
+  );
+  assert.equal(isManualAssistedPlatform('XIAOHONGSHU'), true);
+  assert.equal(isManualAssistedPlatform('bilibili'), false);
+  assert.equal(platformExecutionPathId('xiaohongshu'), 'xiaohongshu_manual_v1');
+  assert.equal(platformExecutionPathId('bilibili'), 'bilibili_api_v2');
+  assert.equal(platformExecutionPathId('weibo', 'weibo-browser-v1'), 'weibo-browser-v1');
+});
+
+test('builds Xiaohongshu updates without leaking repost or unsupported actions', () => {
+  assert.deepEqual(buildActionPlanV2Update({
+    platform: 'xiaohongshu',
+    requiredActions: ['reposted', 'favorited', 'commented', 'liked', 'followed'],
+    actionPayloads: {
+      followed: { target_handle: '@creator' },
+      liked: {},
+      commented: { text: 'exact comment' },
+      favorited: {},
+      reposted: { text: 'must not leak' },
+    },
+    executionPathId: 'xiaohongshu_manual_v1',
+    ruleText: 'complete source rule',
+    ruleCompleteConfirmed: true,
+    reviewed: true,
+  }), {
+    required_actions: ['followed', 'liked', 'commented', 'favorited'],
+    action_payloads: {
+      followed: { target_handle: '@creator' },
+      liked: {},
+      commented: { text: 'exact comment' },
+      favorited: {},
+    },
+    execution_path_id: 'xiaohongshu_manual_v1',
+    rule_text: 'complete source rule',
+    reviewed: true,
+    rule_complete_confirmed: true,
+  });
+});
+
+test('separates Xiaohongshu semantic review from unavailable automatic real-run', () => {
+  const plan = xiaohongshuPlanV2();
+  assert.equal(actionPlanV2ReviewReady(plan, 'xiaohongshu'), true);
+  assert.equal(actionPlanV2Ready(plan, 'xiaohongshu'), false);
+  assert.deepEqual(actionPlanV2ReviewBlockers(plan, 'xiaohongshu'), []);
+  assert.ok(actionPlanV2Blockers(plan, 'xiaohongshu').includes('action_plan_not_executable'));
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      xiaohongshuPlanV2({ executable: true }),
+      'xiaohongshu',
+    ).includes('xiaohongshu_manual_plan_must_be_non_executable'),
+  );
+  assert.equal(
+    actionPlanV2ReviewReady(xiaohongshuPlanV2({
+      payload_validation_errors: ['comment_payload_invalid'],
+    }), 'xiaohongshu'),
+    false,
+  );
+  assert.equal(
+    actionPlanV2ReviewReady(xiaohongshuPlanV2({
+      capability_blockers: ['xiaohongshu_no_official_interaction_api', 'unexpected_blocker'],
+    }), 'xiaohongshu'),
+    false,
+  );
+
+  const missingFavorite = xiaohongshuPlanV2({
+    required_actions: ['followed', 'liked', 'commented'],
+    action_payloads: {
+      followed: { target_handle: '@creator' },
+      liked: {},
+      commented: { text: '#giveaway# exact comment', topic_tags: ['#giveaway#'] },
+    },
+  });
+  assert.ok(
+    actionPlanV2ReviewBlockers(missingFavorite, 'xiaohongshu')
+      .includes('xiaohongshu_four_action_plan_required'),
+  );
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      xiaohongshuPlanV2({ execution_path_id: 'bilibili_api_v2' }),
+      'xiaohongshu',
+    ).includes('execution_path_mismatch'),
+  );
+  const favoriteWithPayload = xiaohongshuPlanV2();
+  favoriteWithPayload.action_payloads.favorited = { text: 'not allowed' };
+  assert.ok(
+    actionPlanV2ReviewBlockers(favoriteWithPayload, 'xiaohongshu')
+      .includes('action_payload_favorited_must_be_empty'),
+  );
+});
+
+test('Xiaohongshu allows only shadow tasks and cannot trust gate.allowed for real-run', () => {
+  const lottery = {
+    id: 9,
+    platform: 'xiaohongshu',
+    raw_url: 'https://www.xiaohongshu.com/explore/example',
+    action_plan: xiaohongshuPlanV2(),
+  };
+  assert.equal(platformDispatchBlocker('xiaohongshu', 'dry_run'), 'xiaohongshu_manual_shadow_only');
+  assert.equal(platformDispatchBlocker('xiaohongshu', 'real_run'), 'xiaohongshu_manual_only');
+  assert.equal(platformDispatchBlocker('xiaohongshu', 'shadow_run'), null);
+  assert.equal(
+    dispatchSafetyBlocker({ lottery, mode: 'dry_run', safeAccountAvailable: true }),
+    'xiaohongshu_manual_shadow_only',
+  );
+  assert.equal(
+    dispatchSafetyBlocker({ lottery, mode: 'shadow_run', safeAccountAvailable: true, accountScopeBound: true }),
+    null,
+  );
+  assert.equal(
+    dispatchSafetyBlocker({
+      lottery,
+      mode: 'real_run',
+      gate: { allowed: true },
+      safeAccountAvailable: true,
+      accountScopeBound: true,
+    }),
+    'xiaohongshu_manual_only',
+  );
+});
+
+test('builds a read-only Xiaohongshu manual checklist from the reviewed plan', () => {
+  assert.deepEqual(xiaohongshuManualChecklist(xiaohongshuPlanV2()), [
+    { action: 'followed', required: true, exactValue: '@creator' },
+    { action: 'liked', required: true, exactValue: '' },
+    { action: 'commented', required: true, exactValue: '#giveaway# exact comment' },
+    { action: 'favorited', required: true, exactValue: '' },
+  ]);
+  assert.deepEqual(xiaohongshuManualChecklist(planV2(), 'bilibili'), []);
+});
+
+test('Xiaohongshu Shadow status trusts selector observation, not real-run qualification', () => {
+  assert.deepEqual(xiaohongshuShadowObservation({
+    selector_observation_complete: true,
+    shadow_ready: false,
+    manual_shadow_task_id: 'shadow-manual-1',
+  }), { complete: true, taskId: 'shadow-manual-1' });
+  assert.deepEqual(xiaohongshuShadowObservation({ shadow_ready: true }), {
+    complete: false,
+    taskId: '',
   });
 });
 

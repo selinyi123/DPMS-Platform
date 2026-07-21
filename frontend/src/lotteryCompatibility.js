@@ -3,16 +3,23 @@ const TARGET_ERROR_CODES = new Set([
 ]);
 
 const DISPATCH_MODES = new Set(['dry_run', 'shadow_run', 'real_run']);
-const LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
+const CANONICAL_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
+const DEFAULT_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
+const XIAOHONGSHU_FOUR_ACTIONS = ['followed', 'liked', 'commented', 'favorited'];
 const TEXT_ACTIONS = new Set(['commented', 'reposted']);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const HANDLE_PATTERN = /^@[\w\u4e00-\u9fff-]{1,64}$/u;
 const CONTENT_REQUIREMENT_ACTIONS = ['commented', 'reposted'];
 const CONTENT_REQUIREMENT_FIELDS = ['topic_tags', 'mentions'];
 export const BILIBILI_EXECUTION_PATH_ID = 'bilibili_api_v2';
+export const XIAOHONGSHU_EXECUTION_PATH_ID = 'xiaohongshu_manual_v1';
 const UNBOUND_EXECUTION_EVIDENCE_BLOCKERS = new Set([
   'api_path_probe_evidence_not_implemented',
   'selector_config_evidence_binding_not_implemented',
+]);
+const XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS = new Set([
+  'xiaohongshu_no_official_interaction_api',
+  'xiaohongshu_manual_only',
 ]);
 
 export function targetTransportCompatibilityIssue(platform, rawUrl) {
@@ -24,7 +31,33 @@ export function targetTransportCompatibilityIssue(platform, rawUrl) {
   }
 }
 
+export function lotteryActionsForPlatform(platform) {
+  return normalizePlatform(platform) === 'xiaohongshu'
+    ? [...XIAOHONGSHU_FOUR_ACTIONS]
+    : [...DEFAULT_LOTTERY_ACTIONS];
+}
+
+export function isManualAssistedPlatform(platform) {
+  return normalizePlatform(platform) === 'xiaohongshu';
+}
+
+export function platformExecutionPathId(platform, currentExecutionPathId = '') {
+  const normalizedPlatform = normalizePlatform(platform);
+  if (normalizedPlatform === 'bilibili') return BILIBILI_EXECUTION_PATH_ID;
+  if (normalizedPlatform === 'xiaohongshu') return XIAOHONGSHU_EXECUTION_PATH_ID;
+  return String(currentExecutionPathId || '').trim();
+}
+
+export function platformDispatchBlocker(platform, mode) {
+  const normalizedMode = String(mode || '').trim().toLowerCase();
+  if (!isManualAssistedPlatform(platform)) return null;
+  if (normalizedMode === 'real_run') return 'xiaohongshu_manual_only';
+  if (normalizedMode === 'dry_run') return 'xiaohongshu_manual_shadow_only';
+  return null;
+}
+
 export function buildActionPlanV2Update({
+  platform = 'bilibili',
   requiredActions,
   actionPayloads,
   executionPathId,
@@ -32,7 +65,7 @@ export function buildActionPlanV2Update({
   ruleCompleteConfirmed,
   reviewed,
 }) {
-  const actions = LOTTERY_ACTIONS.filter(action => requiredActions?.includes(action));
+  const actions = lotteryActionsForPlatform(platform).filter(action => requiredActions?.includes(action));
   const sourcePayloads = actionPayloads && typeof actionPayloads === 'object' ? actionPayloads : {};
   return {
     required_actions: actions,
@@ -72,6 +105,8 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
   const normalizedMode = String(mode || '').trim().toLowerCase();
   if (!lottery?.id) return 'lottery_missing';
   if (!DISPATCH_MODES.has(normalizedMode)) return 'mode_blocked';
+  const platformBlocker = platformDispatchBlocker(lottery.platform, normalizedMode);
+  if (platformBlocker) return platformBlocker;
   if (
     normalizedMode !== 'dry_run'
     && targetTransportCompatibilityIssue(lottery.platform, lottery.raw_url)
@@ -80,43 +115,56 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
   }
   if (safeAccountAvailable !== true) return 'no_safe_account';
   if (normalizedMode !== 'dry_run' && accountScopeBound !== true) return 'account_scope_required';
-  if (normalizedMode !== 'dry_run' && actionPlanV2Blockers(lottery.action_plan, lottery.platform).length) {
+  const planBlockers = isManualAssistedPlatform(lottery.platform)
+    ? actionPlanV2ReviewBlockers(lottery.action_plan, lottery.platform)
+    : actionPlanV2Blockers(lottery.action_plan, lottery.platform);
+  if (normalizedMode !== 'dry_run' && planBlockers.length) {
     return 'action_plan_v2';
   }
   if (normalizedMode === 'real_run' && gate?.allowed !== true) return 'real_run_gate';
   return null;
 }
 
-export function actionPlanV2Blockers(plan, platform = 'bilibili') {
+function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return ['action_plan_v2_required'];
   const blockers = [];
-  const normalizedPlatform = String(platform || '').trim().toLowerCase();
+  const normalizedPlatform = normalizePlatform(platform);
   if (plan.version !== 2) blockers.push('action_plan_v2_required');
   if (!normalizedPlatform || String(plan.platform || '').trim().toLowerCase() !== normalizedPlatform) {
     blockers.push('action_plan_platform_mismatch');
   }
   const executionPathId = String(plan.execution_path_id || '').trim();
+  const expectedExecutionPathId = platformExecutionPathId(normalizedPlatform);
   if (
     !executionPathId
-    || (String(platform || '').trim().toLowerCase() === 'bilibili'
-      && executionPathId !== BILIBILI_EXECUTION_PATH_ID)
+    || (expectedExecutionPathId && executionPathId !== expectedExecutionPathId)
   ) blockers.push('execution_path_mismatch');
   if (plan.review_required !== false) blockers.push('action_plan_not_reviewed');
   if (plan.rule_complete_confirmed !== true) blockers.push('rule_completion_not_attested');
-  if (plan.executable !== true) blockers.push('action_plan_not_executable');
+  if (normalizedPlatform === 'xiaohongshu' && plan.executable !== false) {
+    blockers.push('xiaohongshu_manual_plan_must_be_non_executable');
+  }
+  if (requireExecutable && plan.executable !== true) blockers.push('action_plan_not_executable');
   if (!Number.isInteger(plan.rule_snapshot_id) || plan.rule_snapshot_id <= 0) blockers.push('rule_snapshot_missing');
   if (!SHA256_PATTERN.test(String(plan.rule_hash || ''))) blockers.push('rule_hash_missing');
   if (!SHA256_PATTERN.test(String(plan.plan_hash || ''))) blockers.push('action_plan_hash_missing');
 
   const actions = plan.required_actions;
+  const allowedActions = lotteryActionsForPlatform(normalizedPlatform);
   const actionsValid = Array.isArray(actions)
     && actions.length > 0
     && actions.every((action, index) => (
-      LOTTERY_ACTIONS.includes(action)
+      allowedActions.includes(action)
       && actions.indexOf(action) === index
-      && LOTTERY_ACTIONS.indexOf(action) >= (index ? LOTTERY_ACTIONS.indexOf(actions[index - 1]) : 0)
+      && CANONICAL_LOTTERY_ACTIONS.indexOf(action) >= (
+        index ? CANONICAL_LOTTERY_ACTIONS.indexOf(actions[index - 1]) : 0
+      )
     ));
   if (!actionsValid) blockers.push('required_actions_invalid');
+  if (
+    normalizedPlatform === 'xiaohongshu'
+    && (!actionsValid || !sameOrderedList(actions, XIAOHONGSHU_FOUR_ACTIONS))
+  ) blockers.push('xiaohongshu_four_action_plan_required');
 
   const payloads = plan.action_payloads;
   if (!payloads || typeof payloads !== 'object' || Array.isArray(payloads)) {
@@ -214,12 +262,54 @@ export function actionPlanV2Blockers(plan, platform = 'bilibili') {
   return [...new Set(blockers)];
 }
 
+export function actionPlanV2ReviewBlockers(plan, platform = 'bilibili') {
+  const blockers = collectActionPlanV2Blockers(plan, platform, { requireExecutable: false });
+  if (!isManualAssistedPlatform(platform) || !plan || typeof plan !== 'object') return blockers;
+  const payloadErrors = Array.isArray(plan.payload_validation_errors)
+    ? plan.payload_validation_errors.filter(Boolean)
+    : [];
+  const unexpectedCapabilityBlockers = Array.isArray(plan.capability_blockers)
+    ? plan.capability_blockers.filter(code => code && !XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS.has(code))
+    : [];
+  return [...new Set([...blockers, ...payloadErrors, ...unexpectedCapabilityBlockers])];
+}
+
+export function actionPlanV2Blockers(plan, platform = 'bilibili') {
+  return collectActionPlanV2Blockers(plan, platform, { requireExecutable: true });
+}
+
 function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value || '')).length;
 }
 
 export function actionPlanV2Ready(plan, platform = 'bilibili') {
   return actionPlanV2Blockers(plan, platform).length === 0;
+}
+
+export function actionPlanV2ReviewReady(plan, platform = 'bilibili') {
+  return actionPlanV2ReviewBlockers(plan, platform).length === 0;
+}
+
+export function xiaohongshuManualChecklist(plan, platform = 'xiaohongshu') {
+  if (!isManualAssistedPlatform(platform)) return [];
+  const actions = Array.isArray(plan?.required_actions) ? plan.required_actions : [];
+  const payloads = plan?.action_payloads && typeof plan.action_payloads === 'object'
+    ? plan.action_payloads
+    : {};
+  return XIAOHONGSHU_FOUR_ACTIONS.map(action => ({
+    action,
+    required: actions.includes(action),
+    exactValue: action === 'followed'
+      ? String(payloads.followed?.target_handle || '')
+      : (action === 'commented' ? String(payloads.commented?.text || '') : ''),
+  }));
+}
+
+export function xiaohongshuShadowObservation(gate) {
+  return {
+    complete: gate?.selector_observation_complete === true,
+    taskId: String(gate?.manual_shadow_task_id || ''),
+  };
 }
 
 export function actionPlanHasMediaRequirement(plan) {
@@ -256,6 +346,7 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
     if (requirement === 'topic_tag') return exactActionTokens('topic_tags');
     if (requirement === 'mention_account') return exactActionTokens('mentions');
     if (requirement === 'mention_friends') return false;
+    if (requirement === 'favorited') return Boolean(payloads.favorited);
     if (requirement === 'media_submission') return hasListValue('media_refs');
     if (requirement === 'translation_required') {
       return textPayloads.some(payload => payload?.translation !== undefined && payload.translation !== '');
@@ -334,6 +425,10 @@ function sameOrderedList(left, right) {
     && Array.isArray(right)
     && left.length === right.length
     && left.every((item, index) => item === right[index]);
+}
+
+function normalizePlatform(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
 export function executionEvidencePresentation(gate) {
