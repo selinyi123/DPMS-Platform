@@ -19,6 +19,7 @@ from app.action_plan import (  # noqa: E402
 from app.api.lotteries import (  # noqa: E402
     dispatch_lottery,
     update_lottery_action_plan,
+    xiaohongshu_manual_plan_binding,
 )
 from app.models.schemas import (  # noqa: E402
     DispatchTaskRequest,
@@ -222,6 +223,52 @@ class XiaohongshuActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "action_payload_commented_text_required",
             result["action_plan"]["payload_validation_errors"],
+        )
+
+
+class XiaohongshuManualPlanBindingTests(unittest.TestCase):
+    def assert_binding_rejected(self, plan, expected_blocker):
+        with self.assertRaises(HTTPException) as caught:
+            xiaohongshu_manual_plan_binding(
+                lottery_row(plan),
+                execution_revision=7,
+                selector_config={},
+            )
+
+        self.assertEqual(409, caught.exception.status_code)
+        self.assertEqual(
+            [expected_blocker],
+            caught.exception.detail["blockers"],
+        )
+
+    def test_binding_rejects_executable_claim(self):
+        plan = complete_xiaohongshu_plan()
+        plan["executable"] = True
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        self.assert_binding_rejected(
+            plan,
+            "xiaohongshu_manual_plan_must_be_non_executable",
+        )
+
+    def test_binding_rejects_non_manual_path(self):
+        plan = complete_xiaohongshu_plan()
+        plan["execution_path_id"] = "xiaohongshu_selector_v1"
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        self.assert_binding_rejected(
+            plan,
+            "xiaohongshu_execution_path_not_supported",
+        )
+
+    def test_binding_rejects_nonempty_legacy_repost_bucket(self):
+        plan = complete_xiaohongshu_plan()
+        plan["content_requirements"]["reposted"]["mentions"] = ["@好友"]
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        self.assert_binding_rejected(
+            plan,
+            "xiaohongshu_repost_content_not_supported",
         )
 
 

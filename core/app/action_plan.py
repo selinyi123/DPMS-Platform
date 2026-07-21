@@ -344,6 +344,18 @@ def validate_action_plan_v2(
     plan = dict(value)
     if type(plan.get("version")) is not int or plan.get("version") != 2:
         raise ActionPlanV2Error("action_plan_version_unsupported")
+    raw_platform = plan.get("platform")
+    is_xiaohongshu = bool(
+        isinstance(raw_platform, str)
+        and raw_platform.strip().casefold() == "xiaohongshu"
+    )
+    # Xiaohongshu has no official interaction API.  Even callers validating a
+    # non-executable/manual plan must never be able to smuggle an executable
+    # claim through this shared contract.
+    if is_xiaohongshu and plan.get("executable") is not False:
+        raise ActionPlanV2Error(
+            "xiaohongshu_manual_plan_must_be_non_executable"
+        )
     if require_executable and plan.get("executable") is not True:
         raise ActionPlanV2Error("action_plan_not_executable")
     if plan.get("review_required") is not False:
@@ -363,6 +375,8 @@ def validate_action_plan_v2(
         raise ActionPlanV2Error("action_plan_rule_snapshot_id_invalid")
     rule_hash = _required_string(plan, "rule_hash")
     path_id = _required_string(plan, "execution_path_id")
+    if is_xiaohongshu and path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH:
+        raise ActionPlanV2Error("xiaohongshu_execution_path_not_supported")
     plan_hash = _required_string(plan, "plan_hash")
     for field, value_hash in (("rule_hash", rule_hash), ("hash", plan_hash)):
         if len(value_hash) != 64 or any(ch not in "0123456789abcdef" for ch in value_hash):
@@ -398,6 +412,11 @@ def validate_action_plan_v2(
     content_requirements = _validated_content_requirements(
         plan.get("content_requirements")
     )
+    if is_xiaohongshu and content_requirements["reposted"] != {
+        "topic_tags": [],
+        "mentions": [],
+    }:
+        raise ActionPlanV2Error("xiaohongshu_repost_content_not_supported")
     for action in CONTENT_REQUIREMENT_ACTIONS:
         for field, mismatch_code in (
             ("topic_tags", "action_plan_required_topic_mismatch"),

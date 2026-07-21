@@ -246,6 +246,39 @@ class ActionPlanV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ActionPlanV2Error, "action_plan_not_executable"):
             validate_action_plan_v2(complete_xiaohongshu_plan())
 
+    def test_xiaohongshu_validator_rejects_executable_claim_in_manual_mode(self):
+        plan = complete_xiaohongshu_plan()
+        plan["executable"] = True
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_manual_plan_must_be_non_executable",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_validator_requires_manual_execution_path(self):
+        plan = complete_xiaohongshu_plan()
+        plan["execution_path_id"] = "xiaohongshu_selector_v1"
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_execution_path_not_supported",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
+    def test_xiaohongshu_validator_requires_empty_legacy_repost_bucket(self):
+        plan = complete_xiaohongshu_plan()
+        plan["content_requirements"]["reposted"]["topic_tags"] = ["#转发#"]
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        with self.assertRaisesRegex(
+            ActionPlanV2Error,
+            "xiaohongshu_repost_content_not_supported",
+        ):
+            validate_action_plan_v2(plan, require_executable=False)
+
     def test_xiaohongshu_comment_requires_exact_reviewed_text(self):
         plan = complete_xiaohongshu_plan()
         plan["action_payloads"]["commented"] = {}
