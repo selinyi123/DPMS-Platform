@@ -261,6 +261,12 @@ test('separates Xiaohongshu semantic review from unavailable automatic real-run'
     }), 'xiaohongshu'),
     false,
   );
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      xiaohongshuPlanV2({ capability_blockers: [] }),
+      'xiaohongshu',
+    ).includes('xiaohongshu_no_official_interaction_api'),
+  );
 
   const missingFavorite = xiaohongshuPlanV2({
     required_actions: ['followed', 'liked', 'commented'],

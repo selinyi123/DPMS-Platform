@@ -14,6 +14,7 @@ from app.action_plan import (
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
     action_order_for_platform,
+    bind_xiaohongshu_manual_follow_target,
     compute_action_plan_hash,
     compute_bilibili_api_config_hash,
     compute_config_hash,
@@ -1989,6 +1990,13 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
                 action_payloads[action] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
                 payload_validation_errors.append(exc.code)
         payload_validation_errors = list(dict.fromkeys(payload_validation_errors))
+
+        if lottery["platform"] == "xiaohongshu":
+            content_requirements = bind_xiaohongshu_manual_follow_target(
+                required_actions,
+                action_payloads,
+                content_requirements,
+            )
 
         represented_requirements, unresolved_requirements, capability_blockers = (
             semantic_requirement_status(

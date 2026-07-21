@@ -268,10 +268,20 @@ export function actionPlanV2ReviewBlockers(plan, platform = 'bilibili') {
   const payloadErrors = Array.isArray(plan.payload_validation_errors)
     ? plan.payload_validation_errors.filter(Boolean)
     : [];
-  const unexpectedCapabilityBlockers = Array.isArray(plan.capability_blockers)
-    ? plan.capability_blockers.filter(code => code && !XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS.has(code))
+  const capabilityBlockers = Array.isArray(plan.capability_blockers)
+    ? plan.capability_blockers.filter(Boolean)
     : [];
-  return [...new Set([...blockers, ...payloadErrors, ...unexpectedCapabilityBlockers])];
+  const missingManualCapability = capabilityBlockers.includes('xiaohongshu_no_official_interaction_api')
+    ? []
+    : ['xiaohongshu_no_official_interaction_api'];
+  const unexpectedCapabilityBlockers = capabilityBlockers
+    .filter(code => !XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS.has(code));
+  return [...new Set([
+    ...blockers,
+    ...payloadErrors,
+    ...missingManualCapability,
+    ...unexpectedCapabilityBlockers,
+  ])];
 }
 
 export function actionPlanV2Blockers(plan, platform = 'bilibili') {

@@ -15,6 +15,7 @@ from app.action_plan import (
     XIAOHONGSHU_MANUAL_EXECUTION_PATH,
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
+    bind_xiaohongshu_manual_follow_target,
     compute_bilibili_api_config_hash,
     compute_config_hash,
     compute_rule_hash,
@@ -1338,11 +1339,21 @@ async def validate_xiaohongshu_manual_contract(
                 for action in XIAOHONGSHU_ACTION_ORDER
                 if action in set(parsed_rule.get("required_actions") or [])
             )
+            expected_content_requirements = bind_xiaohongshu_manual_follow_target(
+                list(parsed_actions),
+                plan.action_payloads,
+                parsed_rule.get("content_requirements")
+                or {
+                    "follow_targets": [],
+                    "commented": {"topic_tags": [], "mentions": []},
+                    "reposted": {"topic_tags": [], "mentions": []},
+                },
+            )
             represented, unresolved, semantic_capability = (
                 semantic_requirement_status(
                     list(parsed_rule.get("unsupported_actions") or []),
                     plan.action_payloads,
-                    parsed_rule.get("content_requirements") or {},
+                    expected_content_requirements,
                 )
             )
             if not parsed_rule.get("is_lottery"):
@@ -1383,14 +1394,6 @@ async def validate_xiaohongshu_manual_contract(
                 _append_blocker(
                     blockers, "action_plan_requirement_binding_mismatch"
                 )
-            expected_content_requirements = dict(
-                parsed_rule.get("content_requirements")
-                or {
-                    "follow_targets": [],
-                    "commented": {"topic_tags": [], "mentions": []},
-                    "reposted": {"topic_tags": [], "mentions": []},
-                }
-            )
             if plan.content_requirements != expected_content_requirements:
                 _append_blocker(
                     blockers, "action_plan_requirement_binding_mismatch"

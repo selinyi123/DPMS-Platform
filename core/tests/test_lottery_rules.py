@@ -266,6 +266,16 @@ class XiaohongshuLotteryRuleTests(unittest.TestCase):
         self.assertFalse(plan["review_required"])
         self.assertEqual([], plan["unsupported_actions"])
 
+    def test_four_interactions_shorthand_expands_to_exact_contract(self):
+        plan = parse_lottery_rule("四连参与抽奖，评论区抽一位送同款", "xiaohongshu")
+
+        self.assertTrue(plan["is_lottery"])
+        self.assertEqual(
+            ["followed", "liked", "commented", "favorited"],
+            plan["required_actions"],
+        )
+        self.assertFalse(plan["review_required"])
+
     def test_favorite_is_a_required_action(self):
         plan = parse_lottery_rule("抽奖时间到：关注+点赞+收藏+评论，评论区抽1位送同款", "xiaohongshu")
 

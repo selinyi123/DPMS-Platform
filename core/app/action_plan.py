@@ -305,6 +305,33 @@ def semantic_requirement_status(
     return represented, unresolved, list(dict.fromkeys(capability_blockers))
 
 
+def bind_xiaohongshu_manual_follow_target(
+    required_actions: list[str] | tuple[str, ...],
+    action_payloads: Mapping[str, Mapping[str, Any]],
+    content_requirements: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind an implicit note-author follow rule to the reviewed exact handle.
+
+    Xiaohongshu rules commonly say ``关注博主`` or simply ``四连`` without
+    repeating the author's handle. The manual-only contract may use the
+    operator-reviewed ``target_handle`` in that narrow case. Explicit source
+    handles are never replaced, so ambiguous/multiple targets still fail
+    closed in the normal semantic validator.
+    """
+
+    requirements = {
+        "follow_targets": list(content_requirements.get("follow_targets") or []),
+        "commented": dict(content_requirements.get("commented") or {}),
+        "reposted": dict(content_requirements.get("reposted") or {}),
+    }
+    if "followed" not in required_actions or requirements["follow_targets"]:
+        return requirements
+    target_handle = action_payloads.get("followed", {}).get("target_handle")
+    if isinstance(target_handle, str) and HANDLE_PATTERN.fullmatch(target_handle):
+        requirements["follow_targets"] = [target_handle]
+    return requirements
+
+
 def _validated_content_requirements(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != {
         "follow_targets",

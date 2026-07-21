@@ -33,7 +33,7 @@ from app.services.real_run_readiness import (  # noqa: E402
 )
 
 
-RULE_TEXT = "抽奖：关注@小红书博主、点赞、评论并收藏本篇笔记"
+RULE_TEXT = "抽奖：关注博主、点赞、评论并收藏本篇笔记"
 NOTE_URL = "https://www.xiaohongshu.com/explore/64f1a2b3c4d5e6f7a8b9c0d1"
 CANONICAL_URL = "canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0d1"
 
@@ -186,6 +186,10 @@ class XiaohongshuActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "已认真阅读，参与抽奖",
             plan["action_payloads"]["commented"]["text"],
+        )
+        self.assertEqual(
+            ["@小红书博主"],
+            plan["content_requirements"]["follow_targets"],
         )
         self.assertFalse(plan["review_required"])
         self.assertFalse(plan["executable"])

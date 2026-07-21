@@ -69,10 +69,10 @@ WEIBO_AMBIGUOUS_PATTERNS = (
 # action. Sharing/reposting is a different side effect and must never be treated
 # as a substitute for collection.
 XIAOHONGSHU_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|本账户|博主|up主)?",),
-    "liked": (r"点赞", r"双击点赞"),
-    "commented": (r"评论", r"留言", r"评论区"),
-    "favorited": (r"收藏",),
+    "followed": (r"关注(?:我|本账号|本账户|博主|up主)?", r"(?:一键)?四连"),
+    "liked": (r"点赞", r"双击点赞", r"(?:一键)?四连"),
+    "commented": (r"评论", r"留言", r"评论区", r"(?:一键)?四连"),
+    "favorited": (r"收藏", r"(?:一键)?四连"),
 }
 XIAOHONGSHU_LOTTERY_PATTERNS = (
     r"抽奖",
