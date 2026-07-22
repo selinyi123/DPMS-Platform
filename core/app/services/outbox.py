@@ -54,6 +54,7 @@ LOTTERY_TASK_FIELDS = (
     "execution_revision",
     "account_lease_id",
     "account_lease_generation",
+    "weibo_rip_encrypted",
 )
 
 OUTBOX_MAX_ATTEMPTS = 5
@@ -89,6 +90,7 @@ def build_lottery_task_message(
     execution_revision=None,
     account_lease_id: str | None = None,
     account_lease_generation=None,
+    weibo_rip_encrypted: str | None = None,
 ) -> dict[str, str]:
     """Build the Redis-stream message for a lottery task.
 
@@ -118,7 +120,15 @@ def build_lottery_task_message(
         "execution_revision": str(execution_revision or ""),
         "account_lease_id": str(account_lease_id or ""),
         "account_lease_generation": str(account_lease_generation or ""),
+        "weibo_rip_encrypted": str(weibo_rip_encrypted or ""),
     }
+
+
+def _reject_plaintext_weibo_rip(message: dict, stream_key: str) -> None:
+    """Keep legacy/plaintext client IP fields out of every durable handoff."""
+
+    if stream_key == "lottery_tasks" and "weibo_rip" in message:
+        raise ValueError("plaintext_weibo_rip_forbidden")
 
 
 def should_retry(attempts: int) -> bool:
@@ -138,6 +148,7 @@ async def enqueue_outbox(message: dict[str, str], stream_key: str, *, dedup_key:
     means a second enqueue for the same task is a no-op rather than a duplicate
     job.
     """
+    _reject_plaintext_weibo_rip(message, stream_key)
     await database.execute(
         """INSERT INTO outbox_events (stream_key, payload, status, dedup_key)
            VALUES (:stream_key, :payload, 'pending', :dedup_key)
@@ -186,6 +197,7 @@ async def _deliver_claimed(row) -> bool:
     attempts = int(row["attempts"])
     try:
         message = json.loads(row["payload"]) if isinstance(row["payload"], str) else dict(row["payload"])
+        _reject_plaintext_weibo_rip(message, str(row["stream_key"]))
         msg_id = await redis.xadd(row["stream_key"], message)
         if not msg_id:
             raise RuntimeError("xadd returned no id")

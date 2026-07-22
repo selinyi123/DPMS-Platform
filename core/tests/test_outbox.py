@@ -12,12 +12,14 @@ from app.services.outbox import (  # noqa: E402
     LOTTERY_TASK_FIELDS,
     OUTBOX_MAX_ATTEMPTS,
     _deliver_claimed,
+    _reject_plaintext_weibo_rip,
     _settle_terminal_delivery_failure,
     build_lottery_task_message,
     reconcile_orphaned_locks,
     should_retry,
     terminal_status,
 )
+from app.utils.crypto import decrypt_weibo_rip, encrypt_weibo_rip  # noqa: E402
 
 
 class _Transaction:
@@ -149,6 +151,26 @@ class BuildLotteryTaskMessageTests(unittest.TestCase):
         msg = self._msg(raw_url=None, canonical_url=None)
         self.assertEqual(msg["raw_url"], "")
         self.assertEqual(msg["canonical_url"], "")
+
+    def test_weibo_rip_is_encrypted_before_durable_serialization(self):
+        raw_rip = "8.8.8.8"
+        encrypted = encrypt_weibo_rip(raw_rip)
+        msg = self._msg(
+            platform="weibo",
+            weibo_rip_encrypted=encrypted,
+        )
+        serialized = json.dumps(msg)
+
+        self.assertEqual(decrypt_weibo_rip(msg["weibo_rip_encrypted"]), raw_rip)
+        self.assertNotIn(raw_rip, serialized)
+        self.assertNotIn('"weibo_rip":', serialized)
+
+    def test_plaintext_weibo_rip_is_rejected_from_durable_handoff(self):
+        with self.assertRaisesRegex(ValueError, "plaintext_weibo_rip_forbidden"):
+            _reject_plaintext_weibo_rip(
+                {"task_id": "t-1", "weibo_rip": "8.8.8.8"},
+                "lottery_tasks",
+            )
 
 
 class RetryPredicateTests(unittest.TestCase):

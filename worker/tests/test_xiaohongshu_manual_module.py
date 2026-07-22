@@ -115,7 +115,7 @@ class ActionPlanContractTests(unittest.TestCase):
             validate_action_plan_v2(plan, require_executable=False)
         self.assertEqual(
             caught.exception.code,
-            "xiaohongshu_no_official_interaction_api",
+            "xiaohongshu_manual_plan_must_be_non_executable",
         )
 
     def test_missing_favorite_or_repost_substitution_is_rejected(self):
@@ -136,20 +136,19 @@ class ActionPlanContractTests(unittest.TestCase):
                     for action in actions
                 }
                 plan["plan_hash"] = compute_action_plan_hash(plan)
-                self.assert_plan_code(
-                    "xiaohongshu_four_action_plan_required",
-                    plan,
+                expected = (
+                    "xiaohongshu_four_action_plan_required"
+                    if "reposted" not in actions
+                    else "action_plan_required_actions_invalid"
                 )
+                self.assert_plan_code(expected, plan)
 
     def test_wrong_execution_path_is_rejected(self):
         plan = xiaohongshu_plan(execution_path_id="selector_flow")
-        self.assert_plan_code("xiaohongshu_execution_path_invalid", plan)
+        self.assert_plan_code("xiaohongshu_execution_path_not_supported", plan)
 
     def test_other_platforms_cannot_smuggle_favorited(self):
-        plan = xiaohongshu_plan(
-            platform="weibo",
-            execution_path_id="weibo_selector_v1",
-        )
+        plan = xiaohongshu_plan(platform="bilibili", execution_path_id="bilibili_api_v2")
         self.assert_plan_code("action_plan_required_actions_invalid", plan)
 
 

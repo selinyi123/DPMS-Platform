@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,11 @@ from app.adapters.registry import get_adapter
 from app.adapter_config import load_selector_config
 from app.action_plan import (
     BILIBILI_API_EXECUTION_PATH,
+    DOUYIN_ACTION_ORDER,
+    WEIBO_ACTION_ORDER,
+    WEIBO_MAX_UNIQUE_HANDLES,
+    WEIBO_MANUAL_EXECUTION_PATH,
+    WEIBO_OAUTH_EXECUTION_PATH,
     XIAOHONGSHU_REQUIRED_ACTIONS,
     ActionPlanV2Error,
     canonical_json_bytes,
@@ -37,13 +43,18 @@ from app.bilibili.runtime import (
     validate_card_for_actions,
 )
 from app.browser_pool import BrowserPool
-from app.db import database, redis
+from app.db import database, execute_affected_rows, redis
 from app.event_store.service import record_event
 from app.evidence_storage import (
     SHADOW_EVIDENCE_DIR,
     TASK_FAILURE_EVIDENCE_DIR,
 )
-from app.real_run_gate import RealRunGateBlocked, enforce_real_run_gate, open_unknown_outcome_breaker
+from app.real_run_gate import (
+    RealRunGateBlocked,
+    enforce_real_run_gate,
+    open_unknown_outcome_breaker,
+    platform_real_run_block_reason,
+)
 from app.services.external_action_intents import (
     ExternalActionIntentBlocked,
     StartedActionIntent,
@@ -68,6 +79,23 @@ from app.utils.navigation_safety import (
 )
 from app.utils.cookies import credential_to_cookie_header, inject_account_cookies
 from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
+from app.weibo.client import (
+    WeiboApiActionOutcomeUnknown,
+    WeiboApiClient,
+    WeiboApiRejected,
+    build_weibo_mutation_request,
+    status_identifier_from_canonical_uri,
+)
+from app.weibo.credentials import (
+    WeiboOAuthCredentialError,
+    decrypt_weibo_rip,
+    parse_weibo_oauth_credential,
+    weibo_rip_required,
+)
+from app.weibo.executor import (
+    WeiboExecutionOutcomeUnknown,
+    WeiboOAuthExecutor,
+)
 
 try:
     import fcntl
@@ -80,9 +108,14 @@ GROUP_NAME = "workers"
 WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
 CONSUMER_NAME = WORKER_ID
 PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
+DOUYIN_PHASE_ORDER = list(DOUYIN_ACTION_ORDER)
+WEIBO_PHASE_ORDER = list(WEIBO_ACTION_ORDER)
 XIAOHONGSHU_PHASE_ORDER = list(XIAOHONGSHU_REQUIRED_ACTIONS)
 TERMINAL_TASK_STATUSES = {"succeeded", "failed"}
 TASK_LEASE_SECONDS = 900
+WEIBO_PREFLIGHT_TIMEOUT_SECONDS = 300
+WEIBO_ACTION_HTTP_BUDGET_SECONDS = 20
+WEIBO_ACTION_SETTLEMENT_BUFFER_SECONDS = 120
 SCREENSHOT_DIR = TASK_FAILURE_EVIDENCE_DIR
 SHADOW_SCREENSHOT_DIR = SHADOW_EVIDENCE_DIR
 EVIDENCE_HASH_CHUNK_SIZE = 1024 * 1024
@@ -453,9 +486,10 @@ async def mark_task_started(
         ):
             raise TaskClaimConflict(f"Lottery {binding.lottery_id} is not claimable by {task_id}")
         platform = str(row_get(lottery, "platform") or "").strip().lower()
-        needs_selector_binding = (task_mode == "shadow_run" and platform != "bilibili") or (
-            task_mode == "real_run" and platform != "bilibili"
-        )
+        # Selector configuration is evidence for observation-only shadow runs.
+        # Official OAuth/API real paths bind their own immutable capability and
+        # endpoint contracts and must never inherit browser selector state.
+        needs_selector_binding = task_mode == "shadow_run" and platform != "bilibili"
         if task_mode == "shadow_run" and platform == "bilibili":
             await validate_bilibili_api_shadow_claim(
                 task_message=task_message,
@@ -715,9 +749,12 @@ def validate_shadow_task_binding(task: dict | None, lottery) -> None:
     if message_plan != authoritative_plan:
         raise TaskClaimConflict("shadow_task_action_plan_mismatch")
 
-    if str(row_get(lottery, "platform") or "").strip().lower() == "xiaohongshu":
+    manual_platform = str(
+        row_get(lottery, "platform") or ""
+    ).strip().lower()
+    if manual_platform in {"douyin", "weibo", "xiaohongshu"}:
         if any(
-            str(plan.get("platform") or "").strip().lower() != "xiaohongshu"
+            str(plan.get("platform") or "").strip().lower() != manual_platform
             for plan in (authoritative_plan, message_plan)
         ):
             raise TaskClaimConflict(
@@ -747,14 +784,15 @@ def validate_task_selector_binding(task: dict | None, authoritative_selectors: d
 def _real_success_intents_match_reviewed_plan(
     *, task_row, lottery, intent_rows
 ) -> bool:
-    """Prove every reviewed Bilibili mutation has one confirmed intent.
+    """Prove every reviewed API mutation has one confirmed durable intent.
 
     A caller saying ``success=True`` is not authority.  Settlement revalidates
     the locked lottery's immutable Action Plan and requires a one-to-one set of
     confirmed external intents before it may release the real-run fence.
     """
 
-    if str(row_get(lottery, "platform") or "").strip().lower() != "bilibili":
+    platform = str(row_get(lottery, "platform") or "").strip().lower()
+    if platform not in {"bilibili", "weibo"}:
         return False
     try:
         plan = validate_action_plan_v2(
@@ -764,19 +802,27 @@ def _real_success_intents_match_reviewed_plan(
         return False
     task_plan_hash = str(row_get(task_row, "action_plan_hash") or "").strip()
     lottery_plan_hash = str(row_get(lottery, "action_plan_hash") or "").strip()
+    expected_execution_path = (
+        BILIBILI_API_EXECUTION_PATH
+        if platform == "bilibili"
+        else WEIBO_OAUTH_EXECUTION_PATH
+    )
     if (
-        plan.execution_path_id != BILIBILI_API_EXECUTION_PATH
-        or str(plan.plan.get("platform") or "").strip().lower() != "bilibili"
+        plan.execution_path_id != expected_execution_path
+        or str(plan.plan.get("platform") or "").strip().lower() != platform
         or not task_plan_hash
         or task_plan_hash != plan.plan_hash
         or lottery_plan_hash != plan.plan_hash
     ):
         return False
 
-    try:
-        expected_actions = dpms_phases_to_api_actions(list(plan.required_actions))
-    except (TypeError, ValueError):
-        return False
+    if platform == "bilibili":
+        try:
+            expected_actions = dpms_phases_to_api_actions(list(plan.required_actions))
+        except (TypeError, ValueError):
+            return False
+    else:
+        expected_actions = list(plan.required_actions)
     if not expected_actions or len(expected_actions) != len(plan.required_actions):
         return False
     observed_actions: list[str] = []
@@ -812,6 +858,7 @@ async def mark_task_finished(
     error: str | None = None,
     screenshot_path: str | None = None,
     quarantine_account: bool = False,
+    account_failure_status: str | None = None,
 ):
     async with database.transaction():
         row = await database.fetch_one(
@@ -832,6 +879,20 @@ async def mark_task_finished(
             lottery_id=int(row_get(row, "lottery_id")),
             task_mode=str(row_get(row, "task_mode") or "").strip().lower(),
         )
+        normalized_failure_status = (
+            str(account_failure_status or "").strip().lower() or None
+        )
+        if normalized_failure_status not in {
+            None,
+            "login_required",
+            "warming",
+            "cooling",
+        }:
+            raise ValueError("account_failure_status_invalid")
+        if normalized_failure_status is not None and (
+            success or binding.task_mode != "real_run"
+        ):
+            raise ValueError("account_failure_status_not_applicable")
         if binding.task_id != task_id:
             raise RuntimeError("task_binding_mismatch")
         release_account = False
@@ -949,15 +1010,52 @@ async def mark_task_finished(
                 {"lottery_id": binding.lottery_id, "status": lottery_status, "task_id": task_id},
             )
         if release_account:
-            if quarantine_account or real_reconciliation_required:
-                await database.execute(
-                    "UPDATE accounts SET status = 'cooling', updated_at = NOW(), version = version + 1 WHERE id = :account_id AND status = 'executing'",
-                    {"account_id": binding.account_id},
+            account = await database.fetch_one(
+                "SELECT status FROM accounts WHERE id = :account_id FOR UPDATE",
+                {"account_id": binding.account_id},
+            )
+            current_account_status = str(
+                row_get(account, "status", "") or ""
+            ).strip().lower()
+            if current_account_status not in {
+                "executing",
+                "login_required",
+                "warming",
+                "cooling",
+            }:
+                raise AccountStatusPersistenceFailed(
+                    binding.account_id,
+                    normalized_failure_status or "ready",
+                    "task_terminal_account_status_invalid",
+                    RuntimeError("account_status_invalid"),
                 )
-            else:
-                await database.execute(
-                    "UPDATE accounts SET status = 'ready', updated_at = NOW(), version = version + 1 WHERE id = :account_id AND status = 'executing'",
-                    {"account_id": binding.account_id},
+            # A risk handler may already have moved the account out of
+            # `executing`. Preserve that stricter state; otherwise apply this
+            # task's classified terminal target.
+            target_account_status = (
+                current_account_status
+                if current_account_status != "executing"
+                else (
+                    "cooling"
+                    if quarantine_account or real_reconciliation_required
+                    else normalized_failure_status or "ready"
+                )
+            )
+            account_updated = await execute_affected_rows(
+                "UPDATE accounts SET status = :account_status, updated_at = NOW(), version = version + 1 WHERE id = :account_id AND status = :expected_account_status",
+                {
+                    "account_id": binding.account_id,
+                    "account_status": target_account_status,
+                    "expected_account_status": current_account_status,
+                },
+                db=database,
+            )
+            if account_updated != 1:
+                raise AccountStatusPersistenceFailed(
+                    binding.account_id,
+                    target_account_status,
+                    "task_terminal_account_status_cas_lost",
+                    RuntimeError("account_status_cas_lost"),
                 )
         lease_id = str(row_get(row, "account_lease_id") or "").strip()
         try:
@@ -1070,9 +1168,30 @@ async def execute_dry_run(
     phases: list[str],
     *,
     platform: str = "",
+    action_plan=None,
 ):
-    if str(platform or "").strip().lower() == "xiaohongshu":
-        raise RuntimeError("xiaohongshu_manual_shadow_only")
+    normalized_platform = str(platform or "").strip().lower()
+    if normalized_platform == "weibo":
+        try:
+            preliminary_plan = validate_action_plan_v2(
+                action_plan,
+                require_executable=False,
+                reject_media=True,
+            )
+            if preliminary_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+                raise RuntimeError("weibo_manual_shadow_only")
+            validated_plan = validate_action_plan_v2(
+                action_plan,
+                reject_media=True,
+            )
+        except ActionPlanV2Error as exc:
+            raise RuntimeError(exc.code) from exc
+        if validated_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+            raise RuntimeError("weibo_execution_path_not_supported")
+        if tuple(phases) != validated_plan.required_actions:
+            raise RuntimeError("weibo_dry_run_phase_binding_mismatch")
+    elif normalized_platform in {"douyin", "xiaohongshu"}:
+        raise RuntimeError(f"{normalized_platform}_manual_shadow_only")
     for phase_name in phases:
         await asyncio.sleep(0.2)
         await save_phase(task_id, account_id, lottery_id, phase_name)
@@ -1294,10 +1413,23 @@ async def execute_shadow_run(task: dict, adapter, pool):
         selector_observation_complete = (
             bool(phases) and not missing_phases and bool(screenshot_path)
         )
-        xiaohongshu_manual_only = (
-            str(platform or "").strip().lower() == "xiaohongshu"
+        manual_confirmation_required = bool(
+            getattr(adapter, "MANUAL_CONFIRMATION_REQUIRED", False)
         )
-        qualified = selector_observation_complete and not xiaohongshu_manual_only
+        capability_block_reason = (
+            (
+                "weibo_selector_observation_only"
+                if str(platform or "").strip().lower() == "weibo"
+                else platform_real_run_block_reason(platform)
+            )
+            if manual_confirmation_required
+            else None
+        )
+        real_run_capable = (
+            capability_block_reason is None
+            and bool(getattr(adapter, "REAL_ACTIONS", False))
+        )
+        qualified = selector_observation_complete and real_run_capable
         observation_event_id = await record_event(
             aggregate="task",
             aggregate_id=task_id,
@@ -1311,13 +1443,9 @@ async def execute_shadow_run(task: dict, adapter, pool):
                 "screenshot_path": screenshot_path,
                 "qualified": qualified,
                 "selector_observation_complete": selector_observation_complete,
-                "manual_confirmation_required": xiaohongshu_manual_only,
-                "real_run_capable": not xiaohongshu_manual_only,
-                "capability_block_reason": (
-                    "xiaohongshu_no_official_interaction_api"
-                    if xiaohongshu_manual_only
-                    else None
-                ),
+                "manual_confirmation_required": manual_confirmation_required,
+                "real_run_capable": real_run_capable,
+                "capability_block_reason": capability_block_reason,
                 "side_effects": False,
             },
             correlation_id=task_id,
@@ -1711,6 +1839,12 @@ def uses_bilibili_api_real_task(task: dict) -> bool:
     return str(task.get("platform") or "").lower() == "bilibili"
 
 
+def uses_weibo_oauth_real_task(task: dict) -> bool:
+    # The real-run gate independently requires the exact OAuth execution path;
+    # this predicate only selects the platform executor after that proof.
+    return str(task.get("platform") or "").strip().lower() == "weibo"
+
+
 async def execute_bilibili_api_real_task(task: dict):
     task_id = task.get("task_id")
     account_id = int(task.get("account_id"))
@@ -2075,6 +2209,504 @@ async def execute_bilibili_api_real_task(task: dict):
             raise
         except Exception as exc:
             raise TaskSettlementUnconfirmed(task_id, exc) from exc
+
+
+async def load_weibo_oauth_credential(
+    account_id: int,
+    *,
+    expected_uid: str,
+    expected_execution_revision: int,
+):
+    """Decrypt and bind the exact OAuth credential selected by the gate."""
+
+    row = await database.fetch_one(
+        """SELECT platform, encrypted_credential, execution_revision
+             FROM accounts
+            WHERE id = :account_id AND deleted_at IS NULL""",
+        {"account_id": account_id},
+    )
+    if not row or str(row_get(row, "platform") or "").strip().lower() != "weibo":
+        raise WeiboOAuthCredentialError("weibo_oauth_account_binding_invalid")
+    try:
+        revision = int(row_get(row, "execution_revision"))
+    except (TypeError, ValueError) as exc:
+        raise WeiboOAuthCredentialError(
+            "weibo_oauth_execution_revision_mismatch"
+        ) from exc
+    if revision != expected_execution_revision:
+        raise WeiboOAuthCredentialError("weibo_oauth_execution_revision_mismatch")
+    encrypted = row_get(row, "encrypted_credential")
+    if not encrypted:
+        raise WeiboOAuthCredentialError("weibo_oauth_credential_required")
+    try:
+        decrypted = cookie_vault.decrypt(encrypted, aad=CREDENTIAL_AAD)
+    except Exception as exc:
+        # OAuth secrets never use the legacy plaintext cookie fallback.
+        raise WeiboOAuthCredentialError(
+            "weibo_oauth_credential_decryption_failed"
+        ) from exc
+    return parse_weibo_oauth_credential(decrypted, expected_uid=expected_uid)
+
+
+def _weibo_handle_identity_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+async def preflight_weibo_friend_mentions(
+    client,
+    plan,
+    *,
+    pre_resolved: dict[str, str] | None = None,
+    on_progress=None,
+) -> dict[str, str]:
+    """Resolve every constrained mention and enforce friend counts by UID.
+
+    This runs before any durable intent or mutation. Source mentions and follow
+    targets are excluded by both normalized handle identity and resolved UID so
+    aliases cannot be counted as distinct friends or disguise a brand account.
+    """
+
+    constraints = dict(plan.friend_mention_requirements or {})
+    cache: dict[str, str] = {
+        _weibo_handle_identity_key(handle): uid
+        for handle, uid in dict(pre_resolved or {}).items()
+    }
+
+    async def resolve(handle: str) -> str:
+        key = _weibo_handle_identity_key(handle)
+        if key not in cache:
+            cache[key] = await client.resolve_user_uid(handle)
+            if on_progress is not None:
+                await on_progress()
+        return cache[key]
+
+    source = dict(plan.source_content_requirements or {})
+    bound = dict(plan.content_requirements or {})
+    excluded_handles = list(source.get("follow_targets") or []) + list(
+        bound.get("follow_targets") or []
+    )
+    all_handles = list(excluded_handles)
+    for action in ("commented", "reposted"):
+        source_action = source.get(action, {})
+        if isinstance(source_action, dict):
+            all_handles.extend(source_action.get("mentions") or [])
+        all_handles.extend(plan.payload_for(action).get("mentions") or [])
+    unique_handle_keys = {
+        _weibo_handle_identity_key(handle) for handle in all_handles
+    }
+    if len(unique_handle_keys) > WEIBO_MAX_UNIQUE_HANDLES:
+        raise RuntimeError("weibo_preflight_unique_handle_limit_exceeded")
+    excluded_keys = {
+        _weibo_handle_identity_key(handle) for handle in excluded_handles
+    }
+    excluded_uids = {await resolve(handle) for handle in excluded_handles}
+
+    # Mention validity is an independent precondition, not merely an input to
+    # the optional friend-count rule.  Resolve every user identity referenced
+    # by an executable text action before any durable intent/POST is created.
+    # Otherwise a misspelled/non-existent brand mention could be accepted as
+    # plain comment text and later recorded as a successful requirement.
+    for action in ("commented", "reposted"):
+        source_action = source.get(action, {})
+        source_mentions = list(
+            source_action.get("mentions") or []
+            if isinstance(source_action, dict)
+            else []
+        )
+        source_keys = {
+            _weibo_handle_identity_key(handle) for handle in source_mentions
+        }
+        source_uids = {await resolve(handle) for handle in source_mentions}
+        payload_mentions = list(plan.payload_for(action).get("mentions") or [])
+        resolved_payload = [
+            (handle, await resolve(handle)) for handle in payload_mentions
+        ]
+        constraint = constraints.get(action)
+        if constraint is None:
+            continue
+        friend_uids = {
+            uid
+            for handle, uid in resolved_payload
+            if _weibo_handle_identity_key(handle)
+            not in source_keys | excluded_keys
+            and uid not in source_uids | excluded_uids
+        }
+        expected = int(constraint["count"])
+        satisfied = (
+            len(friend_uids) == expected
+            if constraint["mode"] == "exact"
+            else len(friend_uids) >= expected
+        )
+        if not satisfied:
+            raise RuntimeError(
+                f"weibo_friend_identity_count_mismatch:{action}"
+            )
+    return dict(cache)
+
+
+async def execute_weibo_oauth_real_task(task: dict) -> None:
+    """Execute one immutable official Weibo OAuth plan with durable fencing."""
+
+    task_id = str(task.get("task_id") or "").strip()
+    if "weibo_rip" in task:
+        raise RuntimeError("weibo_rip_plaintext_forbidden")
+    account_id = int(task.get("account_id"))
+    lottery_id = int(task.get("lottery_id"))
+    try:
+        validated_plan = validate_action_plan_v2(
+            task.get("action_plan"), reject_media=True
+        )
+    except ActionPlanV2Error as exc:
+        raise RuntimeError(exc.code) from exc
+    if validated_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+        raise RuntimeError("weibo_execution_path_not_supported")
+
+    current_phase = await get_latest_phase(task_id) or "init"
+    if current_phase == "completed":
+        return
+    if current_phase != "init":
+        # Weibo actions are journaled only in external_action_intents; the
+        # task_phases ENUM is not an action ledger (and may not contain favorite).
+        raise RuntimeError("weibo_task_phase_requires_reconciliation")
+
+    gate = await enforce_task_real_run_gate(task, require_running=True)
+    if (
+        gate.platform != "weibo"
+        or gate.execution_evidence_id
+        != str(task.get("execution_evidence_id") or "").strip()
+        or gate.oauth_capabilities is None
+        or not gate.weibo_uid
+    ):
+        raise RealRunGateBlocked("weibo_oauth_execution_binding_invalid")
+    credential = await load_weibo_oauth_credential(
+        account_id,
+        expected_uid=gate.weibo_uid,
+        expected_execution_revision=gate.execution_revision,
+    )
+    rip = decrypt_weibo_rip(
+        task.get("weibo_rip_encrypted"),
+        required=weibo_rip_required(validated_plan.required_actions),
+    )
+    canonical_identifier = status_identifier_from_canonical_uri(
+        task.get("canonical_url")
+    )
+
+    client = WeiboApiClient(
+        credential.access_token,
+        capability_attestation=gate.oauth_capabilities,
+        calibration_id=gate.execution_evidence_id,
+        account_id=account_id,
+        execution_revision=gate.execution_revision,
+        runtime_capability_requirements=(
+            validated_plan.runtime_capability_requirements
+        ),
+    )
+    current_intents: dict[str, StartedActionIntent] = {}
+    expected_mutations = {}
+
+    async def renew_preflight_leases() -> None:
+        await refresh_task_lease(task_id)
+        await renew_account_operation_lease(
+            db=database,
+            task_id=task_id,
+            account_id=account_id,
+            lottery_id=lottery_id,
+            worker_id=WORKER_ID,
+        )
+
+    async def quarantine_unknown(action: str, cause: BaseException) -> None:
+        intent = current_intents.get(action)
+        if intent is not None:
+            try:
+                await await_safety_settlement(
+                    mark_action_intent_unknown(
+                        db=database,
+                        intent=intent,
+                        reason=f"weibo_{action}_outcome_unknown",
+                    )
+                )
+            except Exception as intent_exc:
+                structured_log(
+                    "error",
+                    "external_action_intent_unknown_write_failed",
+                    task_id=task_id,
+                    action=action,
+                    exception=intent_exc,
+                )
+        await await_safety_settlement(
+            quarantine_external_action_outcome(
+                task_id=task_id,
+                account_id=account_id,
+                platform="weibo",
+                action=action,
+                cause=cause,
+            )
+        )
+
+    async def run_readonly_weibo_preflight():
+        status_id = await client.resolve_status_id(canonical_identifier)
+        await renew_preflight_leases()
+        await client.preflight_status(status_id)
+        await renew_preflight_leases()
+        follow_target_uid = None
+        if "followed" in validated_plan.required_actions:
+            follow_target_uid = await client.resolve_user_uid(
+                validated_plan.follow_target_handle
+            )
+            await renew_preflight_leases()
+        await preflight_weibo_friend_mentions(
+            client,
+            validated_plan,
+            pre_resolved=(
+                {validated_plan.follow_target_handle: follow_target_uid}
+                if follow_target_uid
+                else None
+            ),
+            on_progress=renew_preflight_leases,
+        )
+        return status_id, follow_target_uid
+
+    try:
+        await renew_preflight_leases()
+        try:
+            status_id, follow_target_uid = await asyncio.wait_for(
+                run_readonly_weibo_preflight(),
+                timeout=WEIBO_PREFLIGHT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("weibo_preflight_deadline_exceeded") from exc
+
+        # Lease renewal is liveness only. Re-read every authorization binding
+        # after the potentially long read-only preflight and before the first
+        # intent can be created.
+        post_preflight_gate = await enforce_task_real_run_gate(
+            task, require_running=True
+        )
+        credential.require_fresh(
+            min_remaining_seconds=(
+                len(validated_plan.required_actions)
+                * WEIBO_ACTION_HTTP_BUDGET_SECONDS
+                + WEIBO_ACTION_SETTLEMENT_BUFFER_SECONDS
+            )
+        )
+        if (
+            post_preflight_gate.action_plan.plan_hash != validated_plan.plan_hash
+            or post_preflight_gate.execution_evidence_id
+            != gate.execution_evidence_id
+            or post_preflight_gate.execution_revision != gate.execution_revision
+            or post_preflight_gate.weibo_uid != gate.weibo_uid
+            or post_preflight_gate.oauth_capabilities != gate.oauth_capabilities
+        ):
+            raise RealRunGateBlocked(
+                "weibo_oauth_binding_changed_during_preflight"
+            )
+
+        async def before_action(action: str) -> None:
+            action_index = validated_plan.required_actions.index(action)
+            remaining_actions = len(validated_plan.required_actions) - action_index
+            credential.require_fresh(
+                min_remaining_seconds=(
+                    remaining_actions * WEIBO_ACTION_HTTP_BUDGET_SECONDS
+                    + WEIBO_ACTION_SETTLEMENT_BUFFER_SECONDS
+                )
+            )
+            current_gate = await enforce_task_real_run_gate(
+                task, require_running=True
+            )
+            if (
+                current_gate.action_plan.plan_hash != validated_plan.plan_hash
+                or current_gate.execution_evidence_id != gate.execution_evidence_id
+                or current_gate.execution_revision != gate.execution_revision
+                or current_gate.weibo_uid != gate.weibo_uid
+                or current_gate.oauth_capabilities != gate.oauth_capabilities
+            ):
+                raise RealRunGateBlocked(
+                    "weibo_oauth_binding_changed_during_execution"
+                )
+            await refresh_task_lease(task_id)
+            await renew_account_operation_lease(
+                db=database,
+                task_id=task_id,
+                account_id=account_id,
+                lottery_id=lottery_id,
+                worker_id=WORKER_ID,
+            )
+            # Renewals are not authority. Re-read the entire gate immediately
+            # before the transaction that marks the external intent started.
+            renewed_gate = await enforce_task_real_run_gate(
+                task, require_running=True
+            )
+            if (
+                renewed_gate.action_plan.plan_hash != validated_plan.plan_hash
+                or renewed_gate.execution_evidence_id != gate.execution_evidence_id
+                or renewed_gate.execution_revision != gate.execution_revision
+                or renewed_gate.weibo_uid != gate.weibo_uid
+                or renewed_gate.oauth_capabilities != gate.oauth_capabilities
+            ):
+                raise RealRunGateBlocked(
+                    "weibo_oauth_binding_changed_during_execution"
+                )
+            intent_payload = {
+                "platform": "weibo",
+                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                "calibration_id": gate.execution_evidence_id,
+                "execution_revision": gate.execution_revision,
+                "status_id": status_id,
+                "action_payload": validated_plan.payload_for(action),
+            }
+            mutation_target = (
+                follow_target_uid if action == "followed" else status_id
+            )
+            expected_mutation = build_weibo_mutation_request(
+                action,
+                mutation_target,
+                payload=validated_plan.payload_for(action),
+                rip=(
+                    rip
+                    if action in {"followed", "commented", "reposted"}
+                    else ""
+                ),
+            )
+            expected_mutations[action] = expected_mutation
+            intent_payload["mutation_spec"] = expected_mutation.audit_spec
+            if action == "followed":
+                intent_payload["follow_target_handle"] = (
+                    validated_plan.follow_target_handle
+                )
+                intent_payload["follow_target_uid"] = follow_target_uid
+            current_intents[action] = await prepare_and_start_action_intent(
+                db=database,
+                task_id=task_id,
+                account_id=account_id,
+                lottery_id=lottery_id,
+                worker_id=WORKER_ID,
+                action=action,
+                payload=intent_payload,
+            )
+
+        async def operation_key_for(action: str) -> str:
+            intent = current_intents.get(action)
+            if intent is None:
+                raise RuntimeError("weibo_action_intent_missing")
+            return f"{intent.intent_id}:{intent.attempt_no}"
+
+        async def after_receipt(action: str, receipt) -> None:
+            intent = current_intents.get(action)
+            if intent is None:
+                raise RuntimeError("weibo_action_intent_missing")
+            expected = expected_mutations.get(action)
+            if (
+                expected is None
+                or receipt.action != action
+                or receipt.target_id != expected.target_id
+                or receipt.operation_key
+                != f"{intent.intent_id}:{intent.attempt_no}"
+                or receipt.request_payload_hash != expected.audit_spec_hash
+            ):
+                raise RuntimeError("weibo_action_receipt_binding_invalid")
+            await settle_action_intent(
+                db=database,
+                intent=intent,
+                succeeded=True,
+                outcome="ok",
+                remote_ref=receipt.remote_id,
+            )
+            current_intents.pop(action, None)
+            expected_mutations.pop(action, None)
+
+        try:
+            result = await WeiboOAuthExecutor(
+                client,
+                operation_key_for=operation_key_for,
+                before_action=before_action,
+                after_receipt=after_receipt,
+            ).execute(
+                validated_plan,
+                status_id=status_id,
+                follow_target_uid=follow_target_uid,
+                rip=rip,
+            )
+        except WeiboApiRejected as exc:
+            if not exc.confirmed_no_effect:
+                await quarantine_unknown(exc.action, exc)
+                raise ExternalActionOutcomeUnknown(
+                    "weibo", exc.action, exc
+                ) from exc
+            intent = current_intents.get(exc.action)
+            if intent is None:
+                raise
+            try:
+                await await_safety_settlement(
+                    settle_action_intent(
+                        db=database,
+                        intent=intent,
+                        succeeded=False,
+                        outcome="rejected",
+                        error_message=f"weibo_api_rejected:{exc.error_code}",
+                    )
+                )
+                current_intents.pop(exc.action, None)
+            except BaseException as settlement_exc:
+                await quarantine_unknown(exc.action, settlement_exc)
+                raise ExternalActionOutcomeUnknown(
+                    "weibo", exc.action, settlement_exc
+                ) from settlement_exc
+            raise
+        except (WeiboApiActionOutcomeUnknown, WeiboExecutionOutcomeUnknown) as exc:
+            await quarantine_unknown(exc.action, exc)
+            raise ExternalActionOutcomeUnknown("weibo", exc.action, exc) from exc
+        except asyncio.CancelledError as exc:
+            if current_intents:
+                action = next(reversed(current_intents))
+                await quarantine_unknown(action, exc)
+            raise
+        except BaseException as exc:
+            if current_intents:
+                action = next(reversed(current_intents))
+                await quarantine_unknown(action, exc)
+                raise ExternalActionOutcomeUnknown("weibo", action, exc) from exc
+            raise
+
+        try:
+            completion_event_id = await record_event(
+                aggregate="task",
+                aggregate_id=task_id,
+                event_type="WeiboOAuthRealRunExecuted",
+                payload={
+                    "account_id": account_id,
+                    "lottery_id": lottery_id,
+                    "calibration_id": gate.execution_evidence_id,
+                    "actions": list(result.receipts),
+                    "success": result.success,
+                },
+                correlation_id=task_id,
+            )
+            if not completion_event_id:
+                raise RuntimeError("weibo_completion_event_persistence_failed")
+        except BaseException as exc:
+            await quarantine_unknown("task_completion", exc)
+            raise ExternalActionOutcomeUnknown(
+                "weibo", "task_completion", exc
+            ) from exc
+        try:
+            await save_phase(task_id, account_id, lottery_id, "completed")
+        except BaseException as exc:
+            await quarantine_unknown("task_completion", exc)
+            raise ExternalActionOutcomeUnknown(
+                "weibo", "task_completion", exc
+            ) from exc
+    finally:
+        try:
+            await client.aclose()
+        except Exception as exc:
+            # Closing a socket cannot undo a durably settled remote result and
+            # must not manufacture an unknown external outcome.
+            structured_log(
+                "warning",
+                "weibo_http_client_close_failed",
+                task_id=task_id,
+                exception=exc,
+            )
 
 
 async def capture_failure_screenshot(page, task_id: str) -> str | None:
@@ -2585,17 +3217,61 @@ def validate_task_message(task: dict) -> dict:
     task["lottery_id"] = str(lottery_id)
     task["platform"] = platform
     task["mode"] = mode
-    if mode == "dry_run" and platform.lower() == "xiaohongshu":
-        # The deployed task_phases ENUM has no ``favorited`` member. Reject all
-        # Xiaohongshu dry runs before claim/save_phase so a missing or tampered
-        # plan cannot bypass the fourth-action storage limitation.
-        raise InvalidTaskMessage("xiaohongshu_manual_shadow_only")
+    normalized_platform = platform.lower()
+    if mode == "dry_run" and normalized_platform in {
+        "douyin",
+        "xiaohongshu",
+    }:
+        raise InvalidTaskMessage(f"{normalized_platform}_manual_shadow_only")
+    if mode == "dry_run" and normalized_platform == "weibo":
+        try:
+            preliminary_plan = validate_action_plan_v2(
+                task.get("action_plan"),
+                require_executable=False,
+                reject_media=True,
+            )
+            if preliminary_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+                raise InvalidTaskMessage("weibo_manual_shadow_only")
+            oauth_dry_plan = validate_action_plan_v2(
+                task.get("action_plan"),
+                reject_media=True,
+            )
+            if oauth_dry_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+                raise InvalidTaskMessage("weibo_execution_path_not_supported")
+        except ActionPlanV2Error as exc:
+            raise InvalidTaskMessage(exc.code) from exc
+    if "weibo_rip" in task:
+        # Never accept or reserialize the retired plaintext queue field.
+        task.pop("weibo_rip", None)
+        raise InvalidTaskMessage("weibo_rip_plaintext_forbidden")
+    encrypted_rip = task.get("weibo_rip_encrypted")
+    if normalized_platform == "weibo" and mode == "real_run":
+        try:
+            plan = validate_action_plan_v2(task.get("action_plan"), reject_media=True)
+            if plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+                raise InvalidTaskMessage("weibo_execution_path_not_supported")
+            rip_required = weibo_rip_required(plan.required_actions)
+            if rip_required and not isinstance(encrypted_rip, str):
+                raise InvalidTaskMessage("weibo_rip_encrypted_required")
+            if rip_required and not encrypted_rip:
+                raise InvalidTaskMessage("weibo_rip_encrypted_required")
+            if not rip_required and encrypted_rip is not None and encrypted_rip != "":
+                raise InvalidTaskMessage("weibo_rip_encrypted_not_applicable")
+            task["weibo_rip_encrypted"] = encrypted_rip or ""
+        except ActionPlanV2Error as exc:
+            raise InvalidTaskMessage(exc.code) from exc
+    elif encrypted_rip is not None and encrypted_rip != "":
+        raise InvalidTaskMessage("weibo_rip_encrypted_not_applicable")
+    else:
+        task["weibo_rip_encrypted"] = ""
     return task
 
 
 async def dead_letter_message(msg_id: str, task: dict, reason: str):
     task_id = str(task.get("task_id") or "") or None
-    payload = json.dumps(task, ensure_ascii=False)
+    sanitized_task = dict(task)
+    sanitized_task.pop("weibo_rip", None)
+    payload = json.dumps(sanitized_task, ensure_ascii=False)
     try:
         await database.execute(
             """INSERT INTO failed_task_messages (stream_key, message_id, task_id, reason, payload)
@@ -2613,6 +3289,85 @@ async def dead_letter_message(msg_id: str, task: dict, reason: str):
         structured_log("error", "dead_letter_stream_failed", message_id=msg_id, task_id=task_id, error=str(exc))
 
 
+def _canonical_task_uuid(task: dict) -> str | None:
+    """Return only the canonical UUID shape produced by Core dispatch.
+
+    A Redis message is untrusted input.  In particular, merely supplying the
+    task_id of another queued task must not grant authority to fail or release
+    that task.  This lightweight shape check is followed by an authoritative
+    database lookup and, for retained messages, Core recovery's immutable
+    outbox/gate validation.
+    """
+
+    raw_task_id = str(task.get("task_id") or "").strip().lower()
+    if not raw_task_id:
+        return None
+    try:
+        parsed = uuid.UUID(raw_task_id)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    canonical = str(parsed)
+    return canonical if raw_task_id == canonical else None
+
+
+async def invalid_task_requires_authoritative_recovery(task: dict) -> bool:
+    """Whether an invalid stream entry must remain pending for Core recovery.
+
+    We intentionally do not settle the task here.  The recovery daemon owns
+    the safe replay/terminal path: it locks the authoritative task, validates
+    the immutable outbox payload and current real-run gates, then either
+    rebuilds a clean message or marks a blocked queued task failed.  Retaining
+    only an existing active task avoids permanently orphaning legitimate work
+    without treating attacker-controlled message fields as settlement proof.
+    """
+
+    task_id = _canonical_task_uuid(task)
+    if task_id is None:
+        return False
+    row = await database.fetch_one(
+        "SELECT status FROM task_runs WHERE task_id = :task_id",
+        {"task_id": task_id},
+    )
+    return bool(
+        row
+        and str(row_get(row, "status", "") or "").strip().lower()
+        in {"queued", "running"}
+    )
+
+
+async def handle_invalid_task_message(msg_id: str, task: dict, reason: str) -> bool:
+    """Dead-letter an invalid entry and ack only when no active task needs it.
+
+    Returns ``True`` when the message was acknowledged.  Database lookup
+    failures deliberately propagate so the consumer leaves the entry pending;
+    losing observability is preferable to acknowledging the only recovery
+    trigger while authoritative state is unavailable.
+    """
+
+    await dead_letter_message(msg_id, task, reason)
+    if await invalid_task_requires_authoritative_recovery(task):
+        structured_log(
+            "warning",
+            "invalid_task_message_retained_for_authoritative_recovery",
+            message_id=msg_id,
+            task_id=_canonical_task_uuid(task),
+            reason=reason,
+        )
+        return False
+    if reason == "weibo_rip_plaintext_forbidden":
+        # XACK only removes the consumer-group pending reference; the stream
+        # entry (and therefore the retired plaintext IP) remains readable.
+        # There is no authoritative active task to recover on this branch, so
+        # delete precisely the already-dead-lettered entry before acknowledging
+        # it. If XDEL fails the entry remains pending for retry; if XACK fails
+        # after deletion, recovery can safely acknowledge the PEL tombstone.
+        # Active tasks take the retained branch above and must not be deleted
+        # until Core recovery has rebuilt or terminally settled them.
+        await redis.xdel(STREAM_KEY, msg_id)
+    await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
+    return True
+
+
 async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id: str | None = None):
     task_id = task.get("task_id")
     account_id = int(task.get("account_id"))
@@ -2621,15 +3376,33 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     completion_screenshot_path = None
     claimed = False
     try:
-        if (
-            task_mode == "dry_run"
-            and str(task.get("platform") or "").strip().lower() == "xiaohongshu"
-        ):
-            raise RuntimeError("xiaohongshu_manual_shadow_only")
+        normalized_platform = str(task.get("platform") or "").strip().lower()
+        if task_mode == "dry_run" and normalized_platform in {
+            "douyin",
+            "xiaohongshu",
+        }:
+            raise RuntimeError(f"{normalized_platform}_manual_shadow_only")
+        if task_mode == "dry_run" and normalized_platform == "weibo":
+            try:
+                dry_plan = validate_action_plan_v2(
+                    task.get("action_plan"),
+                    require_executable=False,
+                    reject_media=True,
+                )
+            except ActionPlanV2Error as exc:
+                raise RuntimeError(exc.code) from exc
+            if dry_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+                raise RuntimeError("weibo_manual_shadow_only")
+            if (
+                dry_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH
+                or dry_plan.plan.get("executable") is not True
+            ):
+                raise RuntimeError("weibo_execution_path_not_supported")
         if task_mode == "real_run":
             await enforce_task_real_run_gate(task)
             if (
                 not uses_bilibili_api_real_task(task)
+                and not uses_weibo_oauth_real_task(task)
                 and not getattr(adapter, "REAL_ACTIONS", False)
             ):
                 raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
@@ -2653,11 +3426,14 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
                 lottery_id,
                 requested_phases(task, require_plan=False),
                 platform=task.get("platform", ""),
+                action_plan=task.get("action_plan"),
             )
         elif task_mode == "shadow_run":
             completion_screenshot_path = await execute_shadow_run(task, adapter, pool)
         elif uses_bilibili_api_real_task(task):
             await execute_bilibili_api_real_task(task)
+        elif uses_weibo_oauth_real_task(task):
+            await execute_weibo_oauth_real_task(task)
         else:
             await execute_real_task(task, adapter, pool)
         try:
@@ -2750,6 +3526,9 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
                         BilibiliActionSettlementFailed,
                     ),
                 ),
+                account_failure_status=(
+                    e.account_status if isinstance(e, WeiboApiRejected) else None
+                ),
             )
             if settled is False:
                 structured_log(
@@ -2800,9 +3579,16 @@ async def task_loop(pool: BrowserPool, shutdown_event: asyncio.Event):
                 try:
                     task = validate_task_message(task)
                 except InvalidTaskMessage as exc:
-                    await dead_letter_message(msg_id, task, str(exc))
-                    await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
-                    structured_log("error", "task_message_dead_lettered", message_id=msg_id, reason=str(exc))
+                    acknowledged = await handle_invalid_task_message(
+                        msg_id, task, str(exc)
+                    )
+                    structured_log(
+                        "error",
+                        "task_message_dead_lettered",
+                        message_id=msg_id,
+                        reason=str(exc),
+                        acknowledged=acknowledged,
+                    )
                     continue
                 selector_config = parse_json_field(task.get("selector_config")) or {}
                 success = await execute_task_with_phases(task, get_adapter(task.get("platform", "bilibili"), selector_config), pool, str(msg_id))
@@ -2842,11 +3628,15 @@ def requested_phases(task: dict, require_plan: bool) -> list[str]:
     if not isinstance(plan, dict):
         plan = {}
     actions = plan.get("required_actions")
-    phase_order = (
-        XIAOHONGSHU_PHASE_ORDER
-        if str(task.get("platform") or "").strip().lower() == "xiaohongshu"
-        else PHASE_ORDER
-    )
+    normalized_platform = str(task.get("platform") or "").strip().lower()
+    if normalized_platform == "xiaohongshu":
+        phase_order = XIAOHONGSHU_PHASE_ORDER
+    elif normalized_platform == "douyin":
+        phase_order = DOUYIN_PHASE_ORDER
+    elif normalized_platform == "weibo":
+        phase_order = WEIBO_PHASE_ORDER
+    else:
+        phase_order = PHASE_ORDER
     phases = [
         phase
         for phase in phase_order

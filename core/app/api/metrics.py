@@ -18,6 +18,10 @@ from app.event_store.service import record_event
 from app.api.notify import configured_channels
 from app.models.schemas import RealRunSettingUpdate, RuntimeRollbackRequest
 from app.platforms import get_platforms
+from app.action_plan import action_order_for_platform
+from app.services.real_run_readiness import (
+    validate_weibo_oauth_capability_attestation,
+)
 from app.security import audit_event, is_real_run_enabled, require_confirmation, require_min_role, set_runtime_setting
 
 from app.utils.log import structured_log
@@ -64,6 +68,42 @@ def _worker_gate_contract():
         "process_capability_required": True,
         "recheck_points": ["before_task_claim", "before_each_external_mutation"],
         "setting_change_cancels_tasks": False,
+    }
+
+
+def weibo_oauth_capability_summary(rows) -> dict:
+    """Summarize generic platform readiness without overstating partial grants."""
+
+    actions = action_order_for_platform("weibo")
+    action_accounts = {action: 0 for action in actions}
+    any_action_accounts = 0
+    full_action_accounts = 0
+    for row in rows:
+        ready_actions = []
+        for action in actions:
+            attestation = validate_weibo_oauth_capability_attestation(
+                row["result"],
+                required_actions=(action,),
+                account_id=int(row["id"]),
+                execution_revision=int(row["execution_revision"] or 0),
+                calibration_fresh=bool(row["calibration_fresh"]),
+            )
+            if attestation["ready"]:
+                ready_actions.append(action)
+                action_accounts[action] += 1
+        any_action_accounts += int(bool(ready_actions))
+        full_attestation = validate_weibo_oauth_capability_attestation(
+            row["result"],
+            required_actions=actions,
+            account_id=int(row["id"]),
+            execution_revision=int(row["execution_revision"] or 0),
+            calibration_fresh=bool(row["calibration_fresh"]),
+        )
+        full_action_accounts += int(full_attestation["ready"])
+    return {
+        "full_action_accounts": full_action_accounts,
+        "any_action_accounts": any_action_accounts,
+        "action_accounts": action_accounts,
     }
 
 
@@ -130,6 +170,8 @@ async def readiness():
 
     for platform, cfg in get_platforms().items():
 
+        dry_run_supported = cfg.get("execution_mode") != "manual_assisted"
+
         safe_accounts = await database.fetch_one(
 
             """SELECT COUNT(*) AS cnt FROM accounts a
@@ -166,7 +208,46 @@ async def readiness():
         runtime_adapter_ready = platform_selectors_complete(selector_config, platform)
         adapter_kind = platform_real_adapter_kind(selector_config, platform)
         action_adapter_enabled = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
-        probe_ready = platform_probe_ready_for_real_actions(platform, probe_summary)
+        oauth_capability_accounts = 0
+        oauth_any_capability_accounts = 0
+        oauth_capability_actions = (
+            {action: 0 for action in action_order_for_platform("weibo")}
+            if platform == "weibo"
+            else {}
+        )
+        if platform == "weibo":
+            oauth_rows = await database.fetch_all(
+                """SELECT a.id, a.execution_revision, c.result,
+                          (c.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS calibration_fresh
+                     FROM accounts a
+                     JOIN account_calibrations c
+                       ON c.id = (
+                         SELECT latest.id
+                         FROM account_calibrations latest
+                         WHERE latest.account_id = a.id
+                           AND latest.platform = 'weibo'
+                         ORDER BY latest.id DESC
+                         LIMIT 1
+                       )
+                    WHERE a.platform = 'weibo'
+                      AND a.status = 'ready'
+                      AND a.deleted_at IS NULL
+                      AND OCTET_LENGTH(a.encrypted_credential) > 0
+                      AND c.status = 'succeeded'"""
+            )
+            capability_summary = weibo_oauth_capability_summary(oauth_rows)
+            oauth_capability_accounts = capability_summary[
+                "full_action_accounts"
+            ]
+            oauth_any_capability_accounts = capability_summary[
+                "any_action_accounts"
+            ]
+            oauth_capability_actions = capability_summary["action_accounts"]
+        probe_ready = (
+            oauth_capability_accounts > 0
+            if adapter_kind == "oauth"
+            else platform_probe_ready_for_real_actions(platform, probe_summary)
+        )
         real_actions_ready = action_adapter_enabled and probe_ready
 
         blockers = []
@@ -182,7 +263,12 @@ async def readiness():
             blockers.append("real adapter not enabled")
             blocker_codes.append("real_adapter_not_enabled")
 
-        if action_adapter_enabled and not real_actions_ready:
+        if adapter_kind == "oauth" and not oauth_capability_accounts:
+
+            blockers.append("official OAuth capability evidence is missing")
+            blocker_codes.append("weibo_oauth_capability_evidence_required")
+
+        elif action_adapter_enabled and not real_actions_ready:
 
             blockers.append("adapter probe is incomplete")
             blocker_codes.append("adapter_probe_incomplete")
@@ -206,10 +292,22 @@ async def readiness():
 
                 "cookie_login": bool(cfg.get("cookie_login")),
 
-                "adapter_status": "configured" if action_adapter_enabled else cfg.get("adapter_status", "planned"),
+                "adapter_status": (
+                    cfg.get("adapter_status", "planned")
+                    if adapter_kind in {"oauth", "manual_assisted"}
+                    else (
+                        "configured"
+                        if action_adapter_enabled
+                        else cfg.get("adapter_status", "planned")
+                    )
+                ),
                 "adapter_kind": adapter_kind,
 
                 "action_adapter": action_adapter_enabled,
+                "selector_observation_configured": runtime_adapter_ready,
+                "oauth_capability_accounts": oauth_capability_accounts,
+                "oauth_any_capability_accounts": oauth_any_capability_accounts,
+                "oauth_capability_actions": oauth_capability_actions,
 
                 "real_actions_ready": real_actions_ready,
 
@@ -230,7 +328,9 @@ async def readiness():
                 "blockers": blockers,
                 "blocker_codes": blocker_codes,
 
-                "ready_for_dry_run": bool(safe_accounts["cnt"]),
+                "dry_run_supported": dry_run_supported,
+                "ready_for_dry_run": dry_run_supported and bool(safe_accounts["cnt"]),
+                "ready_for_shadow_run": bool(safe_accounts["cnt"]),
 
                 "ready_for_real_run": real_run_enabled and real_actions_ready and bool(safe_accounts["cnt"]),
 
@@ -265,6 +365,8 @@ async def readiness():
     summary = {
 
         "platforms_total": len(platforms),
+
+        "dry_run_supported": sum(1 for item in platforms if item["dry_run_supported"]),
 
         "dry_run_ready": sum(1 for item in platforms if item["ready_for_dry_run"]),
 
@@ -498,7 +600,23 @@ def build_next_actions(platforms, summary):
 
             })
 
-        if platform["action_adapter"] and platform.get("adapter_kind") != "api" and not platform["real_actions_ready"]:
+        if platform.get("adapter_kind") == "oauth" and not platform["real_actions_ready"]:
+
+            actions.append({
+
+                "code": "configure_weibo_oauth",
+
+                "priority": "P0",
+
+                "target": platform["platform"],
+
+                "title": f"Authorize official OAuth actions for {platform['label']}",
+
+                "detail": "Configure an approved OAuth application and refresh account-bound capability evidence. Advanced like/follow permissions remain denied until explicitly granted.",
+
+            })
+
+        if platform["action_adapter"] and platform.get("adapter_kind") == "selector" and not platform["real_actions_ready"]:
 
             actions.append({
 
@@ -514,7 +632,7 @@ def build_next_actions(platforms, summary):
 
             })
 
-        if not platform["action_adapter"]:
+        if not platform["action_adapter"] and platform.get("adapter_kind") != "manual_assisted":
 
             actions.append({
 
@@ -714,6 +832,7 @@ def strategy_item(code, priority, target, title, detail, evidence):
 def build_production_checks(platforms, summary):
     platform_count = summary.get("platforms_total", 0)
     dry_ready = summary.get("dry_run_ready", 0)
+    dry_supported = summary.get("dry_run_supported", platform_count)
     real_ready = summary.get("real_run_ready", 0)
     safe_accounts = summary.get("safe_accounts_total", 0)
     checks = [
@@ -748,9 +867,9 @@ def build_production_checks(platforms, summary):
         {
             "code": "all_platforms_dry_ready",
             "priority": "P0",
-            "passed": platform_count > 0 and dry_ready == platform_count,
-            "title": "All platforms have calibrated accounts for dry-run dispatch",
-            "detail": f"{dry_ready}/{platform_count} platform(s) are dry-run ready.",
+            "passed": dry_supported > 0 and dry_ready == dry_supported,
+            "title": "All dry-run-capable platforms have calibrated accounts",
+            "detail": f"{dry_ready}/{dry_supported} dry-run-capable platform(s) are ready.",
         },
         {
             "code": "real_run_available",

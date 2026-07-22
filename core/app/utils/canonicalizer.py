@@ -6,6 +6,8 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 from dataclasses import dataclass
 
+from app.utils.lottery_targets import is_weibo_status_id
+
 
 
 @dataclass(frozen=True)
@@ -146,12 +148,25 @@ class WeiboCanonicalizer:
         host = (parsed.hostname or "").rstrip(".").lower()
         path_parts = [part for part in parsed.path.split("/") if part]
 
-        if host == "m.weibo.cn" and len(path_parts) == 2 and path_parts[0] in {"status", "detail"}:
+        if (
+            host == "m.weibo.cn"
+            and len(path_parts) == 2
+            and path_parts[0] in {"status", "detail"}
+            and is_weibo_status_id(path_parts[1])
+        ):
             return CanonicalURL("weibo", "status", path_parts[1])
         if host in {"weibo.com", "www.weibo.com"}:
-            if len(path_parts) == 2 and path_parts[0] == "detail":
+            if (
+                len(path_parts) == 2
+                and path_parts[0] == "detail"
+                and is_weibo_status_id(path_parts[1])
+            ):
                 return CanonicalURL("weibo", "status", path_parts[1])
-            if len(path_parts) == 2 and path_parts[0].isdigit():
+            if (
+                len(path_parts) == 2
+                and path_parts[0].isdigit()
+                and is_weibo_status_id(path_parts[1])
+            ):
                 return CanonicalURL("weibo", "status", path_parts[1])
         raise ValueError(f"Cannot canonicalize: {raw_url}")
 
@@ -183,6 +198,13 @@ class DouyinCanonicalizer:
         if host in {"douyin.com", "www.douyin.com"}:
             if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
                 return CanonicalURL("douyin", "video", path_parts[1])
+            if (
+                host == "www.douyin.com"
+                and len(path_parts) == 2
+                and path_parts[0] == "note"
+                and re.fullmatch(r"\d{19}", path_parts[1])
+            ):
+                return CanonicalURL("douyin", "note", path_parts[1])
         if host == "www.iesdouyin.com":
             if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():
                 return CanonicalURL("douyin", "video", path_parts[2])

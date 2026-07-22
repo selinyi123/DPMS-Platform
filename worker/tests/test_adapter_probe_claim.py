@@ -23,6 +23,7 @@ stub_worker_runtime_dependencies()
 from app.action_plan import (  # noqa: E402
     compute_action_plan_hash,
     compute_bilibili_api_config_hash,
+    compute_config_hash,
     compute_rule_hash,
     compute_target_hash,
 )
@@ -214,6 +215,118 @@ class AdapterProbeClaimTests(unittest.IsolatedAsyncioTestCase):
                         await claim_probe(self.message())
 
 
+class ManualAdapterProbeClaimTests(unittest.IsolatedAsyncioTestCase):
+    PLATFORM = "douyin"
+    DOUYIN_ID = "1234567890123456789"
+    RAW_URL = f"https://www.douyin.com/video/{DOUYIN_ID}"
+    CANONICAL_URL = f"canonical://douyin/video/{DOUYIN_ID}"
+    SELECTORS = {
+        "followed": ["button.follow"],
+        "liked": ["button.like"],
+        "commented": {"input": ["textarea"], "submit": ["button.publish"]},
+        "favorited": {"done": ["[data-state='collected']"]},
+        "reposted": {"done": ["[data-state='reposted']"]},
+    }
+
+    def database(self):
+        fake = FakeProbeDatabase()
+        fake.row.update(
+            {
+                "platform": self.PLATFORM,
+                "target_url": self.RAW_URL,
+                "execution_path_id": f"{self.PLATFORM}_selector_v1",
+                "rule_snapshot_id": None,
+                "target_hash": compute_target_hash(self.CANONICAL_URL),
+                "rule_hash": None,
+                "action_plan_hash": None,
+                "config_hash": compute_config_hash(
+                    {
+                        "platform": self.PLATFORM,
+                        "execution_revision": 3,
+                        "selector_config": self.SELECTORS,
+                    }
+                ),
+                "lottery_platform": self.PLATFORM,
+                "lottery_raw_url": self.RAW_URL,
+                "canonical_url": self.CANONICAL_URL,
+                "account_platform": self.PLATFORM,
+            }
+        )
+        original_fetch_one = fake.fetch_one
+
+        async def fetch_one(query, values=None):
+            if "FROM adapter_selector_configs" in query:
+                return {"config_json": json.dumps(self.SELECTORS)}
+            return await original_fetch_one(query, values)
+
+        fake.fetch_one = fetch_one
+        return fake
+
+    def message(self):
+        return {
+            "probe_id": "probe-1",
+            "platform": self.PLATFORM,
+            "account_id": "7",
+            "lottery_id": "11",
+            "target_url": self.RAW_URL,
+            "canonical_url": self.CANONICAL_URL,
+            "execution_path_id": f"{self.PLATFORM}_selector_v1",
+            "rule_snapshot_id": "",
+            "target_hash": compute_target_hash(self.CANONICAL_URL),
+            "rule_hash": "",
+            "action_plan_hash": "",
+            "config_hash": compute_config_hash(
+                {
+                    "platform": self.PLATFORM,
+                    "execution_revision": 3,
+                    "selector_config": self.SELECTORS,
+                }
+            ),
+            "execution_revision": "3",
+            "account_lease_id": "lease-probe",
+            "account_lease_generation": "4",
+        }
+
+    async def test_claim_binds_database_selector_snapshot(self):
+        fake = self.database()
+        with patch("app.adapter_probe.database", fake):
+            binding = await claim_probe(self.message())
+        self.assertEqual(binding["selector_config"], self.SELECTORS)
+        self.assertEqual(binding["execution_revision"], 3)
+
+    async def test_changed_selector_snapshot_rejects_stale_probe(self):
+        fake = self.database()
+        stale = self.message()
+        fake.row["config_hash"] = stale["config_hash"]
+        changed = {**self.SELECTORS, "liked": ["button.like.changed"]}
+
+        async def changed_fetch_one(query, values=None):
+            if "FROM adapter_selector_configs" in query:
+                return {"config_json": json.dumps(changed)}
+            if "FROM adapter_calibrations ac" in query:
+                return dict(fake.row)
+            if "ROW_COUNT()" in query:
+                return {"affected": fake.affected}
+            raise AssertionError(f"unexpected query: {query}")
+
+        fake.fetch_one = changed_fetch_one
+        with patch("app.adapter_probe.database", fake):
+            with self.assertRaisesRegex(ValueError, "adapter_probe_selector_binding_mismatch"):
+                await claim_probe(stale)
+
+
+class WeiboAdapterProbeClaimTests(ManualAdapterProbeClaimTests):
+    PLATFORM = "weibo"
+    RAW_URL = "https://weibo.com/123456/PCAGRFqKj"
+    CANONICAL_URL = "canonical://weibo/status/PCAGRFqKj"
+    SELECTORS = {
+        "followed": ["button.follow"],
+        "liked": ["button.like"],
+        "commented": {"input": ["textarea"], "submit": ["button.publish"]},
+        "reposted": ["button.repost"],
+    }
+
+
 class AdapterProbeSummaryTests(unittest.TestCase):
     @staticmethod
     def visible(selector: str) -> dict:
@@ -231,9 +344,12 @@ class AdapterProbeSummaryTests(unittest.TestCase):
         }
         summary = summarize_probe_result("weibo", result)
         self.assertTrue(summary["selector_observation_complete"])
+        self.assertFalse(summary["ready_for_real_actions"])
+        self.assertFalse(summary["real_run_capable"])
+        self.assertTrue(summary["manual_confirmation_required"])
         self.assertEqual(
-            summary["ready_for_real_actions"],
-            summary["selector_observation_complete"],
+            summary["capability_block_reason"],
+            "weibo_selector_observation_only",
         )
 
 

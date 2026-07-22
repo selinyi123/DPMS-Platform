@@ -1,4 +1,10 @@
+import re
 from urllib.parse import urlparse
+
+
+WEIBO_MBLOGID_PATTERN = re.compile(r"(?=.*[A-Za-z])[A-Za-z0-9]{6,16}")
+WEIBO_MID_PATTERN = re.compile(r"[1-9][0-9]{0,18}", re.ASCII)
+WEIBO_MAX_STATUS_ID = (1 << 63) - 1
 
 
 PLATFORM_ALLOWED_NAVIGATION_HOSTS = {
@@ -85,9 +91,19 @@ def _parse_canonical_content_uri(platform: str, canonical_uri: str) -> tuple[str
         "bilibili": {"dynamic", "video", "article"},
         "weibo": {"status"},
         "xiaohongshu": {"note"},
-        "douyin": {"video"},
+        "douyin": {"video", "note"},
     }
     if resource_type not in allowed_types.get(platform, set()) or not resource_id:
+        raise ValueError("platform_navigation_canonical_identity_invalid")
+    if platform == "weibo" and resource_type == "status" and not _is_weibo_status_id(
+        resource_id
+    ):
+        raise ValueError("platform_navigation_canonical_identity_invalid")
+    if (
+        platform == "douyin"
+        and resource_type == "note"
+        and (len(resource_id) != 19 or not resource_id.isdigit())
+    ):
         raise ValueError("platform_navigation_canonical_identity_invalid")
     return resource_type, resource_id
 
@@ -113,10 +129,18 @@ def _content_identity_from_https_url(platform: str, value: str) -> tuple[str, st
         return None
 
     if platform == "weibo":
-        if host == "m.weibo.cn" and len(parts) == 2 and parts[0] in {"status", "detail"}:
+        if (
+            host == "m.weibo.cn"
+            and len(parts) == 2
+            and parts[0] in {"status", "detail"}
+            and _is_weibo_status_id(parts[1])
+        ):
             return "status", parts[1]
         if host in {"weibo.com", "www.weibo.com"} and len(parts) == 2:
-            if parts[0] == "detail" or parts[0].isdigit():
+            if (
+                (parts[0] == "detail" or parts[0].isdigit())
+                and _is_weibo_status_id(parts[1])
+            ):
                 return "status", parts[1]
         return None
 
@@ -143,6 +167,14 @@ def _content_identity_from_https_url(platform: str, value: str) -> tuple[str, st
             and parts[2].isdigit()
         ):
             return "video", parts[2]
+        if (
+            host == "www.douyin.com"
+            and len(parts) == 2
+            and parts[0] == "note"
+            and len(parts[1]) == 19
+            and parts[1].isdigit()
+        ):
+            return "note", parts[1]
         return None
 
     return None
@@ -155,6 +187,16 @@ def _normalized_content_id(platform: str, resource_type: str, value: str) -> str
     if platform == "xiaohongshu" and resource_type == "note":
         return normalized.lower()
     return normalized
+
+
+def _is_weibo_status_id(value: str) -> bool:
+    return bool(
+        (
+            WEIBO_MID_PATTERN.fullmatch(value)
+            and int(value) <= WEIBO_MAX_STATUS_ID
+        )
+        or WEIBO_MBLOGID_PATTERN.fullmatch(value)
+    )
 
 
 async def install_main_frame_navigation_guard(

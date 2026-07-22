@@ -103,6 +103,12 @@ class WeiboCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail.to_uri(), mobile.to_uri())
         self.assertEqual("canonical://weibo/status/4890123456789012", detail.to_uri())
 
+    async def test_canonicalizes_official_ten_digit_numeric_status_example(self):
+        result = await WeiboCanonicalizer.canonicalize(
+            "https://m.weibo.cn/status/7987885345"
+        )
+        self.assertEqual("canonical://weibo/status/7987885345", result.to_uri())
+
     async def test_rejects_profile_url(self):
         with self.assertRaises(ValueError):
             await WeiboCanonicalizer.canonicalize("https://weibo.com/u/3937348351")
@@ -138,6 +144,19 @@ class DouyinCanonicalizerTests(unittest.IsolatedAsyncioTestCase):
         web = await DouyinCanonicalizer.canonicalize("https://www.douyin.com/video/7300000000000000000")
         share = await DouyinCanonicalizer.canonicalize("https://www.iesdouyin.com/share/video/7300000000000000000/")
         self.assertEqual(web.to_uri(), share.to_uri())
+
+    async def test_canonicalizes_note_url(self):
+        result = await DouyinCanonicalizer.canonicalize(
+            "https://www.douyin.com/note/7659275356428852849"
+        )
+
+        self.assertEqual(
+            "canonical://douyin/note/7659275356428852849", result.to_uri()
+        )
+
+    async def test_rejects_malformed_note_id(self):
+        with self.assertRaises(ValueError):
+            await DouyinCanonicalizer.canonicalize("https://www.douyin.com/note/1")
 
     async def test_rejects_profile_url(self):
         with self.assertRaises(ValueError):

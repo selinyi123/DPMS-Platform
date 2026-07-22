@@ -436,7 +436,14 @@ class FakeDatabase:
         elif "UPDATE lotteries SET status = :status" in query:
             self.lottery_status = values.get("status")
             self.lottery_execution_lock = None
-        if "UPDATE accounts SET status = 'cooling'" in query and self.account_status == "executing":
+        if (
+            "UPDATE accounts SET status = :account_status" in query
+            and self.account_status == values.get("expected_account_status")
+        ):
+            self.account_status = values.get("account_status")
+        elif "UPDATE accounts SET status = :account_status" in query:
+            self._last_affected_rows = 0
+        elif "UPDATE accounts SET status = 'cooling'" in query and self.account_status == "executing":
             self.account_status = "cooling"
         elif "UPDATE accounts" in query and "SET status = 'executing'" in query:
             self.account_status = "executing"

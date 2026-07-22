@@ -248,6 +248,24 @@ class WeiboLotteryRuleTests(unittest.TestCase):
         plan = parse_lottery_rule("今天天气不错，分享一下心情。", "weibo")
 
         self.assertFalse(plan["is_lottery"])
+
+    def test_weibo_prize_wording_identifies_realistic_lotteries(self):
+        cases = (
+            "带话题#ASUS翻转夏日#并@ASUS华硕官方UP晒图，赢ROG键盘！关注@ASUS华硕官方UP+转评赞本条动态",
+            "关注并转发，评论区抽一位送同款键盘",
+            "关注+转评赞，送出奖品一份",
+            "关注点赞评论转发，抽ROG键盘",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertTrue(parse_lottery_rule(text, "weibo")["is_lottery"])
+
+    def test_weibo_non_lottery_keyboard_review_is_not_misclassified(self):
+        plan = parse_lottery_rule(
+            "今天抽空评测ROG键盘，欢迎关注点赞评论转发。",
+            "weibo",
+        )
+        self.assertFalse(plan["is_lottery"])
         self.assertTrue(plan["review_required"])
 
 
@@ -321,6 +339,48 @@ class DouyinLotteryRuleTests(unittest.TestCase):
         self.assertTrue(plan["is_lottery"])
         self.assertEqual({"followed", "liked", "commented", "reposted"}, set(plan["required_actions"]))
         self.assertFalse(plan["review_required"])
+
+    def test_favorite_and_repost_are_not_interchangeable(self):
+        favorite = parse_lottery_rule(
+            "抽奖福利：关注+点赞+评论+收藏本视频，抽2位粉丝", "douyin"
+        )
+        repost = parse_lottery_rule(
+            "抽奖福利：关注+点赞+评论+转发本视频，抽2位粉丝", "douyin"
+        )
+
+        self.assertIn("favorited", favorite["required_actions"])
+        self.assertNotIn("reposted", favorite["required_actions"])
+        self.assertIn("reposted", repost["required_actions"])
+        self.assertNotIn("favorited", repost["required_actions"])
+
+        both = parse_lottery_rule(
+            "抽奖福利：关注+点赞+评论+收藏本视频并转发本视频，抽2位粉丝",
+            "douyin",
+        )
+        self.assertIn("favorited", both["required_actions"])
+        self.assertIn("reposted", both["required_actions"])
+
+    def test_comment_word_share_does_not_invent_repost_action(self):
+        plan = parse_lottery_rule(
+            "抽奖福利：关注点赞，评论区分享你的夏日故事。", "douyin"
+        )
+
+        self.assertIn("commented", plan["required_actions"])
+        self.assertNotIn("reposted", plan["required_actions"])
+        self.assertIn("comment_content", plan["unsupported_actions"])
+
+    def test_topic_and_mention_are_bound_to_comment_requirements(self):
+        plan = parse_lottery_rule(
+            "抽奖：关注点赞收藏，评论带#夏日好物#并@品牌官方。", "douyin"
+        )
+
+        self.assertEqual(
+            ["#夏日好物#"], plan["content_requirements"]["commented"]["topic_tags"]
+        )
+        self.assertEqual(
+            ["@品牌官方"], plan["content_requirements"]["commented"]["mentions"]
+        )
+        self.assertTrue(plan["review_required"])
 
     def test_marks_ambiguous_rule_for_review(self):
         plan = parse_lottery_rule("抽奖：评论区留言即可，关注点赞可选。", "douyin")

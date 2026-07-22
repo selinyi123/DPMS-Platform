@@ -104,11 +104,29 @@ class LotteryTargetValidationTests(unittest.TestCase):
             "https://weibo.com/detail/4890123456789012",
             "https://m.weibo.cn/status/4890123456789012",
             "https://m.weibo.cn/detail/PCAGRFqKj",
+            # Official statuses/queryid documentation uses this 10-digit MID.
+            "https://m.weibo.cn/status/7987885345",
+            "https://weibo.com/detail/9223372036854775807",
         ):
             with self.subTest(url=url):
                 result = validate_lottery_target("weibo", url)
                 self.assertTrue(result.valid)
                 self.assertEqual("status", result.kind)
+
+    def test_rejects_noncanonical_or_out_of_range_weibo_numeric_status_ids(self):
+        for value in (
+            "0",
+            "01",
+            "9223372036854775808",
+            "\uff17\uff19\uff18\uff17\uff18\uff18\uff15\uff13\uff14\uff15",
+        ):
+            with self.subTest(value=value):
+                result = validate_lottery_target(
+                    "weibo",
+                    f"https://m.weibo.cn/status/{value}",
+                )
+                self.assertFalse(result.valid)
+                self.assertEqual("weibo_actionable_url_required", result.reason)
 
     def test_accepts_weibo_short_link(self):
         result = validate_lottery_target("weibo", "https://t.cn/A6abcdef")
@@ -165,6 +183,20 @@ class LotteryTargetValidationTests(unittest.TestCase):
                 result = validate_lottery_target("douyin", url)
                 self.assertTrue(result.valid)
                 self.assertEqual("video", result.kind)
+
+    def test_accepts_douyin_note_url(self):
+        result = validate_lottery_target(
+            "douyin", "https://www.douyin.com/note/7659275356428852849"
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual("note", result.kind)
+
+    def test_rejects_malformed_douyin_note_id(self):
+        result = validate_lottery_target("douyin", "https://www.douyin.com/note/1")
+
+        self.assertFalse(result.valid)
+        self.assertEqual("douyin_actionable_url_required", result.reason)
 
     def test_accepts_douyin_short_link(self):
         result = validate_lottery_target("douyin", "https://v.douyin.com/abc123/")

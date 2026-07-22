@@ -6,13 +6,20 @@ const DISPATCH_MODES = new Set(['dry_run', 'shadow_run', 'real_run']);
 const CANONICAL_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
 const DEFAULT_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
 const XIAOHONGSHU_FOUR_ACTIONS = ['followed', 'liked', 'commented', 'favorited'];
+const DOUYIN_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
+const WEIBO_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
+export const WEIBO_MAX_UNIQUE_HANDLES = 32;
 const TEXT_ACTIONS = new Set(['commented', 'reposted']);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const HANDLE_PATTERN = /^@[\w\u4e00-\u9fff-]{1,64}$/u;
+const HANDLE_PATTERN = /^@[\p{L}\p{N}_-]{1,64}$/u;
+const MENTION_IN_TEXT_PATTERN = /@[\p{L}\p{N}_-]{1,64}(?![\p{L}\p{N}_-])/gu;
 const CONTENT_REQUIREMENT_ACTIONS = ['commented', 'reposted'];
 const CONTENT_REQUIREMENT_FIELDS = ['topic_tags', 'mentions'];
 export const BILIBILI_EXECUTION_PATH_ID = 'bilibili_api_v2';
 export const XIAOHONGSHU_EXECUTION_PATH_ID = 'xiaohongshu_manual_v1';
+export const DOUYIN_EXECUTION_PATH_ID = 'douyin_manual_v1';
+export const WEIBO_OAUTH_EXECUTION_PATH_ID = 'weibo_oauth_v1';
+export const WEIBO_MANUAL_EXECUTION_PATH_ID = 'weibo_manual_v1';
 const UNBOUND_EXECUTION_EVIDENCE_BLOCKERS = new Set([
   'api_path_probe_evidence_not_implemented',
   'selector_config_evidence_binding_not_implemented',
@@ -21,6 +28,20 @@ const XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS = new Set([
   'xiaohongshu_no_official_interaction_api',
   'xiaohongshu_manual_only',
 ]);
+const DOUYIN_EXPECTED_MANUAL_BLOCKERS = new Set([
+  'douyin_no_official_interaction_api',
+  'douyin_manual_only',
+]);
+const WEIBO_EXPECTED_MANUAL_BLOCKERS = new Set([
+  'weibo_manual_execution_selected',
+]);
+const WEIBO_ACTION_CAPABILITY_REQUIREMENTS = {
+  followed: { endpoint: 'friendships/create', permission: 'advanced', client_type: 'weibo' },
+  liked: { endpoint: 'attitudes/create', permission: 'advanced' },
+  commented: { endpoint: 'comments/create', permission: 'standard' },
+  favorited: { endpoint: 'favorites/create', permission: 'standard' },
+  reposted: { endpoint: 'statuses/repost', permission: 'standard' },
+};
 
 export function targetTransportCompatibilityIssue(platform, rawUrl) {
   try {
@@ -32,12 +53,28 @@ export function targetTransportCompatibilityIssue(platform, rawUrl) {
 }
 
 export function lotteryActionsForPlatform(platform) {
-  return normalizePlatform(platform) === 'xiaohongshu'
-    ? [...XIAOHONGSHU_FOUR_ACTIONS]
-    : [...DEFAULT_LOTTERY_ACTIONS];
+  const normalizedPlatform = normalizePlatform(platform);
+  if (normalizedPlatform === 'xiaohongshu') return [...XIAOHONGSHU_FOUR_ACTIONS];
+  if (normalizedPlatform === 'douyin') return [...DOUYIN_LOTTERY_ACTIONS];
+  if (normalizedPlatform === 'weibo') return [...WEIBO_LOTTERY_ACTIONS];
+  return [...DEFAULT_LOTTERY_ACTIONS];
 }
 
-export function isManualAssistedPlatform(platform) {
+export function isManualAssistedPlatform(platform, executionPathId = '') {
+  const normalizedPlatform = normalizePlatform(platform);
+  if (['douyin', 'xiaohongshu'].includes(normalizedPlatform)) return true;
+  return normalizedPlatform === 'weibo'
+    && String(executionPathId || '').trim() === WEIBO_MANUAL_EXECUTION_PATH_ID;
+}
+
+export function isManualAssistedPlan(platform, planOrExecutionPath = '') {
+  const executionPathId = planOrExecutionPath && typeof planOrExecutionPath === 'object'
+    ? planOrExecutionPath.execution_path_id
+    : planOrExecutionPath;
+  return isManualAssistedPlatform(platform, executionPathId);
+}
+
+export function isFixedManualActionPlatform(platform) {
   return normalizePlatform(platform) === 'xiaohongshu';
 }
 
@@ -45,14 +82,22 @@ export function platformExecutionPathId(platform, currentExecutionPathId = '') {
   const normalizedPlatform = normalizePlatform(platform);
   if (normalizedPlatform === 'bilibili') return BILIBILI_EXECUTION_PATH_ID;
   if (normalizedPlatform === 'xiaohongshu') return XIAOHONGSHU_EXECUTION_PATH_ID;
+  if (normalizedPlatform === 'douyin') return DOUYIN_EXECUTION_PATH_ID;
+  if (normalizedPlatform === 'weibo') {
+    const current = String(currentExecutionPathId || '').trim();
+    return [WEIBO_OAUTH_EXECUTION_PATH_ID, WEIBO_MANUAL_EXECUTION_PATH_ID].includes(current)
+      ? current
+      : WEIBO_OAUTH_EXECUTION_PATH_ID;
+  }
   return String(currentExecutionPathId || '').trim();
 }
 
-export function platformDispatchBlocker(platform, mode) {
+export function platformDispatchBlocker(platform, mode, executionPathId = '') {
+  const normalizedPlatform = normalizePlatform(platform);
   const normalizedMode = String(mode || '').trim().toLowerCase();
-  if (!isManualAssistedPlatform(platform)) return null;
-  if (normalizedMode === 'real_run') return 'xiaohongshu_manual_only';
-  if (normalizedMode === 'dry_run') return 'xiaohongshu_manual_shadow_only';
+  if (!isManualAssistedPlatform(normalizedPlatform, executionPathId)) return null;
+  if (normalizedMode === 'real_run') return `${normalizedPlatform}_manual_only`;
+  if (normalizedMode === 'dry_run') return `${normalizedPlatform}_manual_shadow_only`;
   return null;
 }
 
@@ -69,12 +114,25 @@ export function buildActionPlanV2Update({
   const sourcePayloads = actionPayloads && typeof actionPayloads === 'object' ? actionPayloads : {};
   return {
     required_actions: actions,
-    action_payloads: Object.fromEntries(actions.map(action => [action, sourcePayloads[action] || {}])),
+    action_payloads: Object.fromEntries(actions.map(action => [
+      action,
+      normalizedUpdatePayload(platform, action, sourcePayloads[action]),
+    ])),
     execution_path_id: executionPathId,
     rule_text: ruleText,
     reviewed: reviewed === true,
     rule_complete_confirmed: ruleCompleteConfirmed === true,
   };
+}
+
+function normalizedUpdatePayload(platform, action, value) {
+  const payload = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  if (!['douyin', 'weibo'].includes(normalizePlatform(platform)) || action !== 'reposted') return payload;
+  const hasExactText = Boolean(String(payload.text || '').trim());
+  const hasMetadata = ['topic_tags', 'mentions', 'media_refs'].some(field => (
+    Array.isArray(payload[field]) && payload[field].length
+  )) || Boolean(String(payload.translation || '').trim());
+  return hasExactText || hasMetadata ? payload : {};
 }
 
 export function realRunEvidencePath(accountId) {
@@ -105,7 +163,9 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
   const normalizedMode = String(mode || '').trim().toLowerCase();
   if (!lottery?.id) return 'lottery_missing';
   if (!DISPATCH_MODES.has(normalizedMode)) return 'mode_blocked';
-  const platformBlocker = platformDispatchBlocker(lottery.platform, normalizedMode);
+  const executionPathId = lottery?.action_plan?.execution_path_id || '';
+  const manualAssisted = isManualAssistedPlatform(lottery.platform, executionPathId);
+  const platformBlocker = platformDispatchBlocker(lottery.platform, normalizedMode, executionPathId);
   if (platformBlocker) return platformBlocker;
   if (
     normalizedMode !== 'dry_run'
@@ -115,7 +175,7 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
   }
   if (safeAccountAvailable !== true) return 'no_safe_account';
   if (normalizedMode !== 'dry_run' && accountScopeBound !== true) return 'account_scope_required';
-  const planBlockers = isManualAssistedPlatform(lottery.platform)
+  const planBlockers = manualAssisted
     ? actionPlanV2ReviewBlockers(lottery.action_plan, lottery.platform)
     : actionPlanV2Blockers(lottery.action_plan, lottery.platform);
   if (normalizedMode !== 'dry_run' && planBlockers.length) {
@@ -134,15 +194,31 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
     blockers.push('action_plan_platform_mismatch');
   }
   const executionPathId = String(plan.execution_path_id || '').trim();
-  const expectedExecutionPathId = platformExecutionPathId(normalizedPlatform);
+  const expectedExecutionPathId = platformExecutionPathId(normalizedPlatform, executionPathId);
   if (
     !executionPathId
     || (expectedExecutionPathId && executionPathId !== expectedExecutionPathId)
   ) blockers.push('execution_path_mismatch');
-  if (plan.review_required !== false) blockers.push('action_plan_not_reviewed');
+  const reviewedBy = typeof plan.reviewed_by === 'string' ? plan.reviewed_by : '';
+  if (
+    plan.review_required !== false
+    || !reviewedBy
+    || reviewedBy !== reviewedBy.trim()
+    || utf8ByteLength(reviewedBy) > 128
+  ) blockers.push('action_plan_not_reviewed');
   if (plan.rule_complete_confirmed !== true) blockers.push('rule_completion_not_attested');
   if (normalizedPlatform === 'xiaohongshu' && plan.executable !== false) {
     blockers.push('xiaohongshu_manual_plan_must_be_non_executable');
+  }
+  if (normalizedPlatform === 'douyin' && plan.executable !== false) {
+    blockers.push('douyin_manual_plan_must_be_non_executable');
+  }
+  if (
+    normalizedPlatform === 'weibo'
+    && executionPathId === WEIBO_MANUAL_EXECUTION_PATH_ID
+    && plan.executable !== false
+  ) {
+    blockers.push('weibo_manual_plan_must_be_non_executable');
   }
   if (requireExecutable && plan.executable !== true) blockers.push('action_plan_not_executable');
   if (!Number.isInteger(plan.rule_snapshot_id) || plan.rule_snapshot_id <= 0) blockers.push('rule_snapshot_missing');
@@ -165,6 +241,21 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
     normalizedPlatform === 'xiaohongshu'
     && (!actionsValid || !sameOrderedList(actions, XIAOHONGSHU_FOUR_ACTIONS))
   ) blockers.push('xiaohongshu_four_action_plan_required');
+  if (normalizedPlatform === 'weibo') {
+    const expectedRuntimeRequirements = executionPathId === WEIBO_OAUTH_EXECUTION_PATH_ID
+      ? {
+        contract_version: 1,
+        actions: Object.fromEntries(
+          (Array.isArray(actions) ? actions : [])
+            .filter(action => WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action])
+            .map(action => [action, WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action]]),
+        ),
+      }
+      : {};
+    if (!sameJsonValue(plan.runtime_capability_requirements ?? {}, expectedRuntimeRequirements)) {
+      blockers.push('weibo_oauth_capability_contract_mismatch');
+    }
+  }
 
   const payloads = plan.action_payloads;
   if (!payloads || typeof payloads !== 'object' || Array.isArray(payloads)) {
@@ -188,7 +279,15 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
         } else if (!validHandle(payload.target_handle)) {
           blockers.push('action_payload_followed_target_invalid');
         }
-      } else if (TEXT_ACTIONS.has(action) && !String(payload.text || '').trim()) {
+      } else if (
+        TEXT_ACTIONS.has(action)
+        && !(
+          ['douyin', 'weibo'].includes(normalizedPlatform)
+          && action === 'reposted'
+          && Object.keys(payload).length === 0
+        )
+        && !String(payload.text || '').trim()
+      ) {
         blockers.push(`action_payload_${action}_text_required`);
       } else if (!TEXT_ACTIONS.has(action) && Object.keys(payload).length) {
         blockers.push(`action_payload_${action}_must_be_empty`);
@@ -198,7 +297,14 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
           'text', 'topic_tags', 'mentions', 'media_refs', 'translation',
         ].includes(field));
         if (unknownFields.length) blockers.push('action_payload_unknown_field');
+        if (!isWellFormedUnicode(text)) blockers.push(`action_payload_${action}_text_invalid`);
         if (utf8ByteLength(text) > 4096) blockers.push(`action_payload_${action}_text_too_large`);
+        // Match Core/Worker and the Weibo client contract exactly. JavaScript
+        // string length counts UTF-16 code units, so non-BMP emoji consume two.
+        // Do not truncate reviewed text to make it fit a remote API limit.
+        if (normalizedPlatform === 'weibo' && text.length > 140) {
+          blockers.push(`weibo_${action}_text_too_long`);
+        }
         for (const field of ['topic_tags', 'mentions', 'media_refs']) {
           const value = payload[field];
           if (Array.isArray(value) && value.length > 32) {
@@ -210,15 +316,24 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
               typeof item !== 'string'
               || !item
               || item !== item.trim()
+              || !isWellFormedUnicode(item)
               || utf8ByteLength(item) > 512
               || value.indexOf(item) !== index
+              || (field === 'mentions' && !validHandle(item))
             ))
           )) blockers.push(`action_payload_${field}_invalid`);
         }
         const topics = Array.isArray(payload.topic_tags) ? payload.topic_tags : [];
         const mentions = Array.isArray(payload.mentions) ? payload.mentions : [];
-        for (const token of [...topics, ...mentions]) {
-          if (!text.includes(token)) blockers.push('action_payload_required_token_missing');
+        for (const token of topics) {
+          if (!actionTextContainsRequiredToken(text, token)) {
+            blockers.push('action_payload_required_token_missing');
+          }
+        }
+        for (const mention of mentions) {
+          if (!actionTextContainsRequiredToken(text, mention, { mention: true })) {
+            blockers.push('action_payload_required_token_missing');
+          }
         }
         if (payload.translation !== undefined) {
           if (typeof payload.translation !== 'string' || !payload.translation.trim()) {
@@ -259,23 +374,122 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
       blockers.push('action_plan_follow_target_without_action');
     }
   }
+
+  const friendMentionRequirements = validatedFriendMentionRequirements(
+    plan.friend_mention_requirements,
+  );
+  if (!friendMentionRequirements) {
+    blockers.push('action_plan_friend_mention_requirements_invalid');
+  } else {
+    const rawSourceRequirements = plan.source_content_requirements;
+    const sourceRequirements = rawSourceRequirements === undefined
+      ? (Object.keys(friendMentionRequirements).length ? null : requirements)
+      : validatedContentRequirements(rawSourceRequirements);
+    if (!sourceRequirements) {
+      blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
+    } else if (requirements) {
+      const boundFollowKeys = new Set(requirements.follow_targets.map(mentionIdentityKey));
+      if (sourceRequirements.follow_targets.some(target => (
+        !boundFollowKeys.has(mentionIdentityKey(target))
+      ))) blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
+      for (const action of CONTENT_REQUIREMENT_ACTIONS) {
+        const sourceAction = sourceRequirements[action];
+        const boundAction = requirements[action];
+        const topicsMatch = sameOrderedList(sourceAction.topic_tags, boundAction.topic_tags);
+        const boundMentionKeys = boundAction.mentions.map(mentionIdentityKey);
+        const mentionsMatch = friendMentionRequirements[action]
+          ? (
+            new Set(boundMentionKeys).size === boundMentionKeys.length
+            && sourceAction.mentions.every(mention => (
+              boundMentionKeys.includes(mentionIdentityKey(mention))
+            ))
+          )
+          : sameOrderedList(sourceAction.mentions, boundAction.mentions);
+        if (!topicsMatch || !mentionsMatch) {
+          blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
+        }
+      }
+      if (normalizedPlatform === 'weibo') {
+        const handles = [
+          ...requirements.follow_targets,
+          ...sourceRequirements.follow_targets,
+          ...(payloads?.followed?.target_handle ? [payloads.followed.target_handle] : []),
+        ];
+        for (const action of CONTENT_REQUIREMENT_ACTIONS) {
+          handles.push(
+            ...requirements[action].mentions,
+            ...sourceRequirements[action].mentions,
+            ...(payloads?.[action]?.mentions || []),
+          );
+        }
+        if (new Set(handles.map(mentionIdentityKey)).size > WEIBO_MAX_UNIQUE_HANDLES) {
+          blockers.push('weibo_preflight_unique_handle_limit_exceeded');
+        }
+      }
+    }
+    for (const [action, constraint] of Object.entries(friendMentionRequirements)) {
+      if (!Array.isArray(actions) || !actions.includes(action)) {
+        blockers.push('action_plan_friend_mention_action_missing');
+        continue;
+      }
+      const mentions = Array.isArray(payloads?.[action]?.mentions)
+        ? payloads[action].mentions
+        : [];
+      const mentionKeys = mentions.map(mentionIdentityKey);
+      if (new Set(mentionKeys).size !== mentionKeys.length) {
+        blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
+      }
+      const sourceMentions = new Set(
+        (sourceRequirements?.[action]?.mentions || []).map(mentionIdentityKey),
+      );
+      const sourceFollowTargets = new Set([
+        ...(sourceRequirements?.follow_targets || []),
+        ...(requirements?.follow_targets || []),
+      ].map(mentionIdentityKey));
+      const friendCount = mentionKeys.filter(identityKey => (
+        !sourceMentions.has(identityKey) && !sourceFollowTargets.has(identityKey)
+      )).length;
+      if (!friendMentionCountSatisfied(constraint, friendCount)) {
+        blockers.push('action_plan_friend_mention_count_mismatch');
+      }
+      const boundMentions = requirements?.[action]?.mentions;
+      if (!Array.isArray(boundMentions) || !sameOrderedList(boundMentions, mentions)) {
+        blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
+      }
+    }
+  }
   return [...new Set(blockers)];
 }
 
 export function actionPlanV2ReviewBlockers(plan, platform = 'bilibili') {
   const blockers = collectActionPlanV2Blockers(plan, platform, { requireExecutable: false });
-  if (!isManualAssistedPlatform(platform) || !plan || typeof plan !== 'object') return blockers;
+  if (
+    !isManualAssistedPlatform(platform, plan?.execution_path_id)
+    || !plan
+    || typeof plan !== 'object'
+  ) return blockers;
+  const normalizedPlatform = normalizePlatform(platform);
   const payloadErrors = Array.isArray(plan.payload_validation_errors)
     ? plan.payload_validation_errors.filter(Boolean)
     : [];
   const capabilityBlockers = Array.isArray(plan.capability_blockers)
     ? plan.capability_blockers.filter(Boolean)
     : [];
-  const missingManualCapability = capabilityBlockers.includes('xiaohongshu_no_official_interaction_api')
+  const capabilityCode = normalizedPlatform === 'douyin'
+    ? 'douyin_no_official_interaction_api'
+    : (normalizedPlatform === 'weibo'
+      ? 'weibo_manual_execution_selected'
+      : 'xiaohongshu_no_official_interaction_api');
+  const expectedCapabilityBlockers = normalizedPlatform === 'douyin'
+    ? DOUYIN_EXPECTED_MANUAL_BLOCKERS
+    : (normalizedPlatform === 'weibo'
+      ? WEIBO_EXPECTED_MANUAL_BLOCKERS
+      : XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS);
+  const missingManualCapability = capabilityBlockers.includes(capabilityCode)
     ? []
-    : ['xiaohongshu_no_official_interaction_api'];
+    : [capabilityCode];
   const unexpectedCapabilityBlockers = capabilityBlockers
-    .filter(code => !XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS.has(code));
+    .filter(code => !expectedCapabilityBlockers.has(code));
   return [...new Set([
     ...blockers,
     ...payloadErrors,
@@ -292,6 +506,21 @@ function utf8ByteLength(value) {
   return new TextEncoder().encode(String(value || '')).length;
 }
 
+function isWellFormedUnicode(value) {
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+      index += 1;
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function actionPlanV2Ready(plan, platform = 'bilibili') {
   return actionPlanV2Blockers(plan, platform).length === 0;
 }
@@ -301,21 +530,36 @@ export function actionPlanV2ReviewReady(plan, platform = 'bilibili') {
 }
 
 export function xiaohongshuManualChecklist(plan, platform = 'xiaohongshu') {
-  if (!isManualAssistedPlatform(platform)) return [];
+  if (normalizePlatform(platform) !== 'xiaohongshu') return [];
+  return manualAssistedChecklist(plan, platform);
+}
+
+export function manualAssistedChecklist(plan, platform) {
+  if (
+    !isManualAssistedPlatform(platform, plan?.execution_path_id)
+    || !actionPlanV2ReviewReady(plan, platform)
+  ) return [];
+  const normalizedPlatform = normalizePlatform(platform);
   const actions = Array.isArray(plan?.required_actions) ? plan.required_actions : [];
   const payloads = plan?.action_payloads && typeof plan.action_payloads === 'object'
     ? plan.action_payloads
     : {};
-  return XIAOHONGSHU_FOUR_ACTIONS.map(action => ({
+  const checklistActions = lotteryActionsForPlatform(normalizedPlatform)
+    .filter(action => normalizedPlatform === 'xiaohongshu' || actions.includes(action));
+  return checklistActions.map(action => ({
     action,
     required: actions.includes(action),
     exactValue: action === 'followed'
       ? String(payloads.followed?.target_handle || '')
-      : (action === 'commented' ? String(payloads.commented?.text || '') : ''),
+      : (TEXT_ACTIONS.has(action) ? String(payloads[action]?.text || '') : ''),
   }));
 }
 
 export function xiaohongshuShadowObservation(gate) {
+  return manualShadowObservation(gate);
+}
+
+export function manualShadowObservation(gate) {
   return {
     complete: gate?.selector_observation_complete === true,
     taskId: String(gate?.manual_shadow_task_id || ''),
@@ -339,6 +583,12 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
   const textPayloads = [payloads.commented, payloads.reposted].filter(Boolean);
   const contentRequirements = validatedContentRequirements(rulePlan.content_requirements);
   if (!contentRequirements) return ['content_requirements_invalid'];
+  const friendRequirements = validatedFriendMentionRequirements(
+    rulePlan.friend_mention_requirements,
+  );
+  const friendSourceRequirements = validatedContentRequirements(
+    rulePlan.source_content_requirements,
+  ) || (rulePlan.version === 1 ? contentRequirements : null);
   const hasListValue = field => textPayloads.some(payload => (
     Array.isArray(payload?.[field]) && payload[field].length > 0
   ));
@@ -348,14 +598,30 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
       const required = contentRequirements[action][field];
       if (required.length) anyRequired = true;
       const declared = Array.isArray(payloads[action]?.[field]) ? payloads[action][field] : [];
-      if (!sameOrderedList(declared, required)) return false;
+      const allowsBoundFriends = field === 'mentions' && Boolean(friendRequirements?.[action]);
+      if (
+        allowsBoundFriends
+          ? required.some(token => !declared.includes(token))
+          : !sameOrderedList(declared, required)
+      ) return false;
     }
     return anyRequired;
   };
   const resolved = requirement => {
     if (requirement === 'topic_tag') return exactActionTokens('topic_tags');
     if (requirement === 'mention_account') return exactActionTokens('mentions');
-    if (requirement === 'mention_friends') return false;
+    if (requirement === 'mention_friends') {
+      if (!friendRequirements) return false;
+      if (
+        Array.isArray(rulePlan.unresolved_requirements)
+        && rulePlan.unresolved_requirements.includes('mention_friends')
+      ) return false;
+      return friendMentionRequirementsSatisfied(
+        friendRequirements,
+        payloads,
+        friendSourceRequirements,
+      );
+    }
     if (requirement === 'favorited') return Boolean(payloads.favorited);
     if (requirement === 'media_submission') return hasListValue('media_refs');
     if (requirement === 'translation_required') {
@@ -372,7 +638,10 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
   ]) {
     if (CONTENT_REQUIREMENT_ACTIONS.some(action => {
       const declared = Array.isArray(payloads[action]?.[field]) ? payloads[action][field] : [];
-      return !sameOrderedList(declared, contentRequirements[action][field]);
+      const required = contentRequirements[action][field];
+      return field === 'mentions' && friendRequirements?.[action]
+        ? required.some(token => !declared.includes(token))
+        : !sameOrderedList(declared, required);
     })) unresolved.push(requirement);
   }
   if (payloads.followed) {
@@ -387,6 +656,66 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
     unresolved.push('ambiguous_rule');
   }
   return [...new Set(unresolved)];
+}
+
+function validatedFriendMentionRequirements(value) {
+  if (value === undefined || value === null) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const result = {};
+  for (const [action, constraint] of Object.entries(value)) {
+    if (!CONTENT_REQUIREMENT_ACTIONS.includes(action)) return null;
+    if (
+      !constraint
+      || typeof constraint !== 'object'
+      || Array.isArray(constraint)
+      || !sameKeySet(constraint, ['mode', 'count'])
+      || !['minimum', 'exact'].includes(constraint.mode)
+      || !Number.isInteger(constraint.count)
+      || constraint.count < 1
+      || constraint.count > 32
+    ) return null;
+    result[action] = { mode: constraint.mode, count: constraint.count };
+  }
+  return result;
+}
+
+function friendMentionCountSatisfied(constraint, count) {
+  return constraint.mode === 'exact' ? count === constraint.count : count >= constraint.count;
+}
+
+function friendMentionRequirementsSatisfied(requirements, payloads, sourceRequirements = null) {
+  const entries = Object.entries(requirements || {});
+  if (!entries.length) return false;
+  const sourceFollowTargets = new Set(
+    (sourceRequirements?.follow_targets || []).map(mentionIdentityKey),
+  );
+  return entries.every(([action, constraint]) => {
+    const mentions = Array.isArray(payloads?.[action]?.mentions)
+      ? payloads[action].mentions
+      : [];
+    const mentionKeys = mentions.map(mentionIdentityKey);
+    if (new Set(mentionKeys).size !== mentionKeys.length) return false;
+    const sourceMentions = new Set(
+      (sourceRequirements?.[action]?.mentions || []).map(mentionIdentityKey),
+    );
+    const friendCount = sourceRequirements
+      ? mentionKeys.filter(identityKey => (
+        !sourceMentions.has(identityKey) && !sourceFollowTargets.has(identityKey)
+      )).length
+      : mentionKeys.length;
+    return friendMentionCountSatisfied(constraint, friendCount);
+  });
+}
+
+export function mentionIdentityKey(value) {
+  return String(value || '').normalize('NFKC').toLowerCase();
+}
+
+export function actionTextContainsRequiredToken(text, token, { mention = false } = {}) {
+  const content = String(text || '');
+  const required = String(token || '');
+  if (!mention) return content.includes(required);
+  return (content.match(MENTION_IN_TEXT_PATTERN) || []).includes(required);
 }
 
 function validHandle(value) {
@@ -419,7 +748,10 @@ function validatedContentRequirements(value) {
       || typeof actionRequirements !== 'object'
       || Array.isArray(actionRequirements)
       || !sameKeySet(actionRequirements, CONTENT_REQUIREMENT_FIELDS)
-      || !CONTENT_REQUIREMENT_FIELDS.every(field => validMetadataList(actionRequirements[field]))
+      || !CONTENT_REQUIREMENT_FIELDS.every(field => validMetadataList(
+        actionRequirements[field],
+        { handlesOnly: field === 'mentions' },
+      ))
     ) return null;
     normalized[action] = actionRequirements;
   }
@@ -428,6 +760,19 @@ function validatedContentRequirements(value) {
 
 function sameKeySet(value, expected) {
   return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+
+function sameJsonValue(left, right) {
+  if (!left || typeof left !== 'object' || Array.isArray(left)) return false;
+  return JSON.stringify(sortJsonValue(left)) === JSON.stringify(sortJsonValue(right));
+}
+
+function sortJsonValue(value) {
+  if (Array.isArray(value)) return value.map(sortJsonValue);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map(key => [key, sortJsonValue(value[key])]),
+  );
 }
 
 function sameOrderedList(left, right) {

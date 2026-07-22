@@ -80,6 +80,17 @@ class GateInputContractTests(unittest.TestCase):
             decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
             self.assertEqual(decision["outcome"], "block", f"{missing} should block")
 
+    def test_oauth_exact_dry_preflight_satisfies_legacy_shadow_gate(self):
+        gate = _full_pass_gate()
+        gate["shadow_ready"] = False
+        gate["execution_preflight_ready"] = True
+
+        inputs = gate_inputs(gate, breaker_allowed=True)
+        decision = evaluate_policy(policy=DEFAULT_REAL_RUN_POLICY, inputs=inputs)
+
+        self.assertTrue(inputs["recent_shadow_run"])
+        self.assertEqual(decision["outcome"], "allow")
+
     def test_real_run_disabled_blocks(self):
         gate = _full_pass_gate()
         gate["real_run_enabled"] = False

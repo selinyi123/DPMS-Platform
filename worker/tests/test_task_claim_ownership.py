@@ -1,6 +1,8 @@
+import copy
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
@@ -17,6 +19,32 @@ stub_httpx()
 stub_worker_runtime_dependencies()
 
 from app import task_runner  # noqa: E402
+from app.action_plan import (  # noqa: E402
+    compute_action_plan_hash,
+    weibo_runtime_capability_requirements,
+)
+
+
+def as_weibo_manual_plan(value):
+    plan = copy.deepcopy(value)
+    plan["platform"] = "weibo"
+    plan["execution_path_id"] = "weibo_manual_v1"
+    plan["executable"] = False
+    plan["runtime_capability_requirements"] = {}
+    plan["plan_hash"] = compute_action_plan_hash(plan)
+    return plan
+
+
+def as_weibo_oauth_plan(value):
+    plan = copy.deepcopy(value)
+    plan["platform"] = "weibo"
+    plan["execution_path_id"] = "weibo_oauth_v1"
+    plan["executable"] = True
+    plan["runtime_capability_requirements"] = (
+        weibo_runtime_capability_requirements(plan["required_actions"])
+    )
+    plan["plan_hash"] = compute_action_plan_hash(plan)
+    return plan
 
 
 class FakeRedis:
@@ -151,6 +179,124 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.db.lottery_execution_lock)
         self.assertEqual(self.db.account_status, "ready")
         self.assertIsNotNone(self.db.account_lease_released_at)
+
+    async def test_first_weibo_rejection_moves_account_out_of_ready_by_category(self):
+        cases = (
+            (21327, "login_required"),
+            (10014, "warming"),
+            (10023, "cooling"),
+        )
+        for error_code, expected_status in cases:
+            with self.subTest(error_code=error_code):
+                db = FakeDatabase(task_mode="real_run")
+                db.task_id = "task-1"
+                db.lottery_execution_lock = "task-1"
+                db.lottery_platform = "weibo"
+                db.lottery_action_plan = as_weibo_oauth_plan(
+                    db.lottery_action_plan
+                )
+                db.task_action_plan_hash = db.lottery_action_plan["plan_hash"]
+                task_runner.database = db
+
+                message = build_task_message(
+                    task_id="task-1",
+                    account_id=db.account_id,
+                    lottery_id=db.lottery_id,
+                    platform="weibo",
+                    raw_url="https://weibo.com/123456/AbCdEf1",
+                    canonical_url="canonical://weibo/status/7987885345",
+                    task_mode="real_run",
+                    dry_run=False,
+                    platform_selectors={},
+                    action_plan=db.lottery_action_plan,
+                )
+
+                async def reject_first_action(_task):
+                    db.external_action_intents = [
+                        {
+                            "intent_id": "intent-followed",
+                            "action": "followed",
+                            "status": "failed",
+                            "effect_certainty": "confirmed_no_effect",
+                        }
+                    ]
+                    raise task_runner.WeiboApiRejected(
+                        "followed",
+                        error_code,
+                        "remote message must not drive policy",
+                    )
+
+                with patch.object(
+                    task_runner, "enforce_task_real_run_gate", AsyncMock()
+                ), patch.object(
+                    task_runner, "ensure_account_can_run", AsyncMock()
+                ), patch.object(
+                    task_runner,
+                    "execute_weibo_oauth_real_task",
+                    reject_first_action,
+                ):
+                    completed = await task_runner.execute_task_with_phases(
+                        message,
+                        adapter=None,
+                        pool=None,
+                    )
+
+                self.assertFalse(completed)
+                self.assertEqual(db.task_status, "failed")
+                self.assertEqual(db.task_reconciliation_required, 0)
+                self.assertEqual(db.lottery_status, "pending")
+                self.assertEqual(db.account_status, expected_status)
+                self.assertNotEqual(db.account_status, "ready")
+                self.assertIsNotNone(db.account_lease_released_at)
+
+    async def test_terminal_account_status_cas_failure_is_not_silently_accepted(self):
+        await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0"
+        )
+        self.db.external_action_intents = [
+            {
+                "intent_id": "intent-followed",
+                "action": "followed",
+                "status": "failed",
+                "effect_certainty": "confirmed_no_effect",
+            }
+        ]
+
+        with patch.object(
+            task_runner,
+            "execute_affected_rows",
+            AsyncMock(return_value=0),
+        ):
+            with self.assertRaises(task_runner.AccountStatusPersistenceFailed):
+                await task_runner.mark_task_finished(
+                    "task-1",
+                    False,
+                    "weibo_api_rejected:followed:21327",
+                    account_failure_status="login_required",
+                )
+
+    async def test_terminal_settlement_preserves_an_existing_restrictive_status(self):
+        await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0"
+        )
+        self.db.account_status = "login_required"
+        self.db.external_action_intents = [
+            {
+                "intent_id": "intent-followed",
+                "action": "followed",
+                "status": "failed",
+                "effect_certainty": "confirmed_no_effect",
+            }
+        ]
+
+        await task_runner.mark_task_finished(
+            "task-1",
+            False,
+            "known rejection after risk state persisted",
+        )
+
+        self.assertEqual(self.db.account_status, "login_required")
+        self.assertNotEqual(self.db.account_status, "ready")
 
     async def test_failed_status_with_unknown_effect_certainty_stays_quarantined(self):
         await task_runner.mark_task_started(
@@ -345,6 +491,9 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def test_shadow_claim_binds_authoritative_target_and_action_plan(self):
         self.db.task_mode = "shadow_run"
         self.db.lottery_platform = "weibo"
+        self.db.lottery_action_plan = as_weibo_manual_plan(
+            self.db.lottery_action_plan
+        )
         self.db.lottery_raw_url = "https://weibo.com/123456/AbCdEf1"
         self.db.lottery_canonical_url = self.db.lottery_raw_url
         message = {
@@ -365,6 +514,9 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def test_tampered_shadow_target_is_rejected_before_claim(self):
         self.db.task_mode = "shadow_run"
         self.db.lottery_platform = "weibo"
+        self.db.lottery_action_plan = as_weibo_manual_plan(
+            self.db.lottery_action_plan
+        )
         self.db.lottery_raw_url = "https://weibo.com/123456/AbCdEf1"
         self.db.lottery_canonical_url = self.db.lottery_raw_url
         message = {
@@ -386,6 +538,9 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def test_tampered_shadow_selectors_are_rejected_before_claim(self):
         self.db.task_mode = "shadow_run"
         self.db.lottery_platform = "weibo"
+        self.db.lottery_action_plan = as_weibo_manual_plan(
+            self.db.lottery_action_plan
+        )
         self.db.lottery_raw_url = "https://weibo.com/123456/AbCdEf1"
         self.db.lottery_canonical_url = self.db.lottery_raw_url
         self.db.selector_config = {"followed": ["button.follow"]}
@@ -404,8 +559,11 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.db.task_status, "queued")
 
-    async def test_tampered_selector_real_run_is_rejected_before_claim(self):
+    async def test_weibo_oauth_real_run_does_not_bind_browser_selectors(self):
         self.db.lottery_platform = "weibo"
+        self.db.lottery_action_plan = as_weibo_oauth_plan(
+            self.db.lottery_action_plan
+        )
         self.db.lottery_raw_url = "https://weibo.com/123456/AbCdEf1"
         self.db.lottery_canonical_url = self.db.lottery_raw_url
         self.db.selector_config = {"followed": ["button.follow"]}
@@ -417,12 +575,12 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
             "selector_config": {"followed": ["body"]},
         }
 
-        with self.assertRaisesRegex(task_runner.TaskClaimConflict, "task_selector_config_mismatch"):
-            await task_runner.mark_task_started(
-                "task-1", 9001, 7001, "real_run", "1-0", task_message=message
-            )
+        binding = await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0", task_message=message
+        )
 
-        self.assertEqual(self.db.task_status, "queued")
+        self.assertEqual(binding.task_mode, "real_run")
+        self.assertEqual(self.db.task_status, "running")
 
 
 if __name__ == "__main__":

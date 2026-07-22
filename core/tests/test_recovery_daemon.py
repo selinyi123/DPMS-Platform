@@ -13,6 +13,7 @@ from app.services.recovery_daemon import (  # noqa: E402
     IDLE_THRESHOLD_MS,
     RealRunRecoveryBlocked,
     TaskRecoveryBlocked,
+    _ack_converged_stream_message,
     _mark_recovery_blocked,
     _mark_recovery_exhausted,
     _prepare_task_for_recovery,
@@ -74,6 +75,7 @@ def _task_payload(task_id, *, mode="dry_run", canonical_url="https://example.tes
         "execution_revision": "7",
         "account_lease_id": "lease-1",
         "account_lease_generation": "3",
+        "weibo_rip_encrypted": "",
     }
 
 
@@ -111,6 +113,38 @@ class PendingIdleMsTests(unittest.TestCase):
     def test_missing_value_is_zero_not_crash(self):
         self.assertEqual(pending_idle_ms({}), 0)
         self.assertEqual(pending_idle_ms({"time_since_delivered": None}), 0)
+
+
+class LegacyStreamCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plaintext_entry_is_deleted_before_ack_after_convergence(self):
+        fake_redis = AsyncMock()
+        with patch("app.services.recovery_daemon.redis", fake_redis):
+            await _ack_converged_stream_message(
+                "1700000000000-0",
+                {"task_id": "task-1", "weibo_rip": "8.8.8.8"},
+            )
+
+        fake_redis.xdel.assert_awaited_once_with(
+            "lottery_tasks", "1700000000000-0"
+        )
+        fake_redis.xack.assert_awaited_once_with(
+            "lottery_tasks", "workers", "1700000000000-0"
+        )
+        self.assertEqual(
+            [call[0] for call in fake_redis.method_calls],
+            ["xdel", "xack"],
+        )
+
+    async def test_current_encrypted_entry_is_only_acked(self):
+        fake_redis = AsyncMock()
+        with patch("app.services.recovery_daemon.redis", fake_redis):
+            await _ack_converged_stream_message(
+                "1700000000000-0",
+                {"task_id": "task-1", "weibo_rip_encrypted": "sealed"},
+            )
+
+        fake_redis.xdel.assert_not_awaited()
+        fake_redis.xack.assert_awaited_once()
 
 
 class RebuildTaskPayloadRealRunGateTests(unittest.IsolatedAsyncioTestCase):

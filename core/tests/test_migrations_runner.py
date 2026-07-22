@@ -248,6 +248,14 @@ class MigrationConnectionContractTests(unittest.IsolatedAsyncioTestCase):
 class ProductionSchemaSemanticContractTests(unittest.TestCase):
     def test_security_critical_columns_include_exact_semantics(self):
         self.assertEqual(
+            PRODUCTION_REQUIRED_COLUMN_DEFINITIONS[("task_phases", "phase")],
+            (
+                "enum('init','followed','liked','commented','favorited','reposted','completed')",
+                "YES",
+                "init",
+            ),
+        )
+        self.assertEqual(
             PRODUCTION_REQUIRED_COLUMN_DEFINITIONS[
                 ("accounts", "execution_revision")
             ],

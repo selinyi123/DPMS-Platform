@@ -22,6 +22,10 @@ def _load_platform_manifest() -> dict:
 
 
 PLATFORMS = _load_platform_manifest()
+MANUAL_ONLY_BLOCKERS = {
+    "xiaohongshu": "xiaohongshu_no_official_interaction_api",
+    "douyin": "douyin_no_official_interaction_api",
+}
 
 
 def get_platform(platform: str) -> dict | None:
@@ -31,13 +35,27 @@ def get_platform(platform: str) -> dict | None:
     output = dict(cfg)
     output["action_adapter"] = False
     output["adapter_status"] = "calibration_required"
-    if platform == "xiaohongshu":
+    if platform in MANUAL_ONLY_BLOCKERS:
         output.update(
             {
                 "adapter_status": "manual_assisted_only",
                 "execution_mode": "manual_assisted",
                 "real_run_supported": False,
-                "real_run_blocker": "xiaohongshu_no_official_interaction_api",
+                "real_run_blocker": MANUAL_ONLY_BLOCKERS[platform],
+            }
+        )
+        return output
+    if platform == "weibo":
+        # The official write APIs are OAuth capabilities, not browser selector
+        # capabilities. The adapter exists, while account/action grants remain
+        # a separate fail-closed readiness concern.
+        output.update(
+            {
+                "action_adapter": True,
+                "adapter_status": "oauth_capability_required",
+                "execution_mode": "oauth",
+                "real_run_supported": True,
+                "real_run_blocker": "weibo_oauth_capability_evidence_required",
             }
         )
         return output

@@ -68,7 +68,14 @@ def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
         "calibrated_account_available": int(gate.get("safe_accounts") or 0) > 0,
         "real_adapter_enabled": bool(gate.get("adapter_enabled")),
         "recent_complete_probe": bool(gate.get("probe_ready")),
-        "recent_shadow_run": bool(gate.get("shadow_ready")),
+        # The persisted gate code predates official OAuth support. Browser
+        # paths still require selector shadow evidence; OAuth satisfies the
+        # same no-side-effect rehearsal boundary with an exact, account-bound
+        # local dry run. Keep the legacy code for policy compatibility without
+        # claiming a selector observation occurred.
+        "recent_shadow_run": bool(
+            gate.get("execution_preflight_ready", gate.get("shadow_ready"))
+        ),
         "no_recent_account_risk": "recent_account_risk_event" not in blockers,
     }
 

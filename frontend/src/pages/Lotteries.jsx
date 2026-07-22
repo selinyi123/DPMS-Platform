@@ -4,6 +4,7 @@ import { authenticatedApiPath, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
 import { formatText } from '../i18n/format';
 import {
+  actionTextContainsRequiredToken,
   actionPlanHasMediaRequirement,
   actionPlanV2Blockers,
   actionPlanV2Ready,
@@ -12,8 +13,13 @@ import {
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
   executionEvidencePresentation,
+  isFixedManualActionPlatform,
+  isManualAssistedPlan,
   isManualAssistedPlatform,
   lotteryActionsForPlatform,
+  manualAssistedChecklist,
+  manualShadowObservation,
+  mentionIdentityKey,
   platformDispatchBlocker,
   platformExecutionPathId,
   realRunEvidencePath,
@@ -21,15 +27,31 @@ import {
   targetTransportCompatibilityIssue,
   targetValidationErrorCode,
   unresolvedRuleRequirements,
-  xiaohongshuManualChecklist,
-  xiaohongshuShadowObservation,
+  WEIBO_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MAX_UNIQUE_HANDLES,
+  WEIBO_OAUTH_EXECUTION_PATH_ID,
 } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
+import {
+  DOUYIN_IMPORT_MAX_BYTES,
+  WEIBO_IMPORT_MAX_BYTES,
+  XIAOHONGSHU_IMPORT_MAX_BYTES,
+  TARGET_IMPORT_PASSTHROUGH_MAX_BYTES,
+  TargetImportError,
+  normalizeTargetImportForPlatform,
+} from '../xiaohongshuImport';
+
+function probePhaseTotal(summary, platform) {
+  return Array.isArray(summary?.required_phases) && summary.required_phases.length
+    ? summary.required_phases.length
+    : lotteryActionsForPlatform(platform).length;
+}
 
 const API_ACTION_PHASES = {
   follow: 'followed',
   like: 'liked',
   comment: 'commented',
+  favorite: 'favorited',
   repost: 'reposted',
 };
 const REAL_RUN_EVIDENCE_TTL_MS = 65000;
@@ -40,6 +62,7 @@ export default function Lotteries() {
   const evidenceRefreshPendingRef = useRef(false);
   const evidenceExpiryTimerRef = useRef(null);
   const selectedAccountRef = useRef('');
+  const targetFileReadIdRef = useRef(0);
   const mountedRef = useRef(true);
   const [lotteries, setLotteries] = useState([]);
   const [runs, setRuns] = useState([]);
@@ -196,30 +219,82 @@ export default function Lotteries() {
     setError('');
     setTargetImportResult(null);
     try {
+      const normalizedImport = normalizeTargetImport(targetImport, platforms);
+      if (normalizedImport.converted) {
+        setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
+        const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+        notify(formatText(t(messageKey), {
+          count: normalizedImport.targetCount,
+          discarded: normalizedImport.discardedSensitiveFields,
+          skipped: normalizedImport.discardedRows,
+        }), 'warning');
+      }
       const result = await postJSON('/lotteries/targets/import', {
         platform: targetImport.platform,
-        content: targetImport.content,
+        content: normalizedImport.content,
         value_score: Number(targetImport.value_score || 0),
+      }, {
+        timeoutMs: targetImportTimeout(normalizedImport),
       });
-      setTargetImportResult(result);
+      const displayedResult = {
+        ...result,
+        local_skipped_count: normalizedImport.discardedRows || 0,
+      };
+      setTargetImportResult(displayedResult);
       const message = formatText(t('lotteries.targetsImported'), result);
       notify(message, result.invalid_count ? 'warning' : 'success');
       await load();
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      const message = targetImportErrorText(err, t);
+      setError(message);
+      notify(message, 'error');
     }
   };
 
   const readTargetFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const readId = targetFileReadIdRef.current + 1;
+    targetFileReadIdRef.current = readId;
+    setError('');
+    setTargetImportResult(null);
+    setTargetImport(prev => ({ ...prev, content: '' }));
     try {
+      const importPlatform = String(targetImport.platform || '').trim().toLowerCase();
+      const maxBytes = importPlatform === 'xiaohongshu'
+        ? XIAOHONGSHU_IMPORT_MAX_BYTES
+        : (importPlatform === 'douyin'
+            ? DOUYIN_IMPORT_MAX_BYTES
+            : (importPlatform === 'weibo' ? WEIBO_IMPORT_MAX_BYTES : TARGET_IMPORT_PASSTHROUGH_MAX_BYTES));
+      if (file.size > maxBytes) {
+        const code = importPlatform === 'xiaohongshu'
+          ? 'xiaohongshu_import_too_large'
+          : (importPlatform === 'douyin'
+              ? 'douyin_import_too_large'
+              : (importPlatform === 'weibo' ? 'weibo_import_too_large' : 'target_import_content_too_large'));
+        throw new TargetImportError(code);
+      }
       const text = await file.text();
-      setTargetImport(prev => ({ ...prev, content: text }));
-      notify(formatText(t('lotteries.targetFileLoaded'), { name: file.name }), 'success');
+      if (readId !== targetFileReadIdRef.current) return;
+      const normalizedImport = normalizeTargetImport(
+        { ...targetImport, content: text },
+        platforms,
+      );
+      setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
+      const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+      const message = normalizedImport.converted
+        ? formatText(t(messageKey), {
+            count: normalizedImport.targetCount,
+            discarded: normalizedImport.discardedSensitiveFields,
+            skipped: normalizedImport.discardedRows,
+          })
+        : formatText(t('lotteries.targetFileLoaded'), { name: file.name });
+      notify(message, normalizedImport.converted ? 'warning' : 'success');
     } catch (err) {
-      notify(err.message, 'error');
+      if (readId !== targetFileReadIdRef.current) return;
+      const message = targetImportErrorText(err, t);
+      setError(message);
+      notify(message, 'error');
     } finally {
       e.target.value = '';
     }
@@ -265,7 +340,10 @@ export default function Lotteries() {
         `/lotteries/${lottery.id}/action-plan`,
         buildActionPlanV2Update({ ...draft, platform: lottery.platform }),
       );
-      const manualAssisted = isManualAssistedPlatform(lottery.platform);
+      const manualAssisted = isManualAssistedPlan(
+        lottery.platform,
+        result?.action_plan,
+      );
       const stillBlocked = manualAssisted
         ? !actionPlanV2ReviewReady(result?.action_plan, lottery.platform)
         : !actionPlanV2Ready(result?.action_plan, lottery.platform);
@@ -297,6 +375,10 @@ export default function Lotteries() {
   const dispatchBlockerMessage = (blocker, lottery) => {
     if (blocker === 'xiaohongshu_manual_only') return t('lotteries.xiaohongshuManualOnlyHint');
     if (blocker === 'xiaohongshu_manual_shadow_only') return t('lotteries.xiaohongshuManualShadowOnlyHint');
+    if (blocker === 'douyin_manual_only') return t('lotteries.douyinManualOnlyHint');
+    if (blocker === 'douyin_manual_shadow_only') return t('lotteries.douyinManualShadowOnlyHint');
+    if (blocker === 'weibo_manual_only') return t('lotteries.weiboManualOnlyHint');
+    if (blocker === 'weibo_manual_shadow_only') return t('lotteries.weiboManualShadowOnlyHint');
     if (blocker === 'legacy_http_target') return t('lotteries.legacyHttpTargetHint');
     if (blocker === 'no_safe_account') return t('lotteries.noSafeAccount');
     if (blocker === 'account_scope_required') return t('lotteries.accountScopeRequired');
@@ -447,7 +529,7 @@ export default function Lotteries() {
             </div>
             <div className="capability-row"><span>{t('lotteries.adapter')}</span><span className="mono small-text">{platform.adapter_status || 'planned'}</span></div>
             <div className="capability-row"><span>{t('lotteries.safeAccounts')}</span><span className="mono small-text">{safeAccountCount(platform.id)}</span></div>
-            <div className="capability-row"><span>{t('lotteries.selectorObservation')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/4` : '-'}</span></div>
+            <div className="capability-row"><span>{t('lotteries.selectorObservation')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/${lotteryActionsForPlatform(platform.id).length}` : '-'}</span></div>
             <p className="muted-text tight-text">{adapterById[platform.id]?.notes || t('lotteries.adapterLoading')}</p>
             {!!ready?.blocker_codes?.length && (
               <div className="blocker-list compact-blockers">
@@ -571,7 +653,14 @@ export default function Lotteries() {
           <form onSubmit={importTargets} className="form-grid target-import-form">
             <label>
               <span>{t('lotteries.defaultPlatform')}</span>
-              <select className="input" value={targetImport.platform} onChange={e => setTargetImport({ ...targetImport, platform: e.target.value })}>
+              <select
+                className="input"
+                value={targetImport.platform}
+                onChange={(e) => {
+                  targetFileReadIdRef.current += 1;
+                  setTargetImport({ ...targetImport, platform: e.target.value });
+                }}
+              >
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
               </select>
             </label>
@@ -581,14 +670,24 @@ export default function Lotteries() {
             </label>
             <label className="btn-ghost file-button target-file-button">
               {t('lotteries.uploadTargets')}
-              <input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={readTargetFile} hidden />
+              <input
+                type="file"
+                accept={['douyin', 'weibo', 'xiaohongshu'].includes(String(targetImport.platform).toLowerCase())
+                  ? '.txt,.csv,.json,.jsonl,text/plain,text/csv,application/json'
+                  : '.txt,.csv,text/plain,text/csv'}
+                onChange={readTargetFile}
+                hidden
+              />
             </label>
             <label className="target-text-field">
               <span>{t('lotteries.targetList')}</span>
               <textarea
                 className="input textarea"
                 value={targetImport.content}
-                onChange={e => setTargetImport({ ...targetImport, content: e.target.value })}
+                onChange={(e) => {
+                  targetFileReadIdRef.current += 1;
+                  setTargetImport({ ...targetImport, content: e.target.value });
+                }}
                 placeholder={t('lotteries.targetPlaceholder')}
               />
             </label>
@@ -680,8 +779,13 @@ export default function Lotteries() {
               {lotteries.map(lottery => {
                 const gate = gateByLotteryId[lottery.id];
                 const repairPlan = gate?.repair_plan;
-                const manualAssisted = isManualAssistedPlatform(lottery.platform);
-                const platformModeBlocker = platformDispatchBlocker(lottery.platform, dispatchMode);
+                const executionPathId = lottery.action_plan?.execution_path_id || '';
+                const manualAssisted = isManualAssistedPlan(lottery.platform, executionPathId);
+                const platformModeBlocker = platformDispatchBlocker(
+                  lottery.platform,
+                  dispatchMode,
+                  executionPathId,
+                );
                 const targetIssue = targetTransportCompatibilityIssue(lottery.platform, lottery.raw_url);
                 const transportBlocksSelectedMode = Boolean(targetIssue && dispatchMode !== 'dry_run');
                 const safeAccountAvailable = safeAccountCount(lottery.platform) > 0;
@@ -699,7 +803,10 @@ export default function Lotteries() {
                   && !platformModeBlocker
                   && !actionPlanBlocked
                   && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
-                const repairAvailable = Boolean(repairPlan?.eligible);
+                const repairAvailable = Boolean(repairPlan?.executable);
+                const repairUnavailable = Boolean(
+                  repairPlan?.eligible && !repairPlan?.executable,
+                );
                 const repairBlocked = repairAvailable && (
                   manualAssisted
                   || Boolean(platformModeBlocker)
@@ -710,7 +817,7 @@ export default function Lotteries() {
                   || !actionPlanReady
                 );
                 const repairBlockReason = manualAssisted
-                  ? t('lotteries.xiaohongshuManualOnlyHint')
+                  ? t(manualOnlyHintKey(lottery.platform))
                   : (targetIssue ? t('lotteries.legacyHttpTargetHint')
                   : (!accountScopeReady
                     ? t('lotteries.accountScopeRequired')
@@ -746,7 +853,13 @@ export default function Lotteries() {
                   <td><StatusBadge status={lottery.status} /></td>
                   <td>{lottery.value_score}</td>
                   <td>
-                    <RealGateCell gate={gate} platform={lottery.platform} targetIssue={targetIssue} t={t} />
+                    <RealGateCell
+                      gate={gate}
+                      platform={lottery.platform}
+                      executionPathId={executionPathId}
+                      targetIssue={targetIssue}
+                      t={t}
+                    />
                   </td>
                   <td className="small-text">{lottery.expires_at || '-'}</td>
                   <td className="action-cell">
@@ -785,6 +898,11 @@ export default function Lotteries() {
                         {repairBlocked && <div className="small-text muted-text">{repairBlockReason}</div>}
                       </div>
                     )}
+                    {repairUnavailable && (
+                      <div className="small-text warning-text">
+                        {t('lotteries.repairExecutionUnavailable')}
+                      </div>
+                    )}
                   </td>
                   </tr>
                 );
@@ -814,7 +932,7 @@ export default function Lotteries() {
                     <td>A{item.account_id}</td>
                     <td>{item.lottery_id ? `L${item.lottery_id}` : '-'}</td>
                     <td><StatusBadge status={item.status} /></td>
-                    <td>{summary ? `${summary.ready_phase_count}/4` : '-'}</td>
+                    <td>{summary ? `${summary.ready_phase_count}/${probePhaseTotal(summary, item.platform)}` : '-'}</td>
                     <td>
                       {summary ? (
                         <span className={`badge ${observationComplete ? 'badge-ready' : 'badge-warn'}`}>
@@ -951,6 +1069,49 @@ function targetValidationErrorText(value, t) {
   return translated === key ? value : translated;
 }
 
+function normalizeTargetImport(targetImport, platforms = []) {
+  return normalizeTargetImportForPlatform(targetImport?.platform, targetImport?.content, {
+    allowedPlatformIds: platforms.map(platform => platform.id),
+  });
+}
+
+function targetImportSanitizedMessageKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'xiaohongshu') return 'lotteries.xiaohongshuExportSanitized';
+  if (normalized === 'douyin') return 'lotteries.douyinExportSanitized';
+  if (normalized === 'weibo') return 'lotteries.weiboExportSanitized';
+  return 'lotteries.targetImportSanitized';
+}
+
+function manualOnlyHintKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'douyin') return 'lotteries.douyinManualOnlyHint';
+  if (normalized === 'weibo') return 'lotteries.weiboManualOnlyHint';
+  return 'lotteries.xiaohongshuManualOnlyHint';
+}
+
+function manualMediaRequirementKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'douyin') return 'lotteries.douyinMediaRequirementManual';
+  if (normalized === 'weibo') return 'lotteries.weiboMediaRequirementManual';
+  return 'lotteries.xiaohongshuMediaRequirementManual';
+}
+
+function targetImportTimeout(normalizedImport) {
+  if (!normalizedImport?.targetCount) return undefined;
+  const configuredTimeout = Number(import.meta.env.VITE_API_TIMEOUT_MS || 15_000);
+  const rowBudget = normalizedImport.targetCount * 40;
+  const shortLinkBudget = normalizedImport.shortLinkCount ? 42_000 : 0;
+  return Math.max(configuredTimeout, Math.min(58_000, 15_000 + rowBudget + shortLinkBudget));
+}
+
+function targetImportErrorText(error, t) {
+  const code = String(error?.code || error?.message || '');
+  const key = `lotteries.targetImportErrors.${code}`;
+  const translated = t(key);
+  return translated === key ? (error?.message || code) : translated;
+}
+
 function displayTime(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -968,7 +1129,7 @@ function riskCooldownText(gate, t) {
   });
 }
 
-function RealGateCell({ gate, platform, targetIssue, t }) {
+function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
   if (targetIssue) {
     return (
       <div className="gate-cell">
@@ -984,12 +1145,12 @@ function RealGateCell({ gate, platform, targetIssue, t }) {
       </div>
     );
   }
-  if (isManualAssistedPlatform(platform)) {
-    const shadowObservation = xiaohongshuShadowObservation(gate);
+  if (isManualAssistedPlatform(platform, executionPathId)) {
+    const shadowObservation = manualShadowObservation(gate);
     return (
       <div className="gate-cell">
         <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
-        <div className="small-text warning-text">{t('lotteries.xiaohongshuManualOnlyHint')}</div>
+        <div className="small-text warning-text">{t(manualOnlyHintKey(platform))}</div>
         <div className="capability-row">
           <span>{t('lotteries.shadowEvidence')}</span>
           <span className={`badge ${shadowObservation.complete ? 'badge-ready' : 'badge-muted'}`}>
@@ -1038,6 +1199,11 @@ function RealGateCell({ gate, platform, targetIssue, t }) {
           {!!repairPlan.missing_actions?.length && (
             <div className="small-text">{formatText(t('lotteries.repairMissingActions'), { actions: actionSummary(repairPlan.missing_actions, t) })}</div>
           )}
+        </div>
+      )}
+      {repairPlan?.eligible && !repairPlan?.executable && (
+        <div className="small-text warning-text">
+          {t('lotteries.repairExecutionUnavailable')}
         </div>
       )}
       <ActionLedgerSummary ledger={gate.action_ledger} repairPlan={repairPlan} t={t} />
@@ -1135,10 +1301,15 @@ function ledgerOutcomeClass(row) {
 function RulePlanEditor({ lottery, gate, onSave, t }) {
   const { notify } = useUi();
   const plan = lottery.action_plan || {};
-  const manualAssisted = isManualAssistedPlatform(lottery.platform);
+  const fixedManualActions = isFixedManualActionPlatform(lottery.platform);
   const availableActions = lotteryActionsForPlatform(lottery.platform);
   const savedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
-  const initialActions = manualAssisted ? availableActions : savedActions;
+  const savedExecutionPathId = platformExecutionPathId(
+    lottery.platform,
+    plan.execution_path_id,
+  );
+  const savedManualAssisted = isManualAssistedPlan(lottery.platform, plan);
+  const initialActions = fixedManualActions ? availableActions : savedActions;
   const savedPayloads = actionPayloadDraft(
     savedActions,
     plan.action_payloads,
@@ -1155,12 +1326,16 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
     actions: savedActions,
     payloads: savedPayloads,
     contentRequirements: plan.content_requirements,
+    sourceContentRequirements: plan.source_content_requirements,
+    friendMentionRequirements: plan.friend_mention_requirements,
+    executionPathId: savedExecutionPathId,
     version: plan.version,
     hash: plan.plan_hash,
   });
   const [actions, setActions] = useState(initialActions);
   const [payloads, setPayloads] = useState(initialPayloads);
   const [ruleText, setRuleText] = useState(lottery.rule_text || '');
+  const [executionPathId, setExecutionPathId] = useState(savedExecutionPathId);
   const [ruleCompleteConfirmed, setRuleCompleteConfirmed] = useState(false);
   const [reviewedConfirmed, setReviewedConfirmed] = useState(false);
   const [suggestion, setSuggestion] = useState(null);
@@ -1168,30 +1343,38 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   const suggestionActions = Array.isArray(suggestion?.required_actions) ? suggestion.required_actions : [];
   const draftPayloads = actionPayloadDraft(actions, payloads, null, lottery.platform);
   const semanticSource = suggestion || plan;
+  const friendMentionRequirements = (
+    semanticSource.friend_mention_requirements
+    && typeof semanticSource.friend_mention_requirements === 'object'
+  ) ? semanticSource.friend_mention_requirements : {};
+  const manualAssisted = isManualAssistedPlatform(lottery.platform, executionPathId);
   const unresolvedRequirements = unresolvedRuleRequirements(semanticSource, draftPayloads);
-  const payloadErrors = exactPayloadErrors(actions, draftPayloads);
-  const executionPathId = platformExecutionPathId(lottery.platform, plan.execution_path_id);
+  const payloadErrors = exactPayloadErrors(actions, draftPayloads, lottery.platform);
+  const persistedPlanBlockers = savedManualAssisted
+    ? actionPlanV2ReviewBlockers(plan, lottery.platform)
+    : [
+      ...actionPlanV2Blockers(plan, lottery.platform),
+      ...(Array.isArray(plan.payload_validation_errors) ? plan.payload_validation_errors : []),
+      ...(Array.isArray(plan.capability_blockers) ? plan.capability_blockers : []),
+    ];
   const planBlockers = [...new Set([
-    ...(manualAssisted
-      ? actionPlanV2ReviewBlockers(plan, lottery.platform)
-      : actionPlanV2Blockers(plan, lottery.platform)),
-    ...(Array.isArray(plan.payload_validation_errors) ? plan.payload_validation_errors : []),
-    ...(Array.isArray(plan.capability_blockers) ? plan.capability_blockers : []),
+    ...persistedPlanBlockers,
   ])];
-  const planReady = manualAssisted
+  const planReady = savedManualAssisted
     ? actionPlanV2ReviewReady(plan, lottery.platform)
     : actionPlanV2Ready(plan, lottery.platform);
   const draftChanged = !sameActionSet(actions, savedActions)
-    || JSON.stringify(draftPayloads) !== JSON.stringify(savedPayloads);
+    || JSON.stringify(draftPayloads) !== JSON.stringify(savedPayloads)
+    || executionPathId !== savedExecutionPathId;
   const missingSuggestedActions = suggestionActions.filter(action => !savedActions.includes(action));
   const sourceRuleLocked = Boolean(String(lottery.rule_text || '').trim());
   const discoveryManagedSource = sourceRuleCorrectionPath(lottery.platform, lottery.source_type) === 'discovery_refresh';
   const sourceRuleHelpId = `lottery-${lottery.id}-source-rule-help`;
   const mediaRequired = actionPlanHasMediaRequirement({ action_payloads: draftPayloads });
   const mediaRequirementNotice = t(manualAssisted
-    ? 'lotteries.xiaohongshuMediaRequirementManual'
+    ? manualMediaRequirementKey(lottery.platform)
     : 'lotteries.mediaRuleStoredButUnsupported');
-  const requiredActionSetComplete = !manualAssisted
+  const requiredActionSetComplete = !fixedManualActions
     || (actions.length === availableActions.length && sameActionSet(actions, availableActions));
   const saveDisabled = !actions.length
     || !ruleText.trim()
@@ -1204,12 +1387,13 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
 
   useEffect(() => {
     const persistedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
-    const nextActions = isManualAssistedPlatform(lottery.platform)
+    const nextActions = isFixedManualActionPlatform(lottery.platform)
       ? lotteryActionsForPlatform(lottery.platform)
       : persistedActions;
     setActions(nextActions);
     setPayloads(actionPayloadDraft(nextActions, plan.action_payloads, null, lottery.platform));
     setRuleText(lottery.rule_text || '');
+    setExecutionPathId(platformExecutionPathId(lottery.platform, plan.execution_path_id));
     setRuleCompleteConfirmed(false);
     setReviewedConfirmed(false);
     setSuggestion(null);
@@ -1262,7 +1446,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
       const suggestedActions = Array.isArray(suggested.required_actions)
         ? suggested.required_actions
         : [];
-      const nextActions = manualAssisted
+      const nextActions = fixedManualActions
         ? availableActions
         : availableActions.filter(action => suggestedActions.includes(action));
       setActions(nextActions);
@@ -1287,7 +1471,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
       <summary>
         <span className={`badge ${planReady && !draftChanged ? 'badge-ready' : 'badge-warn'}`}>
           {planReady
-            ? t(manualAssisted ? 'lotteries.manualRuleReady' : 'lotteries.ruleReady')
+            ? t(savedManualAssisted ? 'lotteries.manualRuleReady' : 'lotteries.ruleReady')
             : t('lotteries.ruleNeedsReview')}
         </span>
         <span className="small-text">{actionSummary(savedActions, t)}</span>
@@ -1296,7 +1480,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
       <div className="rule-plan-body">
         <div className="rule-plan-snapshots">
           <div className="rule-plan-snapshot">
-            <span>{t(manualAssisted ? 'lotteries.manualSavedPlan' : 'lotteries.savedExecutionPlan')}</span>
+            <span>{t(savedManualAssisted ? 'lotteries.manualSavedPlan' : 'lotteries.savedExecutionPlan')}</span>
             <strong>{actionSummary(savedActions, t)}</strong>
           </div>
           <div className={`rule-plan-snapshot ${draftChanged ? 'is-dirty' : ''}`}>
@@ -1328,8 +1512,35 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
           <div className="notice notice-warning">{mediaRequirementNotice}</div>
         )}
         <SavedExactPayloads payloads={savedPayloads} t={t} />
-        {manualAssisted && (
+        {savedManualAssisted && (
           <ManualAssistedChecklist plan={plan} gate={gate} platform={lottery.platform} t={t} />
+        )}
+
+        {String(lottery.platform || '').trim().toLowerCase() === 'weibo' && (
+          <label>
+            <span>{t('lotteries.executionPath')}</span>
+            <select
+              className="input"
+              value={executionPathId}
+              onChange={event => {
+                setExecutionPathId(event.target.value);
+                setRuleCompleteConfirmed(false);
+                setReviewedConfirmed(false);
+              }}
+            >
+              <option value={WEIBO_OAUTH_EXECUTION_PATH_ID}>
+                {t('lotteries.weiboOAuthExecutionPath')}
+              </option>
+              <option value={WEIBO_MANUAL_EXECUTION_PATH_ID}>
+                {t('lotteries.weiboManualExecutionPath')}
+              </option>
+            </select>
+            <div className="small-text muted-text">
+              {t(manualAssisted
+                ? 'lotteries.weiboManualExecutionPathHint'
+                : 'lotteries.weiboOAuthExecutionPathHint')}
+            </div>
+          </label>
         )}
 
         {draftChanged && (
@@ -1386,14 +1597,14 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
               <input
                 type="checkbox"
                 checked={actions.includes(action)}
-                disabled={manualAssisted}
+                disabled={fixedManualActions}
                 onChange={() => toggle(action)}
               />
               <span>{t(`lotteries.actions.${action}`)}</span>
             </label>
           ))}
         </div>
-        {manualAssisted && (
+        {fixedManualActions && (
           <div className="small-text muted-text">{t('lotteries.xiaohongshuFourActionsFixed')}</div>
         )}
 
@@ -1438,6 +1649,14 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
                     onChange={event => updateTextPayload(action, field, event.target.value)}
                     placeholder={t('lotteries.onePerLine')}
                   />
+                  {field === 'mentions' && friendMentionRequirements[action] && (
+                    <span className="small-text muted-text">
+                      {formatText(t('lotteries.friendMentionRequirement'), {
+                        count: friendMentionRequirements[action].count,
+                        mode: t(`lotteries.friendMentionModes.${friendMentionRequirements[action].mode}`),
+                      })}
+                    </span>
+                  )}
                 </label>
               ))}
               <label>
@@ -1465,7 +1684,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
             {payloadErrors.map(code => actionPlanBlockerText(code, t)).join(' / ')}
           </div>
         )}
-        {manualAssisted && !requiredActionSetComplete && (
+        {fixedManualActions && !requiredActionSetComplete && (
           <div className="notice notice-warning" role="alert">
             {t('lotteries.xiaohongshuFourActionsRequired')}
           </div>
@@ -1566,28 +1785,67 @@ function translationText(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-function exactPayloadErrors(actions, payloads) {
+function isWellFormedUnicode(value) {
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+      index += 1;
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function exactPayloadErrors(actions, payloads, platform = 'bilibili') {
   const errors = [];
   if (actions.includes('followed')) {
     const target = payloads.followed?.target_handle;
-    if (typeof target !== 'string' || !/^@[\w\u4e00-\u9fff-]{1,64}$/u.test(target)) {
+    if (typeof target !== 'string' || !/^@[\p{L}\p{N}_-]{1,64}$/u.test(target)) {
       errors.push('action_payload_followed_target_invalid');
     }
   }
   for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
     const payload = payloads[action] || {};
     const text = String(payload.text || '');
-    if (!text.trim()) errors.push(`action_payload_${action}_text_required`);
+    const plainPlatformRepost = ['douyin', 'weibo'].includes(
+      String(platform || '').trim().toLowerCase(),
+    )
+      && action === 'reposted'
+      && !text.trim()
+      && !['topic_tags', 'mentions', 'media_refs'].some(field => (
+        Array.isArray(payload[field]) && payload[field].length
+      ))
+      && !String(payload.translation || '').trim();
+    if (!text.trim() && !plainPlatformRepost) errors.push(`action_payload_${action}_text_required`);
+    if (!isWellFormedUnicode(text)) errors.push(`action_payload_${action}_text_invalid`);
     if (utf8ByteLength(text) > 4096) errors.push(`action_payload_${action}_text_too_large`);
+    if (String(platform || '').trim().toLowerCase() === 'weibo' && text.length > 140) {
+      errors.push(`weibo_${action}_text_too_long`);
+    }
     for (const field of ['topic_tags', 'mentions', 'media_refs']) {
       const values = Array.isArray(payload[field]) ? payload[field] : [];
       if (values.length > 32) errors.push(`action_payload_${field}_too_many`);
-      if (values.some(item => utf8ByteLength(item) > 512)) {
+      if (values.some(item => (
+        !isWellFormedUnicode(item)
+        || utf8ByteLength(item) > 512
+        || (field === 'mentions' && !/^@[\p{L}\p{N}_-]{1,64}$/u.test(item))
+      ))) {
         errors.push(`action_payload_${field}_invalid`);
       }
     }
-    for (const token of [...(payload.topic_tags || []), ...(payload.mentions || [])]) {
-      if (!text.includes(token)) errors.push('action_payload_required_token_missing');
+    for (const token of payload.topic_tags || []) {
+      if (!actionTextContainsRequiredToken(text, token)) {
+        errors.push('action_payload_required_token_missing');
+      }
+    }
+    for (const mention of payload.mentions || []) {
+      if (!actionTextContainsRequiredToken(text, mention, { mention: true })) {
+        errors.push('action_payload_required_token_missing');
+      }
     }
     if (payload.translation !== undefined && payload.translation !== '') {
       if (typeof payload.translation !== 'string' || !payload.translation.trim()) {
@@ -1595,6 +1853,18 @@ function exactPayloadErrors(actions, payloads) {
       } else if (!text.includes(payload.translation)) {
         errors.push('action_payload_translation_missing');
       }
+    }
+  }
+  if (String(platform || '').trim().toLowerCase() === 'weibo') {
+    const handles = [];
+    if (actions.includes('followed') && payloads.followed?.target_handle) {
+      handles.push(payloads.followed.target_handle);
+    }
+    for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
+      handles.push(...(payloads[action]?.mentions || []));
+    }
+    if (new Set(handles.map(mentionIdentityKey)).size > WEIBO_MAX_UNIQUE_HANDLES) {
+      errors.push('weibo_preflight_unique_handle_limit_exceeded');
     }
   }
   return [...new Set(errors)];
@@ -1605,8 +1875,8 @@ function utf8ByteLength(value) {
 }
 
 function ManualAssistedChecklist({ plan, gate, platform, t }) {
-  const items = xiaohongshuManualChecklist(plan, platform);
-  const shadowObservation = xiaohongshuShadowObservation(gate);
+  const items = manualAssistedChecklist(plan, platform);
+  const shadowObservation = manualShadowObservation(gate);
   return (
     <section className="manual-assisted-checklist" aria-label={t('lotteries.manualChecklistTitle')}>
       <div className="capability-row">

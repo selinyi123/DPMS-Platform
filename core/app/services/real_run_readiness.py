@@ -5,23 +5,35 @@ import json
 import os
 import stat
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.action_plan import (
     ACTION_ORDER,
     BILIBILI_API_EXECUTION_PATH,
+    DOUYIN_MANUAL_EXECUTION_PATH,
+    DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    WEIBO_MANUAL_EXECUTION_BLOCKER,
+    WEIBO_MANUAL_EXECUTION_PATH,
+    WEIBO_ACTION_CAPABILITY_REQUIREMENTS,
+    WEIBO_ACTION_ORDER,
+    WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION,
+    WEIBO_OAUTH_EXECUTION_PATH,
     XIAOHONGSHU_ACTION_ORDER,
     XIAOHONGSHU_MANUAL_EXECUTION_PATH,
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
-    bind_xiaohongshu_manual_follow_target,
+    action_order_for_platform,
+    bind_manual_friend_mentions,
+    bind_manual_follow_target,
     compute_bilibili_api_config_hash,
     compute_config_hash,
     compute_rule_hash,
     compute_target_hash,
     semantic_requirement_status,
     validate_action_plan_v2,
+    validate_friend_mention_requirements,
+    weibo_runtime_capability_requirements,
 )
 from app.adapter_config import (
     STRUCTURED_SELECTOR_PLATFORMS,
@@ -31,6 +43,7 @@ from app.adapter_config import (
     platform_probe_ready_for_real_actions,
     platform_real_adapter_kind,
     selector_config_complete,
+    selector_phase_configured,
     selector_values,
 )
 from app.db import database, redis
@@ -43,6 +56,11 @@ from app.services.bilibili_preflight_evidence import (
 )
 from app.utils.log import structured_log
 from app.utils.lottery_targets import validate_lottery_target
+from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
+from app.utils.weibo_oauth_credential import (
+    WeiboOAuthCredentialError,
+    parse_weibo_oauth_credential,
+)
 
 ACCOUNT_RISK_COOLDOWN_HOURS = 24
 MAX_ACCOUNT_RISK_COOLDOWN_HOURS = 24
@@ -52,6 +70,27 @@ SHADOW_SCREENSHOT_ROOT = EVIDENCE_ROOT / "shadow-runs"
 EVIDENCE_HASH_CHUNK_SIZE = 1024 * 1024
 MAX_SHADOW_SCREENSHOT_BYTES = 32 * 1024 * 1024
 MAX_EVIDENCE_REQUEST_HASH_BYTES = 128 * 1024 * 1024
+WEIBO_OAUTH_CAPABILITY_MAX_AGE = timedelta(hours=24)
+WEIBO_OAUTH_ATTESTATION_KEYS = frozenset(
+    {
+        "contract_version",
+        "calibration_id",
+        "account_id",
+        "execution_revision",
+        "credential_kind",
+        "identity_verified",
+        "app_review_status",
+        "client_type",
+        "verified_at",
+        "evidence_source",
+        "attested_by",
+        "attested_at",
+        "actions",
+    }
+)
+WEIBO_OAUTH_ACTION_ATTESTATION_KEYS = frozenset(
+    {"endpoint", "permission", "granted"}
+)
 ACCOUNT_RISK_COOLDOWN_BY_REASON = {
     # A local action burst should pause the account, not lock it out for a day.
     "action_window": 4,
@@ -125,17 +164,7 @@ def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
 
 
 def phase_configured(platform: str, config: dict, phase: str) -> bool:
-    value = config.get(phase) if isinstance(config, dict) else None
-    if platform not in STRUCTURED_SELECTOR_PLATFORMS:
-        return bool(value)
-    done = selector_values(value.get("done") or value.get("success")) if isinstance(value, dict) else []
-    if phase == "commented":
-        return isinstance(value, dict) and bool(
-            selector_values(value.get("input") or value.get("inputs"))
-            and selector_values(value.get("submit") or value.get("submits"))
-            and done
-        )
-    return bool(click_selectors(value) and done)
+    return selector_phase_configured(platform, config, phase)
 
 
 def qualified_shadow_observation(payload, required_actions: list[str]) -> bool:
@@ -157,13 +186,18 @@ def qualified_shadow_observation(payload, required_actions: list[str]) -> bool:
     return bool(expected and payload.get("screenshot_path"))
 
 
-def qualified_xiaohongshu_manual_shadow_observation(payload) -> bool:
-    """Validate XHS selector evidence without upgrading it to real-ready.
+def qualified_manual_shadow_observation(
+    payload,
+    *,
+    required_actions: tuple[str, ...] | list[str],
+    capability_blocker: str,
+) -> bool:
+    """Validate manual-only selector evidence without making it real-ready.
 
     The Worker deliberately reports ``qualified=false`` because no official
-    interaction API exists.  This independent contract records that all four
-    selectors were observed while preserving the manual-confirmation boundary;
-    the generic real-run validator above must remain strict.
+    participant interaction API exists. This independent contract records that
+    every required selector was observed while preserving the manual-
+    confirmation boundary; the generic real-run validator remains strict.
     """
 
     if not isinstance(payload, dict):
@@ -174,15 +208,14 @@ def qualified_xiaohongshu_manual_shadow_observation(payload) -> bool:
         or payload.get("selector_observation_complete") is not True
         or payload.get("manual_confirmation_required") is not True
         or payload.get("real_run_capable") is not False
-        or payload.get("capability_block_reason")
-        != XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER
-        or payload.get("required_phases") != list(XIAOHONGSHU_ACTION_ORDER)
+        or payload.get("capability_block_reason") != capability_blocker
+        or payload.get("required_phases") != list(required_actions)
     ):
         return False
     visible = payload.get("visible_phases")
     if not isinstance(visible, dict):
         return False
-    for phase in XIAOHONGSHU_ACTION_ORDER:
+    for phase in required_actions:
         observation = visible.get(phase)
         if phase == "commented":
             if (
@@ -194,6 +227,42 @@ def qualified_xiaohongshu_manual_shadow_observation(payload) -> bool:
         elif not observation:
             return False
     return bool(payload.get("screenshot_path"))
+
+
+def qualified_xiaohongshu_manual_shadow_observation(payload) -> bool:
+    """Backward-compatible XHS four-action observation validator."""
+
+    return qualified_manual_shadow_observation(
+        payload,
+        required_actions=XIAOHONGSHU_ACTION_ORDER,
+        capability_blocker=XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
+    )
+
+
+def qualified_douyin_manual_shadow_observation(
+    payload,
+    required_actions: tuple[str, ...] | list[str],
+) -> bool:
+    """Validate a variable-action Douyin manual shadow observation."""
+
+    return qualified_manual_shadow_observation(
+        payload,
+        required_actions=required_actions,
+        capability_blocker=DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    )
+
+
+def qualified_weibo_manual_shadow_observation(
+    payload,
+    required_actions: tuple[str, ...] | list[str],
+) -> bool:
+    """Validate the explicit Weibo manual-fallback observation contract."""
+
+    return qualified_manual_shadow_observation(
+        payload,
+        required_actions=required_actions,
+        capability_blocker=WEIBO_MANUAL_EXECUTION_BLOCKER,
+    )
 
 
 def shadow_screenshot_integrity_matches(
@@ -1232,21 +1301,32 @@ async def validate_bilibili_v2_evidence(lottery, account_id: int | None) -> dict
     }
 
 
-async def validate_xiaohongshu_manual_contract(
+async def validate_manual_only_contract(
     lottery,
     account_id: int | None = None,
     *,
+    platform: str,
+    execution_path_id: str,
+    capability_blocker: str | None,
+    execution_path_blocker: str | None = None,
+    expected_executable: bool = False,
+    media_capability_blocker: str = "bilibili_media_submission_unsupported",
+    required_action_contract: tuple[str, ...] | None = None,
+    manual_shadow_supported: bool = True,
+    shadow_observation_blocker: str | None = None,
     evidence_batch: RealRunEvidenceBatch | None = None,
 ) -> dict:
-    """Validate an exact XHS manual checklist while always denying real-run.
+    """Validate an exact manual checklist while always denying real-run.
 
     Selector observations may support a side-effect-free shadow run, but they
     cannot establish an official mutation capability.  Keeping plan readiness
-    separate from execution capability lets operators review an exact four-
-    action checklist without ever turning that checklist into real-run proof.
+    separate from execution capability lets operators review an exact
+    checklist without ever turning that checklist into real-run proof.
     """
 
-    blockers: list[str] = [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER]
+    blockers: list[str] = []
+    if capability_blocker:
+        blockers.append(capability_blocker)
     lottery_data = dict(lottery)
     target = validate_lottery_target(
         lottery_data.get("platform"), lottery_data.get("raw_url")
@@ -1270,17 +1350,29 @@ async def validate_xiaohongshu_manual_contract(
     semantic_ready = False
     capability_binding_ready = False
     if plan is not None:
-        if plan.plan.get("platform") != "xiaohongshu":
+        if plan.plan.get("platform") != platform:
             _append_blocker(blockers, "action_plan_platform_mismatch")
-        if plan.execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH:
+        if plan.execution_path_id != execution_path_id:
             _append_blocker(
-                blockers, "xiaohongshu_execution_path_not_supported"
+                blockers,
+                execution_path_blocker
+                or (
+                    "xiaohongshu_execution_path_not_supported"
+                    if platform == "xiaohongshu"
+                    else f"{platform}_execution_path_invalid"
+                ),
             )
-        if tuple(plan.required_actions) != XIAOHONGSHU_ACTION_ORDER:
+        if (
+            required_action_contract is not None
+            and tuple(plan.required_actions) != required_action_contract
+        ):
             _append_blocker(blockers, "xiaohongshu_four_action_plan_required")
-        if plan.plan.get("executable") is not False:
+        if plan.plan.get("executable") is not expected_executable:
             _append_blocker(
-                blockers, "xiaohongshu_manual_plan_must_be_non_executable"
+                blockers,
+                f"{platform}_manual_plan_must_be_non_executable"
+                if not expected_executable
+                else "lottery_action_plan_not_executable",
             )
 
         rule_text = str(lottery_data.get("rule_text") or "")
@@ -1313,7 +1405,7 @@ async def validate_xiaohongshu_manual_contract(
                        FROM lottery_rule_snapshots
                        WHERE id = :snapshot_id
                          AND lottery_id = :lottery_id
-                         AND platform = 'xiaohongshu'
+                         AND platform = :platform
                          AND rule_hash = :rule_hash
                          AND BINARY rule_text = BINARY :rule_text
                          AND is_complete = 1
@@ -1325,6 +1417,7 @@ async def validate_xiaohongshu_manual_contract(
                         "lottery_id": lottery_data.get("id"),
                         "rule_hash": exact_rule_hash,
                         "rule_text": rule_text,
+                        "platform": platform,
                     },
                 )
                 rule_snapshot_ready = bool(snapshot)
@@ -1333,32 +1426,63 @@ async def validate_xiaohongshu_manual_contract(
                         blockers, "authoritative_rule_snapshot_required"
                     )
 
-            parsed_rule = parse_lottery_rule(rule_text, "xiaohongshu")
+            parsed_rule = parse_lottery_rule(rule_text, platform)
+            platform_action_order = action_order_for_platform(platform)
             parsed_actions = tuple(
                 action
-                for action in XIAOHONGSHU_ACTION_ORDER
+                for action in platform_action_order
                 if action in set(parsed_rule.get("required_actions") or [])
             )
-            expected_content_requirements = bind_xiaohongshu_manual_follow_target(
-                list(parsed_actions),
-                plan.action_payloads,
+            source_content_requirements = dict(
                 parsed_rule.get("content_requirements")
                 or {
                     "follow_targets": [],
                     "commented": {"topic_tags": [], "mentions": []},
                     "reposted": {"topic_tags": [], "mentions": []},
-                },
+                }
+            )
+            try:
+                expected_friend_mentions = validate_friend_mention_requirements(
+                    parsed_rule.get("friend_mention_requirements", {})
+                )
+            except ActionPlanV2Error:
+                expected_friend_mentions = {}
+                _append_blocker(
+                    blockers,
+                    "action_plan_friend_mention_requirement_binding_mismatch",
+                )
+            expected_content_requirements = bind_manual_follow_target(
+                list(parsed_actions),
+                plan.action_payloads,
+                source_content_requirements,
+            )
+            expected_content_requirements = bind_manual_friend_mentions(
+                plan.action_payloads,
+                expected_content_requirements,
+                expected_friend_mentions,
             )
             represented, unresolved, semantic_capability = (
                 semantic_requirement_status(
                     list(parsed_rule.get("unsupported_actions") or []),
                     plan.action_payloads,
                     expected_content_requirements,
+                    friend_mention_requirements=expected_friend_mentions,
+                    source_content_requirements=source_content_requirements,
+                    media_capability_blocker=media_capability_blocker,
                 )
             )
             if not parsed_rule.get("is_lottery"):
                 _append_blocker(blockers, "lottery_rule_not_recognized")
-            if parsed_actions != XIAOHONGSHU_ACTION_ORDER:
+            expected_actions = (
+                required_action_contract
+                if required_action_contract is not None
+                else parsed_actions
+            )
+            source_actions_ready = bool(
+                parsed_actions == expected_actions
+                and tuple(plan.required_actions) == expected_actions
+            )
+            if not source_actions_ready:
                 _append_blocker(blockers, "lottery_action_plan_stale")
             if parsed_rule.get("ambiguity_patterns"):
                 _append_blocker(blockers, "lottery_rule_ambiguous")
@@ -1371,7 +1495,10 @@ async def validate_xiaohongshu_manual_contract(
 
             expected_capability = list(
                 dict.fromkeys(
-                    [*semantic_capability, XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER]
+                    [
+                        *semantic_capability,
+                        *([capability_blocker] if capability_blocker else []),
+                    ]
                 )
             )
             capability_binding_ready = (
@@ -1398,9 +1525,24 @@ async def validate_xiaohongshu_manual_contract(
                 _append_blocker(
                     blockers, "action_plan_requirement_binding_mismatch"
                 )
+            if (
+                "source_content_requirements" in plan.plan
+                and plan.source_content_requirements
+                != source_content_requirements
+            ):
+                _append_blocker(
+                    blockers,
+                    "action_plan_friend_mention_requirement_binding_mismatch",
+                )
+            if plan.friend_mention_requirements != expected_friend_mentions:
+                _append_blocker(
+                    blockers,
+                    "action_plan_friend_mention_requirement_binding_mismatch",
+                )
             semantic_ready = bool(
                 parsed_rule.get("is_lottery")
-                and parsed_actions == XIAOHONGSHU_ACTION_ORDER
+                and source_actions_ready
+                and bool(expected_actions)
                 and not parsed_rule.get("ambiguity_patterns")
                 and not unresolved
                 and not semantic_capability
@@ -1408,9 +1550,12 @@ async def validate_xiaohongshu_manual_contract(
 
     action_plan_ready = bool(
         plan is not None
-        and plan.plan.get("executable") is False
-        and plan.execution_path_id == XIAOHONGSHU_MANUAL_EXECUTION_PATH
-        and tuple(plan.required_actions) == XIAOHONGSHU_ACTION_ORDER
+        and plan.plan.get("executable") is expected_executable
+        and plan.execution_path_id == execution_path_id
+        and (
+            required_action_contract is None
+            or tuple(plan.required_actions) == required_action_contract
+        )
         and rule_snapshot_ready
         and semantic_ready
         and capability_binding_ready
@@ -1420,8 +1565,8 @@ async def validate_xiaohongshu_manual_contract(
             or blocker.startswith("lottery_rule_")
             or blocker.startswith("authoritative_rule_")
             or blocker.startswith("xiaohongshu_four_")
-            or blocker.startswith("xiaohongshu_execution_path_")
-            or blocker.startswith("xiaohongshu_manual_plan_")
+            or blocker.startswith(f"{platform}_execution_path_")
+            or blocker.startswith(f"{platform}_manual_plan_")
             for blocker in blockers
         )
     )
@@ -1430,7 +1575,9 @@ async def validate_xiaohongshu_manual_contract(
     if account_id is not None:
         account_filter = "AND account_id = :account_id"
         task_values["account_id"] = account_id
-    if evidence_batch is None:
+    if not manual_shadow_supported:
+        shadow = None
+    elif evidence_batch is None:
         shadow = await database.fetch_one(
             f"""SELECT task_id, account_id, finished_at, screenshot_path
                 FROM task_runs
@@ -1447,7 +1594,12 @@ async def validate_xiaohongshu_manual_contract(
         shadow = evidence_batch.shadows.get(int(lottery_data.get("id")))
 
     selector_observation_complete = False
-    if plan is not None and shadow and row_value(shadow, "screenshot_path"):
+    if (
+        manual_shadow_supported
+        and plan is not None
+        and shadow
+        and row_value(shadow, "screenshot_path")
+    ):
         shadow_task_id = row_value(shadow, "task_id")
         shadow_account_id = row_value(shadow, "account_id")
         expected_account_id = (
@@ -1498,14 +1650,18 @@ async def validate_xiaohongshu_manual_contract(
         evidence_path = str(row_value(evidence_file, "file_path") or "")
         evidence_hash = str(row_value(evidence_file, "sha256") or "").lower()
         metadata_matches = bool(
-            qualified_xiaohongshu_manual_shadow_observation(
-                observation_payload
+            qualified_manual_shadow_observation(
+                observation_payload,
+                required_actions=plan.required_actions,
+                capability_blocker=(
+                    shadow_observation_blocker or capability_blocker or ""
+                ),
             )
             and str(observation_payload.get("account_id"))
             == str(expected_account_id)
             and str(observation_payload.get("lottery_id"))
             == str(lottery_data.get("id"))
-            and str(observation_payload.get("platform")) == "xiaohongshu"
+            and str(observation_payload.get("platform")) == platform
             and screenshot_path
             == str(observation_payload.get("screenshot_path") or "")
             and screenshot_path == evidence_path
@@ -1537,15 +1693,514 @@ async def validate_xiaohongshu_manual_contract(
         "execution_evidence_bound": False,
         "execution_evidence_id": None,
         "execution_evidence": None,
-        "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
-        "execution_mode": "manual_assisted",
+        "execution_path_id": execution_path_id,
+        "execution_mode": "manual_assisted" if not expected_executable else "oauth",
         "real_run_supported": False,
-        "capability_reason": XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
-        "manual_shadow_supported": True,
+        "capability_reason": capability_blocker,
+        "manual_shadow_supported": manual_shadow_supported,
         "selector_observation_complete": selector_observation_complete,
         "manual_confirmation_required": True,
         "account_risk": None,
     }
+
+
+def _parse_utc_timestamp(value) -> datetime | None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+    ):
+        return None
+    token = value
+    if token.endswith("Z"):
+        token = f"{token[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(token)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_weibo_oauth_capability_attestation(
+    calibration_result,
+    *,
+    required_actions: tuple[str, ...] | list[str],
+    account_id: int,
+    execution_revision: int,
+    calibration_fresh: bool,
+    expected_calibration_id: str | None = None,
+    expected_uid: str | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Validate a non-secret, account-bound official OAuth capability proof."""
+
+    blockers: list[str] = []
+    denied_actions: list[str] = []
+    parsed = parse_json_field(calibration_result)
+    capabilities = (
+        parsed.get("oauth_capabilities")
+        if isinstance(parsed, dict)
+        else None
+    )
+    if not isinstance(capabilities, dict):
+        return {
+            "ready": False,
+            "blockers": ["weibo_oauth_capability_evidence_required"],
+            "denied_actions": [],
+            "evidence": None,
+        }
+    if expected_uid is not None:
+        identity = parsed.get("identity") if isinstance(parsed, dict) else None
+        if (
+            not isinstance(identity, dict)
+            or identity.get("verified") is not True
+            or identity.get("method") != "weibo_account_get_uid"
+            or str(identity.get("uid") or "") != str(expected_uid)
+        ):
+            _append_blocker(
+                blockers, "weibo_oauth_identity_verification_required"
+            )
+    if set(capabilities) != WEIBO_OAUTH_ATTESTATION_KEYS:
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    if (
+        type(capabilities.get("contract_version")) is not int
+        or capabilities.get("contract_version")
+        != WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    capability_calibration_id = capabilities.get("calibration_id")
+    if (
+        not isinstance(capability_calibration_id, str)
+        or not capability_calibration_id
+        or capability_calibration_id != capability_calibration_id.strip()
+        or len(capability_calibration_id) > 128
+        or (
+            expected_calibration_id is not None
+            and capability_calibration_id != expected_calibration_id
+        )
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    if (
+        type(capabilities.get("account_id")) is not int
+        or capabilities.get("account_id") != account_id
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    if (
+        type(capabilities.get("execution_revision")) is not int
+        or capabilities.get("execution_revision") != execution_revision
+    ):
+        _append_blocker(blockers, "weibo_oauth_execution_revision_mismatch")
+    if capabilities.get("credential_kind") != "weibo_oauth":
+        _append_blocker(blockers, "weibo_oauth_credential_kind_invalid")
+    if capabilities.get("identity_verified") is not True:
+        _append_blocker(blockers, "weibo_oauth_identity_verification_required")
+    if (
+        capabilities.get("evidence_source")
+        != "operator_attested_app_capabilities"
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    attested_by = capabilities.get("attested_by")
+    if (
+        not isinstance(attested_by, str)
+        or not attested_by
+        or attested_by != attested_by.strip()
+        or len(attested_by.encode("utf-8")) > 128
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    if capabilities.get("app_review_status") not in {
+        "approved",
+        "test_only",
+        "unknown",
+    }:
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    elif capabilities.get("app_review_status") != "approved":
+        _append_blocker(blockers, "weibo_oauth_app_review_required")
+    if capabilities.get("client_type") not in {"weibo", "other"}:
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    if calibration_fresh is not True:
+        _append_blocker(blockers, "weibo_oauth_capability_evidence_stale")
+
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        _append_blocker(blockers, "weibo_oauth_capability_evidence_stale")
+        current = datetime.now(timezone.utc)
+    current = current.astimezone(timezone.utc)
+    verified_at = _parse_utc_timestamp(capabilities.get("verified_at"))
+    attested_at = _parse_utc_timestamp(capabilities.get("attested_at"))
+    if (
+        verified_at is None
+        or verified_at > current
+        or current - verified_at > WEIBO_OAUTH_CAPABILITY_MAX_AGE
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_evidence_stale")
+    if (
+        attested_at is None
+        or attested_at > current
+        or current - attested_at > WEIBO_OAUTH_CAPABILITY_MAX_AGE
+        or (verified_at is not None and attested_at > verified_at)
+    ):
+        _append_blocker(blockers, "weibo_oauth_capability_evidence_stale")
+
+    expected = weibo_runtime_capability_requirements(required_actions)
+    declared_actions = capabilities.get("actions")
+    if (
+        not isinstance(declared_actions, dict)
+        or set(declared_actions) != set(WEIBO_ACTION_ORDER)
+    ):
+        declared_actions = {}
+        _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+    else:
+        for action in WEIBO_ACTION_ORDER:
+            evidence = declared_actions.get(action)
+            expected_requirement = WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action]
+            if (
+                not isinstance(evidence, dict)
+                or set(evidence) != WEIBO_OAUTH_ACTION_ATTESTATION_KEYS
+                or evidence.get("endpoint")
+                != expected_requirement["endpoint"]
+                or evidence.get("permission")
+                != expected_requirement["permission"]
+                or type(evidence.get("granted")) is not bool
+            ):
+                _append_blocker(
+                    blockers, "weibo_oauth_capability_contract_mismatch"
+                )
+    for action, requirement in expected["actions"].items():
+        evidence = declared_actions.get(action)
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != WEIBO_OAUTH_ACTION_ATTESTATION_KEYS
+            or evidence.get("endpoint") != requirement["endpoint"]
+            or evidence.get("permission") != requirement["permission"]
+            or type(evidence.get("granted")) is not bool
+        ):
+            _append_blocker(blockers, "weibo_oauth_capability_contract_mismatch")
+            denied_actions.append(action)
+            continue
+        if evidence.get("granted") is not True:
+            denied_actions.append(action)
+    denied_actions = [
+        action for action in expected["actions"] if action in set(denied_actions)
+    ]
+    if denied_actions:
+        _append_blocker(blockers, "weibo_oauth_action_capability_denied")
+    if (
+        "followed" in expected["actions"]
+        and capabilities.get("client_type") != "weibo"
+    ):
+        _append_blocker(blockers, "weibo_oauth_follow_client_type_required")
+
+    evidence_view = {
+        "contract_version": capabilities.get("contract_version"),
+        "calibration_id": capabilities.get("calibration_id"),
+        "account_id": capabilities.get("account_id"),
+        "execution_revision": capabilities.get("execution_revision"),
+        "credential_kind": capabilities.get("credential_kind"),
+        "identity_verified": capabilities.get("identity_verified") is True,
+        "app_review_status": capabilities.get("app_review_status"),
+        "client_type": capabilities.get("client_type"),
+        "verified_at": capabilities.get("verified_at"),
+        "evidence_source": capabilities.get("evidence_source"),
+        "attested_by": capabilities.get("attested_by"),
+        "attested_at": capabilities.get("attested_at"),
+        "granted_actions": [
+            action
+            for action in expected["actions"]
+            if isinstance(declared_actions.get(action), dict)
+            and declared_actions[action].get("granted") is True
+        ],
+        "denied_actions": denied_actions,
+        "secret_material_exposed": False,
+    }
+    return {
+        "ready": not blockers,
+        "blockers": blockers,
+        "denied_actions": denied_actions,
+        "evidence": evidence_view,
+    }
+
+
+async def validate_xiaohongshu_manual_contract(
+    lottery,
+    account_id: int | None = None,
+    *,
+    evidence_batch: RealRunEvidenceBatch | None = None,
+) -> dict:
+    """Validate XHS's exact four-action manual-only contract."""
+
+    return await validate_manual_only_contract(
+        lottery,
+        account_id=account_id,
+        platform="xiaohongshu",
+        execution_path_id=XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        capability_blocker=XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
+        required_action_contract=XIAOHONGSHU_ACTION_ORDER,
+        evidence_batch=evidence_batch,
+    )
+
+
+async def validate_douyin_manual_contract(
+    lottery,
+    account_id: int | None = None,
+    *,
+    evidence_batch: RealRunEvidenceBatch | None = None,
+) -> dict:
+    """Validate a variable-action Douyin manual-only contract."""
+
+    return await validate_manual_only_contract(
+        lottery,
+        account_id=account_id,
+        platform="douyin",
+        execution_path_id=DOUYIN_MANUAL_EXECUTION_PATH,
+        capability_blocker=DOUYIN_NO_OFFICIAL_API_BLOCKER,
+        media_capability_blocker="douyin_media_submission_unsupported",
+        evidence_batch=evidence_batch,
+    )
+
+
+async def validate_weibo_manual_contract(
+    lottery,
+    account_id: int | None = None,
+    *,
+    evidence_batch: RealRunEvidenceBatch | None = None,
+) -> dict:
+    """Validate the explicit Weibo checklist fallback; never allow writes."""
+
+    return await validate_manual_only_contract(
+        lottery,
+        account_id=account_id,
+        platform="weibo",
+        execution_path_id=WEIBO_MANUAL_EXECUTION_PATH,
+        capability_blocker=WEIBO_MANUAL_EXECUTION_BLOCKER,
+        execution_path_blocker="weibo_execution_path_invalid",
+        media_capability_blocker="weibo_media_submission_unsupported",
+        evidence_batch=evidence_batch,
+    )
+
+
+async def validate_weibo_oauth_contract(
+    lottery,
+    account_id: int | None = None,
+    *,
+    evidence_batch: RealRunEvidenceBatch | None = None,
+) -> dict:
+    """Validate Weibo OAuth semantics and fresh per-action capability proof."""
+
+    result = await validate_manual_only_contract(
+        lottery,
+        account_id=account_id,
+        platform="weibo",
+        execution_path_id=WEIBO_OAUTH_EXECUTION_PATH,
+        capability_blocker=None,
+        execution_path_blocker="weibo_execution_path_invalid",
+        expected_executable=True,
+        media_capability_blocker="weibo_media_submission_unsupported",
+        # Official OAuth mutations are independently authenticated and
+        # capability-attested. A selector shadow requires a browser-session
+        # credential, which cannot coexist in the execution account's single
+        # credential slot; making it a prerequisite would make this path
+        # unreachable or encourage stale cross-account evidence reuse.
+        manual_shadow_supported=False,
+        evidence_batch=evidence_batch,
+    )
+    blockers = list(result.get("blockers") or [])
+    capability = {
+        "ready": False,
+        "blockers": [],
+        "denied_actions": [],
+        "evidence": None,
+    }
+    execution_revision = None
+    calibration_id = None
+    credential_present = False
+    account_risk = None
+    oauth_dry_run_ready = False
+    oauth_dry_run_task_id = None
+    if account_id is None:
+        _append_blocker(blockers, "weibo_oauth_account_scope_required")
+    else:
+        account = await database.fetch_one(
+            """SELECT a.id, a.status, a.execution_revision,
+                      a.encrypted_credential,
+                      c.calibration_id, c.status AS calibration_status,
+                      c.result AS calibration_result,
+                      (c.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS calibration_fresh
+                 FROM accounts a
+                 LEFT JOIN account_calibrations c
+                   ON c.id = (
+                     SELECT latest.id
+                     FROM account_calibrations latest
+                     WHERE latest.account_id = a.id
+                       AND latest.platform = 'weibo'
+                     ORDER BY latest.id DESC
+                     LIMIT 1
+                   )
+                 WHERE a.id = :account_id
+                   AND a.platform = 'weibo'
+                   AND a.deleted_at IS NULL
+                 LIMIT 1""",
+            {"account_id": account_id},
+        )
+        if not account:
+            _append_blocker(blockers, "weibo_oauth_account_scope_required")
+        else:
+            execution_revision = int(row_value(account, "execution_revision") or 0)
+            calibration_id = row_value(account, "calibration_id")
+            if str(row_value(account, "status") or "").lower() != "ready":
+                _append_blocker(blockers, "execution_account_not_ready")
+            encrypted_credential = row_value(account, "encrypted_credential")
+            oauth_credential = None
+            if not encrypted_credential:
+                _append_blocker(blockers, "weibo_oauth_credential_required")
+            else:
+                try:
+                    decrypted_credential = cookie_vault.decrypt(
+                        encrypted_credential,
+                        aad=CREDENTIAL_AAD,
+                    )
+                    oauth_credential = parse_weibo_oauth_credential(
+                        decrypted_credential
+                    )
+                except WeiboOAuthCredentialError as exc:
+                    _append_blocker(blockers, exc.code)
+                except Exception:
+                    _append_blocker(
+                        blockers, "weibo_oauth_credential_invalid"
+                    )
+            credential_present = oauth_credential is not None
+            if row_value(account, "calibration_status") != "succeeded":
+                _append_blocker(
+                    blockers, "weibo_oauth_capability_evidence_required"
+                )
+            else:
+                plan = None
+                try:
+                    plan = validate_action_plan_v2(
+                        parse_json_field(dict(lottery).get("action_plan")),
+                        require_executable=True,
+                    )
+                except ActionPlanV2Error:
+                    pass
+                if plan is not None:
+                    capability = validate_weibo_oauth_capability_attestation(
+                        row_value(account, "calibration_result"),
+                        required_actions=plan.required_actions,
+                        account_id=account_id,
+                        execution_revision=execution_revision,
+                        calibration_fresh=bool(
+                            row_value(account, "calibration_fresh")
+                        ),
+                        expected_calibration_id=str(calibration_id or ""),
+                        expected_uid=(
+                            oauth_credential.get("uid")
+                            if oauth_credential is not None
+                            else None
+                        ),
+                    )
+                    for blocker in capability["blockers"]:
+                        _append_blocker(blockers, blocker)
+                    try:
+                        dry_config_hash = compute_config_hash(
+                            {
+                                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                                "execution_revision": execution_revision,
+                                "runtime_capability_requirements": (
+                                    plan.runtime_capability_requirements
+                                ),
+                                "weibo_rip_hash": "",
+                            }
+                        )
+                        dry_run = await database.fetch_one(
+                            """SELECT tr.task_id
+                                 FROM task_runs tr
+                                 JOIN account_operation_leases lease
+                                   ON lease.lease_id = tr.account_lease_id
+                                  AND lease.account_id = tr.account_id
+                                  AND lease.generation = tr.account_lease_generation
+                                  AND lease.owner_id = tr.task_id
+                                  AND lease.task_id = tr.task_id
+                                  AND lease.operation_kind = 'dry_run'
+                                WHERE tr.lottery_id = :lottery_id
+                                  AND tr.account_id = :account_id
+                                  AND tr.task_mode = 'dry_run'
+                                  AND tr.status = 'succeeded'
+                                  AND tr.finished_at IS NOT NULL
+                                  AND tr.finished_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                                  AND tr.finished_at <= NOW()
+                                  AND tr.rule_snapshot_id = :rule_snapshot_id
+                                  AND tr.execution_path_id = :execution_path_id
+                                  AND tr.target_hash = :target_hash
+                                  AND tr.rule_hash = :rule_hash
+                                  AND tr.action_plan_hash = :action_plan_hash
+                                  AND tr.config_hash = :config_hash
+                                  AND lease.released_at IS NOT NULL
+                                  AND lease.released_at >= tr.finished_at
+                                  AND lease.released_at <= NOW()
+                                ORDER BY tr.finished_at DESC, tr.id DESC
+                                LIMIT 1""",
+                            {
+                                "lottery_id": dict(lottery).get("id"),
+                                "account_id": account_id,
+                                "rule_snapshot_id": plan.rule_snapshot_id,
+                                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                                "target_hash": compute_target_hash(
+                                    str(dict(lottery).get("canonical_url") or "")
+                                ),
+                                "rule_hash": plan.rule_hash,
+                                "action_plan_hash": plan.plan_hash,
+                                "config_hash": dry_config_hash,
+                            },
+                        )
+                    except (ActionPlanV2Error, TypeError, ValueError):
+                        dry_run = None
+                    if dry_run:
+                        oauth_dry_run_ready = True
+                        oauth_dry_run_task_id = str(
+                            row_value(dry_run, "task_id") or ""
+                        ) or None
+                    else:
+                        _append_blocker(
+                            blockers, "recent_oauth_dry_run_required"
+                        )
+            account_risk = await recent_account_risk(account_id)
+            if account_risk["has_recent_risk"]:
+                _append_blocker(blockers, "recent_account_risk_event")
+
+    capability_ready = bool(
+        credential_present
+        and capability.get("ready")
+        and result.get("action_plan_ready")
+    )
+    result.update(
+        {
+            "allowed": (
+                not blockers and capability_ready and oauth_dry_run_ready
+            ),
+            "blockers": blockers,
+            "probe_ready": capability_ready,
+            "shadow_ready": False,
+            "execution_preflight_ready": oauth_dry_run_ready,
+            "oauth_dry_run_ready": oauth_dry_run_ready,
+            "oauth_dry_run_task_id": oauth_dry_run_task_id,
+            "execution_evidence_bound": capability_ready,
+            "execution_evidence_id": calibration_id if capability_ready else None,
+            "execution_evidence": capability.get("evidence"),
+            "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+            "execution_revision": execution_revision,
+            "execution_mode": "oauth",
+            "real_run_supported": True,
+            "capability_reason": blockers[0] if blockers else None,
+            "oauth_capability_ready": capability_ready,
+            "oauth_capability_denied_actions": capability.get(
+                "denied_actions", []
+            ),
+            "manual_confirmation_required": True,
+            "account_risk": account_risk,
+        }
+    )
+    return result
 
 
 async def validate_real_run_evidence(
@@ -1558,6 +2213,30 @@ async def validate_real_run_evidence(
         raise ValueError("real-run evidence batch account scope mismatch")
     if lottery["platform"] == "xiaohongshu":
         return await validate_xiaohongshu_manual_contract(
+            lottery,
+            account_id=account_id,
+            evidence_batch=evidence_batch,
+        )
+    if lottery["platform"] == "douyin":
+        return await validate_douyin_manual_contract(
+            lottery,
+            account_id=account_id,
+            evidence_batch=evidence_batch,
+        )
+    if lottery["platform"] == "weibo":
+        raw_plan = parse_json_field(dict(lottery).get("action_plan"))
+        execution_path_id = (
+            str(raw_plan.get("execution_path_id") or "")
+            if isinstance(raw_plan, dict)
+            else ""
+        )
+        if execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+            return await validate_weibo_manual_contract(
+                lottery,
+                account_id=account_id,
+                evidence_batch=evidence_batch,
+            )
+        return await validate_weibo_oauth_contract(
             lottery,
             account_id=account_id,
             evidence_batch=evidence_batch,
@@ -1844,8 +2523,19 @@ def next_action_for_blockers(blockers: list[str]) -> str:
         )
     ):
         return "review_rule"
-    if XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER in blockers:
+    if (
+        XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER in blockers
+        or DOUYIN_NO_OFFICIAL_API_BLOCKER in blockers
+        or WEIBO_MANUAL_EXECUTION_BLOCKER in blockers
+    ):
         return "manual_assisted"
+    if "weibo_oauth_account_scope_required" in blockers:
+        return "select_account"
+    if any(
+        str(blocker).startswith("weibo_oauth_")
+        for blocker in blockers
+    ):
+        return "configure_oauth"
     if "no_calibrated_ready_account" in blockers:
         return "add_account"
     if "recent_account_risk_event" in blockers:
@@ -1942,11 +2632,19 @@ async def real_run_gate_status(
         "adapter_kind": adapter_kind,
         "selector_ready": selector_ready,
         "api_adapter_ready": adapter_kind == "api",
+        "oauth_adapter_ready": adapter_kind == "oauth" and bool(
+            evidence.get("oauth_capability_ready")
+        ),
         "safe_accounts": account_summary["ready_accounts"],
         "risk_clear_accounts": account_summary["runnable_accounts"],
         "account_risk": evidence["account_risk"] or account_summary["latest_recent_risk"],
         "probe_ready": evidence["probe_ready"],
         "shadow_ready": evidence["shadow_ready"],
+        "execution_preflight_ready": bool(
+            evidence.get("execution_preflight_ready", evidence["shadow_ready"])
+        ),
+        "oauth_dry_run_ready": bool(evidence.get("oauth_dry_run_ready")),
+        "oauth_dry_run_task_id": evidence.get("oauth_dry_run_task_id"),
         "action_plan_ready": evidence["action_plan_ready"],
         "rule_snapshot_ready": bool(evidence.get("rule_snapshot_ready")),
         "execution_evidence_bound": bool(evidence.get("execution_evidence_bound")),
@@ -1956,6 +2654,9 @@ async def real_run_gate_status(
         "execution_mode": evidence.get("execution_mode"),
         "real_run_supported": evidence.get("real_run_supported", True),
         "capability_reason": evidence.get("capability_reason"),
+        "oauth_capability_denied_actions": list(
+            evidence.get("oauth_capability_denied_actions") or []
+        ),
         "manual_shadow_supported": bool(
             evidence.get("manual_shadow_supported")
         ),

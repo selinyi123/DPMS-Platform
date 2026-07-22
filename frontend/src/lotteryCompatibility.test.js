@@ -10,8 +10,12 @@ import {
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
   executionEvidencePresentation,
+  isFixedManualActionPlatform,
+  isManualAssistedPlan,
   isManualAssistedPlatform,
   lotteryActionsForPlatform,
+  manualAssistedChecklist,
+  manualShadowObservation,
   platformDispatchBlocker,
   platformExecutionPathId,
   realRunEvidencePath,
@@ -49,6 +53,7 @@ function planV2(overrides = {}) {
     },
     executable: true,
     review_required: false,
+    reviewed_by: 'operator-1',
     rule_complete_confirmed: true,
     ...overrides,
   };
@@ -76,8 +81,96 @@ function xiaohongshuPlanV2(overrides = {}) {
     },
     executable: false,
     review_required: false,
+    reviewed_by: 'operator-1',
     rule_complete_confirmed: true,
     capability_blockers: ['xiaohongshu_no_official_interaction_api'],
+    ...overrides,
+  };
+}
+
+function douyinPlanV2(overrides = {}) {
+  return {
+    version: 2,
+    platform: 'douyin',
+    execution_path_id: 'douyin_manual_v1',
+    rule_snapshot_id: 12,
+    rule_hash: 'e'.repeat(64),
+    plan_hash: 'f'.repeat(64),
+    required_actions: ['followed', 'liked', 'commented', 'favorited'],
+    action_payloads: {
+      followed: { target_handle: '@creator' },
+      liked: {},
+      commented: { text: '#抽奖# 精确评论', topic_tags: ['#抽奖#'] },
+      favorited: {},
+    },
+    content_requirements: {
+      follow_targets: ['@creator'],
+      commented: { topic_tags: ['#抽奖#'], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    executable: false,
+    review_required: false,
+    reviewed_by: 'operator-1',
+    rule_complete_confirmed: true,
+    capability_blockers: ['douyin_no_official_interaction_api'],
+    ...overrides,
+  };
+}
+
+function weiboPlanV2(overrides = {}) {
+  const manual = overrides.execution_path_id === 'weibo_manual_v1';
+  const requiredActions = overrides.required_actions || [
+    'followed', 'liked', 'commented', 'favorited', 'reposted',
+  ];
+  return {
+    version: 2,
+    platform: 'weibo',
+    execution_path_id: manual ? 'weibo_manual_v1' : 'weibo_oauth_v1',
+    rule_snapshot_id: 13,
+    rule_hash: '1'.repeat(64),
+    plan_hash: '2'.repeat(64),
+    required_actions: requiredActions,
+    action_payloads: {
+      followed: { target_handle: '@official' },
+      liked: {},
+      commented: {
+        text: '#giveaway# @friend1 @friend2',
+        topic_tags: ['#giveaway#'],
+        mentions: ['@friend1', '@friend2'],
+      },
+      favorited: {},
+      reposted: {},
+    },
+    content_requirements: {
+      follow_targets: ['@official'],
+      commented: { topic_tags: ['#giveaway#'], mentions: ['@friend1', '@friend2'] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    source_content_requirements: {
+      follow_targets: ['@official'],
+      commented: { topic_tags: ['#giveaway#'], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: {
+      commented: { mode: 'minimum', count: 2 },
+    },
+    runtime_capability_requirements: manual ? {} : {
+      contract_version: 1,
+      actions: {
+        followed: {
+          endpoint: 'friendships/create', permission: 'advanced', client_type: 'weibo',
+        },
+        liked: { endpoint: 'attitudes/create', permission: 'advanced' },
+        commented: { endpoint: 'comments/create', permission: 'standard' },
+        favorited: { endpoint: 'favorites/create', permission: 'standard' },
+        reposted: { endpoint: 'statuses/repost', permission: 'standard' },
+      },
+    },
+    executable: !manual,
+    review_required: false,
+    reviewed_by: 'operator-1',
+    rule_complete_confirmed: true,
+    capability_blockers: manual ? ['weibo_manual_execution_selected'] : [],
     ...overrides,
   };
 }
@@ -204,7 +297,393 @@ test('uses the exact Xiaohongshu four-action contract and manual execution path'
   assert.equal(isManualAssistedPlatform('bilibili'), false);
   assert.equal(platformExecutionPathId('xiaohongshu'), 'xiaohongshu_manual_v1');
   assert.equal(platformExecutionPathId('bilibili'), 'bilibili_api_v2');
-  assert.equal(platformExecutionPathId('weibo', 'weibo-browser-v1'), 'weibo-browser-v1');
+  assert.equal(platformExecutionPathId('weibo', 'weibo-browser-v1'), 'weibo_oauth_v1');
+});
+
+test('Weibo selects a capability-bound OAuth path with an explicit manual fallback', () => {
+  assert.deepEqual(lotteryActionsForPlatform('weibo'), [
+    'followed', 'liked', 'commented', 'favorited', 'reposted',
+  ]);
+  assert.equal(platformExecutionPathId('weibo'), 'weibo_oauth_v1');
+  assert.equal(platformExecutionPathId('weibo', 'weibo_manual_v1'), 'weibo_manual_v1');
+  assert.equal(isManualAssistedPlatform('weibo'), false);
+  assert.equal(isManualAssistedPlatform('weibo', 'weibo_manual_v1'), true);
+  assert.equal(isManualAssistedPlan('weibo', weiboPlanV2()), false);
+  assert.equal(isManualAssistedPlan('weibo', weiboPlanV2({
+    execution_path_id: 'weibo_manual_v1',
+  })), true);
+
+  assert.deepEqual(actionPlanV2Blockers(weiboPlanV2(), 'weibo'), []);
+  const manual = weiboPlanV2({ execution_path_id: 'weibo_manual_v1' });
+  assert.deepEqual(actionPlanV2ReviewBlockers(manual, 'weibo'), []);
+  assert.equal(actionPlanV2ReviewReady(manual, 'weibo'), true);
+  assert.equal(platformDispatchBlocker('weibo', 'real_run', 'weibo_manual_v1'), 'weibo_manual_only');
+  assert.equal(platformDispatchBlocker('weibo', 'shadow_run', 'weibo_manual_v1'), null);
+  assert.ok(actionPlanV2ReviewBlockers({
+    ...manual,
+    executable: true,
+  }, 'weibo').includes('weibo_manual_plan_must_be_non_executable'));
+});
+
+test('enforces Weibo 140 UTF-16-unit text limits without truncating emoji', () => {
+  const base = weiboPlanV2();
+  const exactly140 = weiboPlanV2({
+    action_payloads: {
+      ...base.action_payloads,
+      commented: { text: 'a'.repeat(140) },
+    },
+    content_requirements: {
+      ...base.content_requirements,
+      commented: { topic_tags: [], mentions: [] },
+    },
+    source_content_requirements: {
+      ...base.source_content_requirements,
+      commented: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: {},
+  });
+  assert.equal(
+    actionPlanV2Blockers(exactly140, 'weibo').includes('weibo_commented_text_too_long'),
+    false,
+  );
+
+  const exactly141 = weiboPlanV2({
+    ...exactly140,
+    action_payloads: {
+      ...exactly140.action_payloads,
+      commented: { text: 'a'.repeat(141) },
+    },
+  });
+  assert.ok(actionPlanV2Blockers(exactly141, 'weibo')
+    .includes('weibo_commented_text_too_long'));
+
+  const emojiBoundary = weiboPlanV2({
+    ...exactly140,
+    action_payloads: {
+      ...exactly140.action_payloads,
+      commented: { text: `${'a'.repeat(139)}🎉` },
+    },
+  });
+  assert.equal(emojiBoundary.action_payloads.commented.text.length, 141);
+  assert.ok(actionPlanV2Blockers(emojiBoundary, 'weibo')
+    .includes('weibo_commented_text_too_long'));
+
+  const malformedUnicode = weiboPlanV2({
+    ...exactly140,
+    action_payloads: {
+      ...exactly140.action_payloads,
+      commented: { text: '\uD800' },
+    },
+  });
+  assert.ok(actionPlanV2Blockers(malformedUnicode, 'weibo')
+    .includes('action_payload_commented_text_invalid'));
+});
+
+test('Weibo plan validation keeps friend-count and OAuth capability contracts fail closed', () => {
+  const missingFriend = weiboPlanV2({
+    action_payloads: {
+      ...weiboPlanV2().action_payloads,
+      commented: {
+        text: '#giveaway# @friend1',
+        topic_tags: ['#giveaway#'],
+        mentions: ['@friend1'],
+      },
+    },
+    content_requirements: {
+      ...weiboPlanV2().content_requirements,
+      commented: { topic_tags: ['#giveaway#'], mentions: ['@friend1'] },
+    },
+  });
+  assert.ok(actionPlanV2Blockers(missingFriend, 'weibo')
+    .includes('action_plan_friend_mention_count_mismatch'));
+
+  const exactTooMany = weiboPlanV2({
+    friend_mention_requirements: { commented: { mode: 'exact', count: 1 } },
+  });
+  assert.ok(actionPlanV2Blockers(exactTooMany, 'weibo')
+    .includes('action_plan_friend_mention_count_mismatch'));
+
+  const malformed = weiboPlanV2({
+    friend_mention_requirements: { commented: { mode: 'at_least', count: 2 } },
+  });
+  assert.ok(actionPlanV2Blockers(malformed, 'weibo')
+    .includes('action_plan_friend_mention_requirements_invalid'));
+
+  const wrongCapability = weiboPlanV2({ runtime_capability_requirements: {} });
+  assert.ok(actionPlanV2Blockers(wrongCapability, 'weibo')
+    .includes('weibo_oauth_capability_contract_mismatch'));
+
+  const brandPlusExactFriends = weiboPlanV2({
+    required_actions: ['commented'],
+    action_payloads: {
+      commented: {
+        text: '@brand @friend1 @friend2 @friend3',
+        mentions: ['@brand', '@friend1', '@friend2', '@friend3'],
+      },
+    },
+    content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: ['@brand', '@friend1', '@friend2', '@friend3'] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    source_content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: ['@brand'] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: { commented: { mode: 'exact', count: 3 } },
+    runtime_capability_requirements: {
+      contract_version: 1,
+      actions: {
+        commented: { endpoint: 'comments/create', permission: 'standard' },
+      },
+    },
+  });
+  assert.deepEqual(actionPlanV2Blockers(brandPlusExactFriends, 'weibo'), []);
+
+  const missingSourceBinding = weiboPlanV2();
+  delete missingSourceBinding.source_content_requirements;
+  assert.ok(actionPlanV2Blockers(missingSourceBinding, 'weibo')
+    .includes('action_plan_friend_mention_requirement_binding_mismatch'));
+
+  const duplicateIdentity = weiboPlanV2({
+    action_payloads: {
+      ...weiboPlanV2().action_payloads,
+      commented: {
+        text: '@Alice @alice',
+        mentions: ['@Alice', '@alice'],
+      },
+    },
+    content_requirements: {
+      ...weiboPlanV2().content_requirements,
+      commented: { topic_tags: [], mentions: ['@Alice', '@alice'] },
+    },
+    source_content_requirements: {
+      ...weiboPlanV2().source_content_requirements,
+      commented: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: { commented: { mode: 'exact', count: 2 } },
+  });
+  assert.ok(actionPlanV2Blockers(duplicateIdentity, 'weibo')
+    .includes('action_plan_friend_mention_requirement_binding_mismatch'));
+
+  const fullwidthAt = weiboPlanV2({
+    action_payloads: {
+      ...weiboPlanV2().action_payloads,
+      commented: { text: '＠friend', mentions: ['＠friend'] },
+    },
+    content_requirements: {
+      ...weiboPlanV2().content_requirements,
+      commented: { topic_tags: [], mentions: ['＠friend'] },
+    },
+    source_content_requirements: {
+      ...weiboPlanV2().source_content_requirements,
+      commented: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: { commented: { mode: 'exact', count: 1 } },
+  });
+  assert.ok(actionPlanV2Blockers(fullwidthAt, 'weibo')
+    .includes('action_payload_mentions_invalid'));
+});
+
+test('Weibo friend rules become represented only after action-scoped handles are bound', () => {
+  const suggestion = {
+    version: 1,
+    content_requirements: {
+      follow_targets: ['@official'],
+      commented: { topic_tags: [], mentions: ['@official'] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    friend_mention_requirements: { commented: { mode: 'minimum', count: 2 } },
+    unsupported_actions: ['mention_friends'],
+  };
+  assert.deepEqual(unresolvedRuleRequirements(suggestion, {
+    followed: { target_handle: '@official' },
+    commented: { text: '@official @friend1', mentions: ['@official', '@friend1'] },
+  }), ['mention_friends']);
+  assert.deepEqual(unresolvedRuleRequirements(suggestion, {
+    followed: { target_handle: '@official' },
+    commented: {
+      text: '@official @friend1 @friend2',
+      mentions: ['@official', '@friend1', '@friend2'],
+    },
+  }), []);
+});
+
+test('Weibo mention requirements reject handle-prefix collisions in reviewed text', () => {
+  const base = weiboPlanV2();
+  const prefixCollision = weiboPlanV2({
+    action_payloads: {
+      ...base.action_payloads,
+      commented: {
+        ...base.action_payloads.commented,
+        text: '#giveaway# @friend12 @friend2',
+      },
+    },
+  });
+  assert.ok(actionPlanV2Blockers(prefixCollision, 'weibo')
+    .includes('action_payload_required_token_missing'));
+
+  const exactTokens = weiboPlanV2({
+    action_payloads: {
+      ...base.action_payloads,
+      commented: {
+        ...base.action_payloads.commented,
+        text: '#giveaway# @friend1，@friend2。',
+      },
+    },
+  });
+  assert.equal(actionPlanV2Blockers(exactTokens, 'weibo')
+    .includes('action_payload_required_token_missing'), false);
+});
+
+test('Weibo plans cap distinct resolved handles across all actions', () => {
+  const base = weiboPlanV2();
+  const commentMentions = Array.from({ length: 16 }, (_, index) => `@c${index}`);
+  const repostMentions = Array.from({ length: 16 }, (_, index) => `@r${index}`);
+  const overLimit = weiboPlanV2({
+    action_payloads: {
+      ...base.action_payloads,
+      commented: { text: commentMentions.join(' '), mentions: commentMentions },
+      reposted: { text: repostMentions.join(' '), mentions: repostMentions },
+    },
+    content_requirements: {
+      follow_targets: ['@official'],
+      commented: { topic_tags: [], mentions: commentMentions },
+      reposted: { topic_tags: [], mentions: repostMentions },
+    },
+    source_content_requirements: {
+      follow_targets: ['@official'],
+      commented: { topic_tags: [], mentions: commentMentions },
+      reposted: { topic_tags: [], mentions: repostMentions },
+    },
+    friend_mention_requirements: {},
+  });
+  assert.ok(actionPlanV2Blockers(overLimit, 'weibo')
+    .includes('weibo_preflight_unique_handle_limit_exceeded'));
+});
+
+test('uses a variable, semantically distinct Douyin manual action contract', () => {
+  assert.deepEqual(lotteryActionsForPlatform('douyin'), [
+    'followed',
+    'liked',
+    'commented',
+    'favorited',
+    'reposted',
+  ]);
+  assert.equal(isManualAssistedPlatform('DOUYIN'), true);
+  assert.equal(isFixedManualActionPlatform('douyin'), false);
+  assert.equal(isFixedManualActionPlatform('xiaohongshu'), true);
+  assert.equal(platformExecutionPathId('douyin', 'bilibili_api_v2'), 'douyin_manual_v1');
+
+  const update = buildActionPlanV2Update({
+    platform: 'douyin',
+    requiredActions: ['favorited', 'reposted', 'commented'],
+    actionPayloads: {
+      commented: { text: '精确评论' },
+      favorited: {},
+      reposted: { text: '精确分享文案' },
+    },
+    executionPathId: 'douyin_manual_v1',
+    ruleText: '评论、收藏并转发',
+    ruleCompleteConfirmed: true,
+    reviewed: true,
+  });
+  assert.deepEqual(update.required_actions, ['commented', 'favorited', 'reposted']);
+  assert.deepEqual(Object.keys(update.action_payloads), ['commented', 'favorited', 'reposted']);
+});
+
+test('Douyin is reviewable but automatic dispatch remains permanently unavailable', () => {
+  const plan = douyinPlanV2();
+  assert.equal(actionPlanV2ReviewReady(plan, 'douyin'), true);
+  assert.equal(actionPlanV2Ready(plan, 'douyin'), false);
+  assert.deepEqual(actionPlanV2ReviewBlockers(plan, 'douyin'), []);
+  assert.ok(actionPlanV2Blockers(plan, 'douyin').includes('action_plan_not_executable'));
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      douyinPlanV2({ executable: true }),
+      'douyin',
+    ).includes('douyin_manual_plan_must_be_non_executable'),
+  );
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      douyinPlanV2({ execution_path_id: 'bilibili_api_v2' }),
+      'douyin',
+    ).includes('execution_path_mismatch'),
+  );
+  assert.ok(
+    actionPlanV2ReviewBlockers(
+      douyinPlanV2({ capability_blockers: [] }),
+      'douyin',
+    ).includes('douyin_no_official_interaction_api'),
+  );
+
+  const lottery = {
+    id: 10,
+    platform: 'douyin',
+    raw_url: 'https://www.douyin.com/video/7300000000000000000',
+    action_plan: plan,
+  };
+  assert.equal(platformDispatchBlocker('douyin', 'dry_run'), 'douyin_manual_shadow_only');
+  assert.equal(platformDispatchBlocker('douyin', 'real_run'), 'douyin_manual_only');
+  assert.equal(platformDispatchBlocker('douyin', 'shadow_run'), null);
+  assert.equal(
+    dispatchSafetyBlocker({ lottery, mode: 'shadow_run', safeAccountAvailable: true, accountScopeBound: true }),
+    null,
+  );
+  assert.equal(
+    dispatchSafetyBlocker({
+      lottery,
+      mode: 'real_run',
+      gate: { allowed: true },
+      safeAccountAvailable: true,
+      accountScopeBound: true,
+    }),
+    'douyin_manual_only',
+  );
+});
+
+test('builds Douyin manual checklist only from reviewed required actions', () => {
+  assert.deepEqual(manualAssistedChecklist(douyinPlanV2(), 'douyin'), [
+    { action: 'followed', required: true, exactValue: '@creator' },
+    { action: 'liked', required: true, exactValue: '' },
+    { action: 'commented', required: true, exactValue: '#抽奖# 精确评论' },
+    { action: 'favorited', required: true, exactValue: '' },
+  ]);
+  assert.deepEqual(manualShadowObservation({
+    selector_observation_complete: true,
+    manual_shadow_task_id: 'dy-shadow-1',
+  }), { complete: true, taskId: 'dy-shadow-1' });
+  const plainRepost = douyinPlanV2({
+    required_actions: ['reposted'],
+    action_payloads: { reposted: {} },
+    content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+  });
+  assert.deepEqual(actionPlanV2ReviewBlockers(plainRepost, 'douyin'), []);
+  assert.deepEqual(manualAssistedChecklist(plainRepost, 'douyin'), [
+    { action: 'reposted', required: true, exactValue: '' },
+  ]);
+  assert.deepEqual(buildActionPlanV2Update({
+    platform: 'douyin',
+    requiredActions: ['reposted'],
+    actionPayloads: { reposted: { text: '' } },
+    executionPathId: 'douyin_manual_v1',
+    ruleText: '转发本视频参与抽奖',
+    ruleCompleteConfirmed: true,
+    reviewed: true,
+  }).action_payloads, { reposted: {} });
+  assert.deepEqual(manualAssistedChecklist(
+    douyinPlanV2({ review_required: true }),
+    'douyin',
+  ), []);
+  assert.deepEqual(manualAssistedChecklist(
+    douyinPlanV2({ reviewed_by: '' }),
+    'douyin',
+  ), []);
 });
 
 test('builds Xiaohongshu updates without leaking repost or unsupported actions', () => {

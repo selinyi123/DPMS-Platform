@@ -37,12 +37,12 @@ KNOWN_INTENT_STATES = frozenset(
     {INTENT_PREPARED, INTENT_STARTED, INTENT_SUCCEEDED, INTENT_FAILED, INTENT_UNKNOWN}
 )
 CONFIRMED_SUCCESS_OUTCOMES = frozenset({"ok"})
-# Only classified Bilibili business responses prove that the mutation did not
-# take effect. Transport failures, timeouts, fatal/unrecognized codes and local
-# exceptions all retain ``unknown`` certainty and must use
-# :func:`mark_action_intent_unknown`.
+# Only classified platform business responses prove that a mutation did not
+# take effect (including an explicit Weibo API rejection). Transport failures,
+# timeouts, fatal/unrecognized codes and local exceptions retain ``unknown``
+# certainty and must use :func:`mark_action_intent_unknown`.
 CONFIRMED_NO_EFFECT_OUTCOMES = frozenset(
-    {"retry", "limit", "skip", "captcha", "risk", "auth"}
+    {"retry", "limit", "skip", "captcha", "risk", "auth", "rejected"}
 )
 
 

@@ -1,7 +1,13 @@
 import json
 import unittest
 
-from app.adapter_config import recommended_config_from_probe, selector_config_complete
+from app.adapter_config import (
+    platform_real_adapter_kind,
+    recommended_config_from_probe,
+    selector_config_complete,
+    selector_phase_configured,
+    selector_phases_for_platform,
+)
 
 
 def _probe_result(platform="bilibili", recommended=None, **extra):
@@ -65,6 +71,53 @@ class RecommendedConfigFromProbeTests(unittest.TestCase):
     def test_malformed_recommendation_shapes_return_empty(self):
         for bad in ([], "nope", 5, {"_recommended_config": []}, {"_recommended_config": {"bilibili": "x"}}):
             self.assertEqual(recommended_config_from_probe(bad, "bilibili"), {})
+
+    def test_douyin_observation_config_covers_all_five_distinct_phases(self):
+        config = {
+            "followed": ["button:has-text('关注')"],
+            "liked": ["[data-e2e='like-icon']"],
+            "commented": {"input": ["textarea"], "submit": ["button:has-text('发布')"]},
+            "favorited": {"done": ["[data-state='collected']"]},
+            "reposted": {"done": ["[data-state='reposted']"]},
+        }
+        self.assertEqual(
+            selector_phases_for_platform("douyin"),
+            ("followed", "liked", "commented", "favorited", "reposted"),
+        )
+        self.assertTrue(selector_config_complete("douyin", config))
+        self.assertTrue(selector_phase_configured("douyin", config, "favorited"))
+        self.assertTrue(selector_phase_configured("douyin", config, "reposted"))
+
+    def test_douyin_generic_share_control_cannot_cover_favorite_or_repost(self):
+        config = {
+            "followed": ["follow"],
+            "liked": ["like"],
+            "commented": {"input": ["textarea"], "submit": ["submit"]},
+            "favorited": ["[data-e2e='share-icon']"],
+            "reposted": ["[data-e2e='share-icon']"],
+        }
+        self.assertFalse(selector_config_complete("douyin", config))
+        self.assertFalse(selector_phase_configured("douyin", config, "favorited"))
+        self.assertFalse(selector_phase_configured("douyin", config, "reposted"))
+
+    def test_weibo_selectors_are_five_phase_observation_only(self):
+        config = {
+            "followed": {"done": ["button.following"]},
+            "liked": {"done": ["button.liked"]},
+            "commented": {"input": ["textarea"], "submit": ["button.submit"]},
+            "favorited": {"done": ["button.favorited"]},
+            "reposted": {"done": ["div.reposted"]},
+        }
+
+        self.assertEqual(
+            selector_phases_for_platform("weibo"),
+            ("followed", "liked", "commented", "favorited", "reposted"),
+        )
+        self.assertTrue(selector_config_complete("weibo", config))
+        self.assertEqual(
+            platform_real_adapter_kind({"weibo": config}, "weibo"),
+            "oauth",
+        )
 
 
 if __name__ == "__main__":

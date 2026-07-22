@@ -26,6 +26,30 @@ class PartialRepairDatabase:
 
 
 class RepairActionUnionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_success_is_eligible_but_not_advertised_as_executable(self):
+        plan = await lotteries.build_lottery_repair_plan(
+            {
+                "id": 73,
+                "status": "pending",
+                "execution_lock": None,
+                "action_plan": {
+                    "is_lottery": True,
+                    "required_actions": ["liked", "commented"],
+                },
+            },
+            completed_actions=["liked"],
+        )
+
+        self.assertTrue(plan["eligible"])
+        self.assertEqual(plan["reason"], "missing_actions_available")
+        self.assertFalse(plan["dispatch_supported"])
+        self.assertFalse(plan["executable"])
+        self.assertEqual(
+            plan["dispatch_blocker"],
+            "repair_intent_binding_not_implemented",
+        )
+        self.assertTrue(plan["repair_action_plan"]["is_lottery"])
+
     async def test_mixed_legacy_phases_and_action_ledger_are_unioned(self):
         original_database = lotteries.database
         lotteries.database = FakeRepairDatabase()
@@ -65,6 +89,7 @@ class RepairActionUnionTests(unittest.IsolatedAsyncioTestCase):
             lotteries.database = original_database
 
         self.assertFalse(plan["eligible"])
+        self.assertFalse(plan["executable"])
         self.assertEqual(plan["reason"], "execution_in_flight_or_reconciliation_required")
 
     async def test_terminal_lottery_is_not_advertised_as_repair_eligible(self):
@@ -83,6 +108,7 @@ class RepairActionUnionTests(unittest.IsolatedAsyncioTestCase):
             lotteries.database = original_database
 
         self.assertFalse(plan["eligible"])
+        self.assertFalse(plan["executable"])
         self.assertEqual(plan["reason"], "lottery_not_pending")
 
 

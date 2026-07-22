@@ -9,11 +9,12 @@ from app.action_plan import (
     ActionPlanV2Error,
     canonical_json_bytes,
     compute_bilibili_api_config_hash,
+    compute_config_hash,
     compute_rule_hash,
     compute_target_hash,
     validate_action_plan_v2,
 )
-from app.adapter_config import STRUCTURED_SELECTOR_PLATFORMS
+from app.adapter_config import STRUCTURED_SELECTOR_PLATFORMS, load_selector_config
 from app.adapters.registry import get_adapter
 from app.bilibili.preflight import API_PREFLIGHT_KIND, run_readonly_api_preflight
 from app.bilibili.runtime import (
@@ -21,6 +22,7 @@ from app.bilibili.runtime import (
 )
 from app.db import database, execute_affected_rows, redis
 from app.event_store.service import record_event
+from app.real_run_gate import platform_real_run_block_reason
 from app.services.execution_evidence import API_PROBE_KIND, materialize_for_probe
 from app.safety import detect_page_risk
 from app.utils.cookies import inject_account_cookies
@@ -258,7 +260,7 @@ async def handle_probe(pool, probe: dict):
     lottery_id = binding["lottery_id"]
     target_url = binding["target_url"]
     canonical_uri = binding["canonical_url"]
-    adapter = get_adapter(platform)
+    adapter = get_adapter(platform, binding.get("selector_config"))
     # Probe images previously bypassed the exclusive, identity-bound evidence
     # writer used by task/shadow screenshots. Until the shared evidence volume
     # and a reusable writer are authorized, persist selector observations only
@@ -783,6 +785,72 @@ async def claim_probe(probe: dict) -> dict:
                     raise ValueError("adapter_probe_action_plan_mismatch")
             authoritative["action_plan"] = plan.plan
             authoritative["execution_revision"] = execution_revision
+        else:
+            selector_config = load_selector_config()
+            platform_selector_config = selector_config.get(platform, {})
+            if not isinstance(platform_selector_config, dict):
+                platform_selector_config = {}
+            config_row = await database.fetch_one(
+                """SELECT config_json FROM adapter_selector_configs
+                   WHERE platform = :platform
+                   FOR UPDATE""",
+                {"platform": platform},
+            )
+            if config_row:
+                raw_config = config_row["config_json"]
+                if isinstance(raw_config, bytes):
+                    raw_config = raw_config.decode("utf-8", errors="strict")
+                try:
+                    parsed_config = (
+                        raw_config
+                        if isinstance(raw_config, dict)
+                        else json.loads(raw_config)
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed_config = None
+                if isinstance(parsed_config, dict):
+                    platform_selector_config = parsed_config
+            try:
+                message_execution_revision = int(probe.get("execution_revision"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("adapter_probe_selector_binding_invalid") from exc
+            execution_revision = int(row["execution_revision"] or 0)
+            expected_config_hash = compute_config_hash(
+                {
+                    "platform": platform,
+                    "execution_revision": execution_revision,
+                    "selector_config": platform_selector_config,
+                }
+            )
+            expected_target_hash = compute_target_hash(authoritative["canonical_url"])
+            expected_execution_path = f"{platform}_selector_v1"
+            message_bindings = {
+                "execution_path_id": str(probe.get("execution_path_id") or "").strip(),
+                "target_hash": str(probe.get("target_hash") or "").strip(),
+                "rule_snapshot_id": str(probe.get("rule_snapshot_id") or "").strip(),
+                "rule_hash": str(probe.get("rule_hash") or "").strip(),
+                "action_plan_hash": str(probe.get("action_plan_hash") or "").strip(),
+                "config_hash": str(probe.get("config_hash") or "").strip(),
+            }
+            if (
+                authoritative["execution_path_id"] != expected_execution_path
+                or message_bindings["execution_path_id"] != expected_execution_path
+                or authoritative["target_hash"] != expected_target_hash
+                or message_bindings["target_hash"] != expected_target_hash
+                or authoritative["rule_snapshot_id"] != 0
+                or message_bindings["rule_snapshot_id"]
+                or authoritative["rule_hash"]
+                or message_bindings["rule_hash"]
+                or authoritative["action_plan_hash"]
+                or message_bindings["action_plan_hash"]
+                or authoritative["config_hash"] != expected_config_hash
+                or message_bindings["config_hash"] != expected_config_hash
+                or message_execution_revision != execution_revision
+                or execution_revision <= 0
+            ):
+                raise ValueError("adapter_probe_selector_binding_mismatch")
+            authoritative["selector_config"] = platform_selector_config
+            authoritative["execution_revision"] = execution_revision
 
         claimed = await execute_affected_rows(
             """UPDATE adapter_calibrations
@@ -825,7 +893,7 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
     ``ready_for_real_actions`` is retained as a compatibility alias because
     Core and previously persisted probe results still consume that key. For
     supported platforms its value only means all phase selectors were seen;
-    for Xiaohongshu it is always false. New consumers should prefer
+    for manual-only platforms it is always false. New consumers should prefer
     ``selector_observation_complete`` plus the capability metadata.
     """
     phases = probe_phases_for_platform(platform)
@@ -849,9 +917,22 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
         if ready:
             visible_phases.append(phase)
     selector_observation_complete = len(visible_phases) == len(phases)
-    xiaohongshu_manual_only = (
-        str(platform or "").strip().lower() == "xiaohongshu"
+    normalized_platform = str(platform or "").strip().lower()
+    manual_confirmation_required = normalized_platform in {
+        "douyin",
+        "weibo",
+        "xiaohongshu",
+    }
+    capability_block_reason = (
+        (
+            "weibo_selector_observation_only"
+            if normalized_platform == "weibo"
+            else platform_real_run_block_reason(normalized_platform)
+        )
+        if manual_confirmation_required
+        else None
     )
+    real_run_capable = capability_block_reason is None
     return {
         "platform": platform,
         "required_phases": phases,
@@ -859,32 +940,39 @@ def summarize_probe_result(platform: str, result: dict) -> dict:
         "missing_phases": [phase for phase in phases if phase not in visible_phases],
         "ready_phase_count": len(visible_phases),
         "selector_observation_complete": selector_observation_complete,
-        # Compatibility only. Xiaohongshu visibility can never assert real
-        # readiness because no supported official interaction API exists.
+        # Compatibility only. Selector visibility cannot override a platform
+        # capability block or prove that a participant-side write API exists.
         "ready_for_real_actions": (
-            selector_observation_complete and not xiaohongshu_manual_only
+            selector_observation_complete and real_run_capable
         ),
-        "manual_confirmation_required": xiaohongshu_manual_only,
-        "capability_block_reason": (
-            "xiaohongshu_no_official_interaction_api"
-            if xiaohongshu_manual_only
-            else None
-        ),
+        "manual_confirmation_required": manual_confirmation_required,
+        "real_run_capable": real_run_capable,
+        "capability_block_reason": capability_block_reason,
         "phase_status": phase_status,
     }
 
 
 def build_recommended_config(platform: str, result: dict) -> dict:
     phases = {}
-    non_comment_phases = (
-        ["followed", "liked", "favorited"]
-        if str(platform or "").strip().lower() == "xiaohongshu"
-        else ["followed", "liked", "reposted"]
-    )
+    normalized_platform = str(platform or "").strip().lower()
+    if normalized_platform == "xiaohongshu":
+        non_comment_phases = ["followed", "liked", "favorited"]
+    elif normalized_platform == "douyin":
+        # Collection and repost are distinct requirements. Preserve both
+        # independently when the read-only probe has an explicit state signal.
+        non_comment_phases = ["followed", "liked", "favorited", "reposted"]
+    else:
+        non_comment_phases = ["followed", "liked", "reposted"]
     for phase in non_comment_phases:
         selector = first_visible_selector(result.get(phase))
         if selector:
-            phases[phase] = [selector]
+            if normalized_platform == "douyin" and phase in {
+                "favorited",
+                "reposted",
+            }:
+                phases[phase] = {"done": [selector]}
+            else:
+                phases[phase] = [selector]
 
     comment_candidates = [item for item in result.get("commented", []) if item.get("visible") and item.get("selector")]
     input_selector = first_selector_matching(comment_candidates, ["textarea", "contenteditable", "placeholder"])
@@ -896,8 +984,11 @@ def build_recommended_config(platform: str, result: dict) -> dict:
 
 
 def probe_phases_for_platform(platform: str) -> list[str]:
-    if str(platform or "").strip().lower() == "xiaohongshu":
+    normalized_platform = str(platform or "").strip().lower()
+    if normalized_platform == "xiaohongshu":
         return ["followed", "liked", "commented", "favorited"]
+    if normalized_platform == "douyin":
+        return ["followed", "liked", "commented", "favorited", "reposted"]
     return ["followed", "liked", "commented", "reposted"]
 
 

@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS `task_phases` (
 
   `task_id` CHAR(36) NOT NULL COMMENT '对应 Redis 消息 ID 或自身 UUID',
 
-  `phase` ENUM('init','followed','liked','commented','reposted','completed') DEFAULT 'init',
+  `phase` ENUM('init','followed','liked','commented','favorited','reposted','completed') DEFAULT 'init',
 
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 

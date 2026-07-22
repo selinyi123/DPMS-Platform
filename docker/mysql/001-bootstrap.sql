@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS task_phases (
   account_id BIGINT NOT NULL,
   lottery_id BIGINT NOT NULL,
   task_id CHAR(36) NOT NULL,
-  phase ENUM('init','followed','liked','commented','reposted','completed') DEFAULT 'init',
+  phase ENUM('init','followed','liked','commented','favorited','reposted','completed') DEFAULT 'init',
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (account_id) REFERENCES accounts(id),
   FOREIGN KEY (lottery_id) REFERENCES lotteries(id),

@@ -35,10 +35,15 @@ def selectors_for(platform: str) -> dict:
 
 
 def has_complete_selectors(platform: str) -> bool:
-    # Selector observations may assist Shadow/manual review, but Xiaohongshu
-    # has no supported official four-interaction write API. Configuration must
-    # therefore never become an executable capability signal.
-    if str(platform or "").strip().lower() == "xiaohongshu":
+    # Selector observations may assist Shadow/manual review. Weibo mutations
+    # use a separate official OAuth provider; Xiaohongshu and Douyin remain
+    # manual-only. Browser configuration must never become an executable
+    # capability signal for any of these platforms.
+    if str(platform or "").strip().lower() in {
+        "douyin",
+        "weibo",
+        "xiaohongshu",
+    }:
         return False
     configured = selectors_for(platform)
     if platform not in STRUCTURED_SELECTOR_PLATFORMS:

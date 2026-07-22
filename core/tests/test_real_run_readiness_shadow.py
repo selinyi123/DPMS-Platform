@@ -442,6 +442,28 @@ class PhaseConfiguredTests(unittest.TestCase):
     def test_structured_click_phase_requires_success_readback(self):
         self.assertFalse(
             real_run_readiness.phase_configured(
+                "bilibili",
+                {"liked": {"click": ["button.like"]}},
+                "liked",
+            )
+        )
+        self.assertTrue(
+            real_run_readiness.phase_configured(
+                "bilibili",
+                {"liked": {"click": ["button.like"], "done": ["button.liked"]}},
+                "liked",
+            )
+        )
+
+    def test_structured_comment_phase_requires_success_readback(self):
+        config = {"commented": {"input": ["textarea"], "submit": ["button.submit"]}}
+        self.assertFalse(real_run_readiness.phase_configured("bilibili", config, "commented"))
+        config["commented"]["done"] = ["article.own-comment"]
+        self.assertTrue(real_run_readiness.phase_configured("bilibili", config, "commented"))
+
+    def test_weibo_selectors_are_observation_only(self):
+        self.assertTrue(
+            real_run_readiness.phase_configured(
                 "weibo",
                 {"liked": {"click": ["button.like"]}},
                 "liked",
@@ -450,16 +472,15 @@ class PhaseConfiguredTests(unittest.TestCase):
         self.assertTrue(
             real_run_readiness.phase_configured(
                 "weibo",
-                {"liked": {"click": ["button.like"], "done": ["button.liked"]}},
-                "liked",
+                {
+                    "commented": {
+                        "input": ["textarea"],
+                        "submit": ["button.submit"],
+                    }
+                },
+                "commented",
             )
         )
-
-    def test_structured_comment_phase_requires_success_readback(self):
-        config = {"commented": {"input": ["textarea"], "submit": ["button.submit"]}}
-        self.assertFalse(real_run_readiness.phase_configured("weibo", config, "commented"))
-        config["commented"]["done"] = ["article.own-comment"]
-        self.assertTrue(real_run_readiness.phase_configured("weibo", config, "commented"))
 
 
 class ShadowScreenshotIntegrityTests(unittest.TestCase):

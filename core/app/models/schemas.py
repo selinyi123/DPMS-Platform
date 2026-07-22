@@ -1,5 +1,5 @@
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from enum import StrEnum
 
@@ -113,6 +113,19 @@ class ProxyStatusUpdate(BaseModel):
 class AccountCalibrationRequest(BaseModel):
 
     force: bool = False
+
+
+class WeiboOAuthCapabilityAttestationRequest(BaseModel):
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_review_status: str = Field(min_length=1, max_length=16)
+
+    client_type: str = Field(min_length=1, max_length=16)
+
+    granted_actions: dict[str, Any]
+
+    confirm: bool = False
 
 
 

@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import os
 import uuid
 from pathlib import Path
@@ -10,11 +11,18 @@ from fastapi.responses import FileResponse
 from app.action_plan import (
     ACTION_ORDER,
     BILIBILI_API_EXECUTION_PATH,
+    DOUYIN_MANUAL_EXECUTION_PATH,
+    DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    WEIBO_MANUAL_EXECUTION_BLOCKER,
+    WEIBO_MANUAL_EXECUTION_PATH,
+    WEIBO_OAUTH_EXECUTION_PATH,
+    WEIBO_RIP_ACTIONS,
     XIAOHONGSHU_MANUAL_EXECUTION_PATH,
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     ActionPlanV2Error,
     action_order_for_platform,
-    bind_xiaohongshu_manual_follow_target,
+    bind_manual_friend_mentions,
+    bind_manual_follow_target,
     compute_action_plan_hash,
     compute_bilibili_api_config_hash,
     compute_config_hash,
@@ -23,16 +31,22 @@ from app.action_plan import (
     semantic_requirement_status,
     validate_action_payload,
     validate_action_plan_v2,
+    validate_friend_mention_requirements,
+    validate_weibo_preflight_unique_handle_limit,
+    weibo_runtime_capability_requirements,
+    friend_mention_requirements_satisfied,
 )
 
 from app.adapter_config import (
     PHASES as ADAPTER_PHASES,
+    MANUAL_ASSISTED_ONLY_PLATFORMS,
     load_runtime_selector_config,
     platform_has_runtime_real_adapter,
     platform_probe_ready_for_real_actions,
     platform_real_adapter_kind,
     recommended_config_from_probe,
     selector_config_complete,
+    selector_phases_for_platform,
 )
 from app.db import database
 from app.event_store.service import record_event
@@ -79,6 +93,7 @@ from app.services.real_run_readiness import (
     load_exact_bilibili_execution_evidence,
     real_run_account_risk_summaries,
     real_run_gate_status,
+    validate_weibo_oauth_capability_attestation,
     validate_real_run_evidence,
 )
 from app.services.bilibili_preflight_evidence import (
@@ -95,6 +110,11 @@ from app.security import (
 )
 from app.utils.canonicalizer import canonicalize_platform_url
 from app.utils.lottery_targets import validate_lottery_target
+from app.utils.credential_kind import (
+    account_credential_kind,
+    decrypt_weibo_oauth_credential,
+)
+from app.utils.crypto import encrypt_weibo_rip, weibo_rip_hmac
 from app.utils.log import structured_log
 
 
@@ -104,6 +124,44 @@ EVIDENCE_ROOT = Path(os.getenv("EVIDENCE_ROOT", "/profiles"))
 TASK_FAILURE_DIR = EVIDENCE_ROOT / "task-failures"
 TASK_SHADOW_DIR = EVIDENCE_ROOT / "shadow-runs"
 ADAPTER_PROBE_DIR = EVIDENCE_ROOT / "adapter-probes"
+
+
+def trusted_weibo_rip(request: Request) -> str:
+    """Return a public IP supplied by the trusted ingress, never raw XFF.
+
+    Nginx overwrites ``X-Real-IP`` at the only exposed API boundary. The
+    appendable ``X-Forwarded-For`` chain is deliberately ignored because its
+    first element can be client supplied. Direct calls fall back to the socket
+    peer and therefore fail closed when the address is local/private.
+    """
+
+    raw = request.headers.get("x-real-ip")
+    if raw is None and request.client is not None:
+        raw = request.client.host
+    token = str(raw or "")
+    if (
+        not token
+        or token != token.strip()
+        or len(token) > 64
+        or "," in token
+    ):
+        raise HTTPException(
+            409,
+            detail={"code": "weibo_public_rip_required"},
+        )
+    try:
+        parsed = ipaddress.ip_address(token)
+    except ValueError as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "weibo_public_rip_required"},
+        ) from exc
+    if not parsed.is_global:
+        raise HTTPException(
+            409,
+            detail={"code": "weibo_public_rip_required"},
+        )
+    return parsed.compressed
 
 
 def validated_probe_navigation_url(raw_url: str) -> str:
@@ -196,6 +254,7 @@ STRATEGY_TARGET_METRICS_SQL = """(
 
 MAX_IMPORT_TARGET_LINES = 1000
 REPAIR_DISPATCH_INTENT_BINDING_READY = False
+REPAIR_DISPATCH_BLOCKER = "repair_intent_binding_not_implemented"
 
 
 def clamp_limit(value: int, minimum: int = 1, maximum: int = 200) -> int:
@@ -291,19 +350,32 @@ async def list_adapters():
         {
             "platform": key,
             "label": cfg["label"],
-            "dry_run": True,
+            "dry_run": key not in {"xiaohongshu", "douyin"},
             "real_actions": cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, key),
-            "adapter_status": "configured" if platform_has_runtime_real_adapter(selector_config, key) else cfg.get("adapter_status", "planned"),
+            "adapter_status": (
+                cfg.get("adapter_status", "planned")
+                if platform_real_adapter_kind(selector_config, key)
+                in {"oauth", "manual_assisted"}
+                else (
+                    "configured"
+                    if platform_has_runtime_real_adapter(selector_config, key)
+                    else cfg.get("adapter_status", "planned")
+                )
+            ),
             "adapter_kind": platform_real_adapter_kind(selector_config, key),
             "phases": list(action_order_for_platform(key)),
             "notes": (
                 "manual-assisted checklist and read-only shadow only; no official interaction API"
-                if key == "xiaohongshu"
+                if key in {"xiaohongshu", "douyin"}
+                else (
+                    "official OAuth writes require fresh per-account and per-action capability evidence; selectors are observation-only"
+                    if key == "weibo"
                 else (
                     "real actions require gray calibration"
                     if cfg.get("action_adapter")
                     or platform_selectors_complete(selector_config, key)
                     else "login and dry-run only until adapter calibration is implemented"
+                )
                 )
             ),
         }
@@ -316,11 +388,12 @@ async def get_adapter_config_status():
     config = await load_runtime_selector_config()
     platforms = []
     for platform in get_platforms():
+        required_phases = selector_phases_for_platform(platform)
         phase_status = {}
         configured = config.get(platform, {})
         if not isinstance(configured, dict):
             configured = {}
-        for phase in ADAPTER_PHASES:
+        for phase in required_phases:
             phase_status[phase] = phase_configured(platform, configured, phase)
         configured_complete = platform_selectors_complete(config, platform)
         platforms.append(
@@ -329,6 +402,8 @@ async def get_adapter_config_status():
                 "configured": configured_complete or platform_has_runtime_real_adapter(config, platform),
                 "selector_configured": configured_complete,
                 "adapter_kind": platform_real_adapter_kind(config, platform),
+                "configuration_kind": "observation" if platform in {"weibo", "xiaohongshu", "douyin"} else "execution",
+                "required_phases": list(required_phases),
                 "phases": phase_status,
             }
         )
@@ -336,6 +411,9 @@ async def get_adapter_config_status():
         "preferred_env": "DPMS_ADAPTER_SELECTORS_B64",
         "fallback_env": "DPMS_ADAPTER_SELECTORS",
         "required_phases": list(ADAPTER_PHASES),
+        "required_phases_by_platform": {
+            platform: list(selector_phases_for_platform(platform)) for platform in get_platforms()
+        },
         "platforms": platforms,
     }
 
@@ -354,7 +432,8 @@ async def save_adapter_config(data: AdapterSelectorConfigUpdate, request: Reques
         if not isinstance(config, dict):
             invalid.append({"platform": platform, "error": "platform config must be an object"})
             continue
-        phase_status = {phase: phase_configured(platform, config, phase) for phase in ADAPTER_PHASES}
+        required_phases = selector_phases_for_platform(platform)
+        phase_status = {phase: phase_configured(platform, config, phase) for phase in required_phases}
         configured_complete = selector_config_complete(platform, config)
         await save_platform_selector_config(platform, config)
         saved.append({"platform": platform, "configured": configured_complete, "phases": phase_status})
@@ -597,13 +676,16 @@ def bilibili_plan_binding(
     }
 
 
-def xiaohongshu_manual_plan_binding(
+def manual_shadow_plan_binding(
     lottery,
     *,
+    platform: str,
+    execution_path_id: str,
+    platform_label: str,
     execution_revision: int,
     selector_config: dict,
 ) -> dict:
-    """Bind a reviewed XHS plan for a side-effect-free shadow run only."""
+    """Bind a reviewed manual-only plan for a side-effect-free shadow run."""
 
     try:
         plan = validate_action_plan_v2(
@@ -620,13 +702,13 @@ def xiaohongshu_manual_plan_binding(
         raise HTTPException(
             409,
             detail={
-                "message": "Xiaohongshu manual-assisted Action Plan v2 is not shadow-ready",
+                "message": f"{platform_label} manual-assisted Action Plan v2 is not shadow-ready",
                 "blockers": [code],
             },
         ) from exc
     if (
-        plan.plan.get("platform") != "xiaohongshu"
-        or plan.execution_path_id != XIAOHONGSHU_MANUAL_EXECUTION_PATH
+        plan.plan.get("platform") != platform
+        or plan.execution_path_id != execution_path_id
         or snapshot_id != plan.rule_snapshot_id
         or str(lottery["rule_hash"] or "") != plan.rule_hash
         or str(lottery["action_plan_hash"] or "") != plan.plan_hash
@@ -634,7 +716,7 @@ def xiaohongshu_manual_plan_binding(
         raise HTTPException(
             409,
             detail={
-                "message": "Xiaohongshu manual-assisted plan binding changed; review again",
+                "message": f"{platform_label} manual-assisted plan binding changed; review again",
                 "blockers": ["action_plan_rule_binding_mismatch"],
             },
         )
@@ -642,7 +724,7 @@ def xiaohongshu_manual_plan_binding(
         raise HTTPException(
             409,
             detail={
-                "message": "Xiaohongshu account revision is invalid",
+                "message": f"{platform_label} account revision is invalid",
                 "blockers": ["execution_revision_invalid"],
             },
         )
@@ -650,11 +732,11 @@ def xiaohongshu_manual_plan_binding(
         "rule_snapshot_id": plan.rule_snapshot_id,
         "rule_hash": plan.rule_hash,
         "action_plan_hash": plan.plan_hash,
-        "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        "execution_path_id": execution_path_id,
         "target_hash": compute_target_hash(str(lottery["canonical_url"] or "")),
         "config_hash": compute_config_hash(
             {
-                "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+                "execution_path_id": execution_path_id,
                 "execution_revision": execution_revision,
                 "selector_config": dict(selector_config or {}),
             }
@@ -662,6 +744,135 @@ def xiaohongshu_manual_plan_binding(
         "execution_revision": execution_revision,
         "required_actions": plan.required_actions,
         "follow_target_handle": plan.follow_target_handle,
+        "action_plan": plan.plan,
+    }
+
+
+def xiaohongshu_manual_plan_binding(
+    lottery,
+    *,
+    execution_revision: int,
+    selector_config: dict,
+) -> dict:
+    """Bind a reviewed XHS plan for a side-effect-free shadow run only."""
+
+    return manual_shadow_plan_binding(
+        lottery,
+        platform="xiaohongshu",
+        execution_path_id=XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+        platform_label="Xiaohongshu",
+        execution_revision=execution_revision,
+        selector_config=selector_config,
+    )
+
+
+def douyin_manual_plan_binding(
+    lottery,
+    *,
+    execution_revision: int,
+    selector_config: dict,
+) -> dict:
+    """Bind a reviewed Douyin plan for a side-effect-free shadow run only."""
+
+    return manual_shadow_plan_binding(
+        lottery,
+        platform="douyin",
+        execution_path_id=DOUYIN_MANUAL_EXECUTION_PATH,
+        platform_label="Douyin",
+        execution_revision=execution_revision,
+        selector_config=selector_config,
+    )
+
+
+def weibo_manual_plan_binding(
+    lottery,
+    *,
+    execution_revision: int,
+    selector_config: dict,
+) -> dict:
+    """Bind an explicitly selected Weibo manual fallback for shadow only."""
+
+    return manual_shadow_plan_binding(
+        lottery,
+        platform="weibo",
+        execution_path_id=WEIBO_MANUAL_EXECUTION_PATH,
+        platform_label="Weibo",
+        execution_revision=execution_revision,
+        selector_config=selector_config,
+    )
+
+
+def weibo_oauth_plan_binding(
+    lottery,
+    *,
+    require_executable: bool,
+    execution_revision: int,
+    weibo_rip: str = "",
+) -> dict:
+    """Bind a Weibo OAuth plan to its target and credential generation."""
+
+    try:
+        plan = validate_action_plan_v2(
+            parse_json_field(lottery["action_plan"]),
+            require_executable=require_executable,
+        )
+        snapshot_id = int(lottery["authoritative_rule_snapshot_id"] or 0)
+    except (ActionPlanV2Error, TypeError, ValueError, KeyError) as exc:
+        code = (
+            exc.code
+            if isinstance(exc, ActionPlanV2Error)
+            else "action_plan_binding_invalid"
+        )
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Weibo OAuth Action Plan v2 is not ready",
+                "blockers": [code],
+            },
+        ) from exc
+    if (
+        plan.plan.get("platform") != "weibo"
+        or plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH
+        or snapshot_id != plan.rule_snapshot_id
+        or str(lottery["rule_hash"] or "") != plan.rule_hash
+        or str(lottery["action_plan_hash"] or "") != plan.plan_hash
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Weibo OAuth plan binding changed; review again",
+                "blockers": ["action_plan_rule_binding_mismatch"],
+            },
+        )
+    if type(execution_revision) is not int or execution_revision <= 0:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Weibo account revision is invalid",
+                "blockers": ["execution_revision_invalid"],
+            },
+        )
+    capability_contract = weibo_runtime_capability_requirements(
+        plan.required_actions
+    )
+    return {
+        "rule_snapshot_id": plan.rule_snapshot_id,
+        "rule_hash": plan.rule_hash,
+        "action_plan_hash": plan.plan_hash,
+        "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+        "target_hash": compute_target_hash(str(lottery["canonical_url"] or "")),
+        "config_hash": compute_config_hash(
+            {
+                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                "execution_revision": execution_revision,
+                "runtime_capability_requirements": capability_contract,
+                "weibo_rip_hash": weibo_rip_hmac(weibo_rip),
+            }
+        ),
+        "execution_revision": execution_revision,
+        "required_actions": plan.required_actions,
+        "follow_target_handle": plan.follow_target_handle,
+        "runtime_capability_requirements": capability_contract,
         "action_plan": plan.plan,
     }
 
@@ -894,11 +1105,13 @@ async def build_lottery_repair_plan(lottery, *, completed_actions: list[str] | N
             reason = "lottery_not_pending"
 
     eligible = reason == "missing_actions_available"
+    dispatch_supported = bool(REPAIR_DISPATCH_INTENT_BINDING_READY)
+    executable = bool(eligible and dispatch_supported)
     repair_action_plan = None
     if eligible:
         repair_action_plan = {
             "version": 1,
-            "is_lottery": bool(parsed_rule.get("is_lottery")),
+            "is_lottery": bool(action_plan.get("is_lottery")),
             "required_actions": missing_actions,
             "review_required": False,
             "confidence": 1.0,
@@ -909,6 +1122,9 @@ async def build_lottery_repair_plan(lottery, *, completed_actions: list[str] | N
 
     return {
         "eligible": eligible,
+        "dispatch_supported": dispatch_supported,
+        "executable": executable,
+        "dispatch_blocker": None if dispatch_supported else REPAIR_DISPATCH_BLOCKER,
         "reason": reason,
         "required_actions": required_actions,
         "completed_actions": completed_actions,
@@ -1223,15 +1439,29 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
     real_adapter_enabled = platform_cfg.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, lottery["platform"])
     task_mode = resolve_task_mode(data)
     dry_run = task_mode != "real_run"
-    if lottery["platform"] == "xiaohongshu" and task_mode == "dry_run":
-        # task_phases.phase cannot persist ``favorited`` without a schema
-        # migration.  Do not silently omit the fourth action; the read-only
-        # shadow path remains available for contract validation.
+    stored_plan = parse_json_field(lottery["action_plan"])
+    stored_execution_path = (
+        str(stored_plan.get("execution_path_id") or "")
+        if isinstance(stored_plan, dict)
+        else ""
+    )
+    weibo_rip = ""
+    manual_shadow_only = bool(
+        lottery["platform"] in {"xiaohongshu", "douyin"}
+        or (
+            lottery["platform"] == "weibo"
+            and stored_execution_path == WEIBO_MANUAL_EXECUTION_PATH
+        )
+    )
+    if manual_shadow_only and task_mode == "dry_run":
+        # Manual-only plans must not fall through to the mutation-capable
+        # selector flow. Douyin may also contain ``favorited``, which the
+        # current task_phases schema cannot persist without a migration.
         raise HTTPException(
             409,
             detail={
-                "message": "Xiaohongshu four-action plans support manual-assisted shadow only",
-                "blockers": ["xiaohongshu_manual_shadow_only"],
+                "message": f"{lottery['platform']} plans support manual-assisted shadow only",
+                "blockers": [f"{lottery['platform']}_manual_shadow_only"],
             },
         )
     target = validate_lottery_target(lottery["platform"], lottery["raw_url"])
@@ -1239,14 +1469,24 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         raise HTTPException(400, detail=target.reason)
     if task_mode == "shadow_run" and lottery["platform"] in {
         "bilibili",
+        "weibo",
         "xiaohongshu",
+        "douyin",
     }:
         shadow_contract = await validate_real_run_evidence(lottery, account_id=None)
         if not shadow_contract.get("action_plan_ready"):
             platform_label = (
                 "Xiaohongshu manual-assisted"
                 if lottery["platform"] == "xiaohongshu"
-                else "Bilibili API-path"
+                else (
+                    "Douyin manual-assisted"
+                    if lottery["platform"] == "douyin"
+                    else (
+                        "Weibo OAuth/manual"
+                        if lottery["platform"] == "weibo"
+                        else "Bilibili API-path"
+                    )
+                )
             )
             raise HTTPException(
                 409,
@@ -1271,6 +1511,33 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
                         "blockers": [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
                     },
                 )
+            if lottery["platform"] == "douyin":
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "Douyin has no official participant interaction API; use the manual-assisted checklist and shadow run",
+                        "blockers": [DOUYIN_NO_OFFICIAL_API_BLOCKER],
+                    },
+                )
+            if (
+                lottery["platform"] == "weibo"
+                and stored_execution_path == WEIBO_MANUAL_EXECUTION_PATH
+            ):
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "Weibo manual fallback supports checklist and shadow only; select the reviewed OAuth path for official writes",
+                        "blockers": [WEIBO_MANUAL_EXECUTION_BLOCKER],
+                    },
+                )
+            if lottery["platform"] == "weibo":
+                required_actions = set(
+                    stored_plan.get("required_actions") or []
+                    if isinstance(stored_plan, dict)
+                    else []
+                )
+                if required_actions.intersection(WEIBO_RIP_ACTIONS):
+                    weibo_rip = trusted_weibo_rip(request)
             require_confirmation(request)
             if not data.confirm:
                 raise HTTPException(409, detail="Real-run body confirmation required")
@@ -1327,7 +1594,23 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             )
             raise HTTPException(423, detail=f"Circuit breaker blocks shadow-run: {breaker_reason}")
 
-    account = await pick_account(data.account_id, lottery["platform"])
+    account = await pick_account(
+        data.account_id,
+        lottery["platform"],
+        execution_path_id=account_execution_path_for_dispatch(
+            lottery["platform"],
+            task_mode=task_mode,
+            stored_execution_path=stored_execution_path,
+        ),
+        required_actions=(
+            tuple(stored_plan.get("required_actions") or ())
+            if lottery["platform"] == "weibo"
+            and task_mode != "shadow_run"
+            and isinstance(stored_plan, dict)
+            else ()
+        ),
+        require_weibo_capability=(task_mode == "real_run"),
+    )
     if not account:
         await _record_post_commit_event(
             aggregate="lottery",
@@ -1420,12 +1703,42 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             selector_config=platform_selectors,
         )
         action_plan = plan_binding["action_plan"]
+    elif lottery["platform"] == "douyin" and task_mode == "shadow_run":
+        plan_binding = douyin_manual_plan_binding(
+            lottery,
+            execution_revision=int(account["execution_revision"] or 0),
+            selector_config=platform_selectors,
+        )
+        action_plan = plan_binding["action_plan"]
+    elif lottery["platform"] == "weibo" and task_mode in {
+        "dry_run",
+        "shadow_run",
+        "real_run",
+    }:
+        if stored_execution_path == WEIBO_MANUAL_EXECUTION_PATH:
+            plan_binding = weibo_manual_plan_binding(
+                lottery,
+                execution_revision=int(account["execution_revision"] or 0),
+                selector_config=platform_selectors,
+            )
+        else:
+            plan_binding = weibo_oauth_plan_binding(
+                lottery,
+                require_executable=(task_mode == "real_run"),
+                execution_revision=int(account["execution_revision"] or 0),
+                weibo_rip=weibo_rip,
+            )
+        action_plan = plan_binding["action_plan"]
     execution_evidence_id = (
         str(decision_gate.get("execution_evidence_id") or "").strip()
         if task_mode == "real_run"
         else ""
     )
-    if task_mode == "real_run" and lottery["platform"] == "bilibili" and not execution_evidence_id:
+    if (
+        task_mode == "real_run"
+        and lottery["platform"] in {"bilibili", "weibo"}
+        and not execution_evidence_id
+    ):
         raise HTTPException(
             409,
             detail={
@@ -1449,37 +1762,56 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
         if task_mode == "real_run":
             completed_actions = await completed_real_run_actions(lottery_id)
             require_no_completed_actions_for_full_real_dispatch(completed_actions)
-            try:
-                dynamic_id = extract_bilibili_dynamic_id(
-                    str(lottery["canonical_url"] or ""),
-                    str(lottery["raw_url"] or ""),
+            if lottery["platform"] == "bilibili":
+                try:
+                    dynamic_id = extract_bilibili_dynamic_id(
+                        str(lottery["canonical_url"] or ""),
+                        str(lottery["raw_url"] or ""),
+                    )
+                except BilibiliPreflightEvidenceError as exc:
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "message": "Bilibili target changed or is not an exact dynamic",
+                            "blockers": [exc.code],
+                        },
+                    ) from exc
+                exact_evidence = await load_exact_bilibili_execution_evidence(
+                    lottery_id=lottery_id,
+                    account_id=int(account["id"]),
+                    rule_snapshot_id=plan_binding["rule_snapshot_id"],
+                    execution_path_id=plan_binding["execution_path_id"],
+                    target_hash=plan_binding["target_hash"],
+                    rule_hash=plan_binding["rule_hash"],
+                    action_plan_hash=plan_binding["action_plan_hash"],
+                    config_hash=plan_binding["config_hash"],
+                    dynamic_id=dynamic_id,
+                    required_actions=plan_binding["required_actions"],
+                    execution_revision=plan_binding["execution_revision"],
+                    follow_target_handle=plan_binding["follow_target_handle"],
+                    evidence_id=execution_evidence_id,
+                    for_update=True,
                 )
-            except BilibiliPreflightEvidenceError as exc:
-                raise HTTPException(
-                    409,
-                    detail={
-                        "message": "Bilibili target changed or is not an exact dynamic",
-                        "blockers": [exc.code],
-                    },
-                ) from exc
-            exact_evidence = await load_exact_bilibili_execution_evidence(
-                lottery_id=lottery_id,
-                account_id=int(account["id"]),
-                rule_snapshot_id=plan_binding["rule_snapshot_id"],
-                execution_path_id=plan_binding["execution_path_id"],
-                target_hash=plan_binding["target_hash"],
-                rule_hash=plan_binding["rule_hash"],
-                action_plan_hash=plan_binding["action_plan_hash"],
-                config_hash=plan_binding["config_hash"],
-                dynamic_id=dynamic_id,
-                required_actions=plan_binding["required_actions"],
-                execution_revision=plan_binding["execution_revision"],
-                follow_target_handle=plan_binding["follow_target_handle"],
-                evidence_id=execution_evidence_id,
-                for_update=True,
-            )
-            if not exact_evidence:
-                raise HTTPException(409, detail="Exact execution evidence expired or changed during dispatch")
+                if not exact_evidence:
+                    raise HTTPException(409, detail="Exact execution evidence expired or changed during dispatch")
+            elif lottery["platform"] == "weibo":
+                fresh_oauth_evidence = await validate_real_run_evidence(
+                    lottery,
+                    account_id=int(account["id"]),
+                )
+                if (
+                    not fresh_oauth_evidence.get("allowed")
+                    or str(fresh_oauth_evidence.get("execution_evidence_id") or "")
+                    != execution_evidence_id
+                ):
+                    raise HTTPException(
+                        409,
+                        detail={
+                            "message": "Weibo OAuth capability evidence expired or changed during dispatch",
+                            "blockers": fresh_oauth_evidence.get("blockers")
+                            or ["weibo_oauth_capability_evidence_required"],
+                        },
+                    )
         try:
             account_lease = await acquire_account_operation_lease(
                 int(account["id"]),
@@ -1557,6 +1889,7 @@ async def dispatch_lottery(lottery_id: int, data: DispatchTaskRequest, request: 
             execution_revision=plan_binding["execution_revision"],
             account_lease_id=account_lease.lease_id,
             account_lease_generation=account_lease.generation,
+            weibo_rip_encrypted=encrypt_weibo_rip(weibo_rip),
         )
         await database.execute(
             "UPDATE lotteries SET status = 'claimed', execution_lock = :task_id, locked_at = NOW() WHERE id = :id",
@@ -1703,9 +2036,9 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
         raise HTTPException(409, detail={"message": "Lottery has no safe missing-action repair plan", "repair_plan": repair_plan})
     if not REPAIR_DISPATCH_INTENT_BINDING_READY:
         raise HTTPException(
-            409,
+            503,
             detail={
-                "code": "repair_intent_binding_not_implemented",
+                "code": REPAIR_DISPATCH_BLOCKER,
                 "message": "Repair dispatch is blocked until its exact action intent is durably bound",
                 "repair_plan": repair_plan,
             },
@@ -1761,7 +2094,24 @@ async def dispatch_lottery_repair(lottery_id: int, data: DispatchTaskRequest, re
         await emit_real_run_gate_notification(lottery, exc.detail, actor_id=actor["actor_id"])
         raise
 
-    account = await pick_account(data.account_id, lottery["platform"])
+    repair_stored_plan = parse_json_field(lottery["action_plan"])
+    account = await pick_account(
+        data.account_id,
+        lottery["platform"],
+        execution_path_id=(
+            str(repair_stored_plan.get("execution_path_id") or "")
+            if lottery["platform"] == "weibo"
+            and isinstance(repair_stored_plan, dict)
+            else ""
+        ),
+        required_actions=(
+            tuple(repair_stored_plan.get("required_actions") or ())
+            if lottery["platform"] == "weibo"
+            and isinstance(repair_stored_plan, dict)
+            else ()
+        ),
+        require_weibo_capability=True,
+    )
     if not account:
         await _record_post_commit_event(
             aggregate="lottery",
@@ -1967,6 +2317,22 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
                 "reposted": {"topic_tags": [], "mentions": []},
             }
         )
+        source_content_requirements = {
+            "follow_targets": list(content_requirements.get("follow_targets") or []),
+            "commented": dict(content_requirements.get("commented") or {}),
+            "reposted": dict(content_requirements.get("reposted") or {}),
+        }
+        try:
+            friend_mention_requirements = validate_friend_mention_requirements(
+                parsed_rule.get("friend_mention_requirements", {})
+            )
+        except ActionPlanV2Error as exc:
+            friend_mention_requirements = {}
+            # A parser-produced invalid shape is a contract defect, never a
+            # reason to silently discard an operator-visible source rule.
+            payload_validation_errors = [exc.code]
+        else:
+            payload_validation_errors = []
         ambiguity_patterns = list(parsed_rule.get("ambiguity_patterns") or [])
         parsed_required_actions = {
             str(action)
@@ -1976,7 +2342,6 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
         selected_required_actions = set(required_actions)
 
         raw_payloads = dict(data.action_payloads or {})
-        payload_validation_errors: list[str] = []
         if set(raw_payloads) != selected_required_actions:
             payload_validation_errors.append("action_plan_payload_binding_mismatch")
         if set(raw_payloads) - platform_action_set:
@@ -1985,24 +2350,80 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
         for action in required_actions:
             raw_payload = raw_payloads.get(action, {})
             try:
-                action_payloads[action] = validate_action_payload(action, raw_payload)
+                action_payloads[action] = validate_action_payload(
+                    action,
+                    raw_payload,
+                    allow_empty_repost_text=(
+                        lottery["platform"] in {"weibo", "douyin"}
+                    ),
+                    platform=lottery["platform"],
+                )
             except ActionPlanV2Error as exc:
                 action_payloads[action] = dict(raw_payload) if isinstance(raw_payload, dict) else {}
                 payload_validation_errors.append(exc.code)
         payload_validation_errors = list(dict.fromkeys(payload_validation_errors))
 
-        if lottery["platform"] == "xiaohongshu":
-            content_requirements = bind_xiaohongshu_manual_follow_target(
+        if lottery["platform"] in {"weibo", "xiaohongshu", "douyin"}:
+            content_requirements = bind_manual_follow_target(
                 required_actions,
                 action_payloads,
                 content_requirements,
             )
+        if lottery["platform"] == "weibo":
+            content_requirements = bind_manual_friend_mentions(
+                action_payloads,
+                content_requirements,
+                friend_mention_requirements,
+            )
+            missing_constraint_actions = [
+                action
+                for action in friend_mention_requirements
+                if action not in selected_required_actions
+            ]
+            if missing_constraint_actions:
+                payload_validation_errors.append(
+                    "action_plan_friend_mention_action_missing"
+                )
+            elif friend_mention_requirements and not friend_mention_requirements_satisfied(
+                action_payloads,
+                content_requirements,
+                friend_mention_requirements,
+                source_content_requirements=source_content_requirements,
+            ):
+                payload_validation_errors.append(
+                    "action_plan_friend_mention_count_mismatch"
+                )
+            payload_validation_errors = list(
+                dict.fromkeys(payload_validation_errors)
+            )
+            try:
+                validate_weibo_preflight_unique_handle_limit(
+                    action_payloads,
+                    content_requirements,
+                    source_content_requirements,
+                )
+            except ActionPlanV2Error as exc:
+                payload_validation_errors.append(exc.code)
+                payload_validation_errors = list(
+                    dict.fromkeys(payload_validation_errors)
+                )
 
         represented_requirements, unresolved_requirements, capability_blockers = (
             semantic_requirement_status(
                 unsupported_actions,
                 action_payloads,
                 content_requirements,
+                friend_mention_requirements=friend_mention_requirements,
+                source_content_requirements=source_content_requirements,
+                media_capability_blocker=(
+                    "douyin_media_submission_unsupported"
+                    if lottery["platform"] == "douyin"
+                    else (
+                        "weibo_media_submission_unsupported"
+                        if lottery["platform"] == "weibo"
+                        else "bilibili_media_submission_unsupported"
+                    )
+                ),
             )
         )
         execution_path_id = str(
@@ -2016,6 +2437,18 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
                     "xiaohongshu_execution_path_not_supported"
                 )
             capability_blockers.append(XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER)
+        elif lottery["platform"] == "douyin":
+            if execution_path_id != DOUYIN_MANUAL_EXECUTION_PATH:
+                capability_blockers.append("douyin_execution_path_invalid")
+            capability_blockers.append(DOUYIN_NO_OFFICIAL_API_BLOCKER)
+        elif lottery["platform"] == "weibo":
+            if execution_path_id not in {
+                WEIBO_OAUTH_EXECUTION_PATH,
+                WEIBO_MANUAL_EXECUTION_PATH,
+            }:
+                capability_blockers.append("weibo_execution_path_invalid")
+            elif execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+                capability_blockers.append(WEIBO_MANUAL_EXECUTION_BLOCKER)
         elif lottery["platform"] != "bilibili":
             capability_blockers.append("platform_execution_path_not_bound")
         elif execution_path_id != BILIBILI_API_EXECUTION_PATH:
@@ -2049,6 +2482,14 @@ async def update_lottery_action_plan(lottery_id: int, data: LotteryActionPlanUpd
             "required_actions": required_actions,
             "action_payloads": action_payloads,
             "content_requirements": content_requirements,
+            "source_content_requirements": source_content_requirements,
+            "friend_mention_requirements": friend_mention_requirements,
+            "runtime_capability_requirements": (
+                weibo_runtime_capability_requirements(required_actions)
+                if lottery["platform"] == "weibo"
+                and execution_path_id == WEIBO_OAUTH_EXECUTION_PATH
+                else {}
+            ),
             "execution_path_id": execution_path_id,
             "rule_snapshot_id": snapshot["id"],
             "rule_hash": snapshot["rule_hash"],
@@ -2175,7 +2616,16 @@ async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, requ
     if not target.valid:
         raise HTTPException(400, detail=target.reason)
 
-    account = await pick_account(data.account_id, lottery["platform"])
+    account = await pick_account(
+        data.account_id,
+        lottery["platform"],
+        execution_path_id=(
+            WEIBO_MANUAL_EXECUTION_PATH
+            if lottery["platform"] == "weibo"
+            else ""
+        ),
+        require_weibo_capability=False,
+    )
     if not account:
         raise HTTPException(400, detail=f"No calibrated ready account is available for {lottery['platform']}")
 
@@ -2186,7 +2636,17 @@ async def probe_lottery_adapter(lottery_id: int, data: AdapterProbeRequest, requ
         "execution_path_id": f"{lottery['platform']}_selector_v1",
         "execution_revision": int(account["execution_revision"] or 0),
     }
-    config_hash = compute_config_hash({})
+    runtime_selector_config = await load_runtime_selector_config()
+    platform_selector_config = runtime_selector_config.get(lottery["platform"], {})
+    if not isinstance(platform_selector_config, dict):
+        platform_selector_config = {}
+    config_hash = compute_config_hash(
+        {
+            "platform": lottery["platform"],
+            "execution_revision": int(account["execution_revision"] or 0),
+            "selector_config": platform_selector_config,
+        }
+    )
     if lottery["platform"] == "bilibili":
         plan_readiness = await validate_real_run_evidence(lottery, account_id=None)
         if not plan_readiness.get("action_plan_ready"):
@@ -2357,6 +2817,7 @@ async def apply_probe_recommended_config(probe_id: str, request: Request):
         raise HTTPException(409, detail=f"Probe is not succeeded (status: {probe['status']})")
 
     platform = probe["platform"]
+    required_phases = selector_phases_for_platform(platform)
     recommended = recommended_config_from_probe(probe["result"], platform)
     if not recommended:
         raise HTTPException(409, detail="Probe has no recommended selector config to apply")
@@ -2365,12 +2826,12 @@ async def apply_probe_recommended_config(probe_id: str, request: Request):
             409,
             detail={
                 "message": "Recommended config is incomplete; re-probe or finish it by hand before applying",
-                "phases": {phase: phase_configured(platform, recommended, phase) for phase in ADAPTER_PHASES},
+                "phases": {phase: phase_configured(platform, recommended, phase) for phase in required_phases},
             },
         )
 
     await save_platform_selector_config(platform, recommended)
-    phase_status = {phase: phase_configured(platform, recommended, phase) for phase in ADAPTER_PHASES}
+    phase_status = {phase: phase_configured(platform, recommended, phase) for phase in required_phases}
     await audit_event(
         request,
         action="adapter_selector_config.apply_probe",
@@ -2471,107 +2932,180 @@ async def update_lottery_result(lottery_id: int, data: LotteryResultUpdate, requ
     return {"status": "updated", "lottery_id": lottery_id, "result": data.status}
 
 
-async def pick_account(account_id: int | None, platform: str):
-    if account_id is not None:
-        return await database.fetch_one(
-            """SELECT * FROM accounts a
-               WHERE a.id = :id
-                 AND a.platform = :platform
-                 AND a.status = 'ready'
-                 AND OCTET_LENGTH(a.encrypted_credential) > 0
-                 AND (
-                   SELECT c.status FROM account_calibrations c
-                   WHERE c.account_id = a.id
-                   ORDER BY c.created_at DESC
-                   LIMIT 1
-                 ) = 'succeeded'
-                 AND NOT EXISTS (
-                   SELECT 1 FROM account_operation_leases lease
-                   WHERE lease.account_id = a.id
-                     AND lease.released_at IS NULL
-                     AND lease.expires_at > NOW()
-                 )""",
-            {"id": account_id, "platform": platform},
+ACCOUNT_PICK_SELECT = """SELECT a.*,
+       c.calibration_id AS latest_calibration_id,
+       c.status AS latest_calibration_status,
+       c.result AS latest_calibration_result,
+       (c.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR))
+         AS latest_calibration_fresh
+  FROM accounts a
+  LEFT JOIN account_calibrations c
+    ON c.id = (
+      SELECT latest.id
+      FROM account_calibrations latest
+      WHERE latest.account_id = a.id
+        AND latest.platform = a.platform
+      ORDER BY latest.id DESC
+      LIMIT 1
+    )
+ WHERE a.platform = :platform
+   AND a.status = 'ready'
+   AND a.deleted_at IS NULL
+   AND OCTET_LENGTH(a.encrypted_credential) > 0
+   AND c.status = 'succeeded'
+   AND NOT EXISTS (
+     SELECT 1 FROM account_operation_leases lease
+     WHERE lease.account_id = a.id
+       AND lease.released_at IS NULL
+       AND lease.expires_at > NOW()
+   )"""
+
+
+def _weibo_candidate_supports_execution(
+    row,
+    *,
+    execution_path_id: str,
+    required_actions: tuple[str, ...],
+    require_capability: bool,
+) -> bool:
+    values = dict(row)
+    if values.get("latest_calibration_status") != "succeeded":
+        return False
+    encrypted_credential = values.get("encrypted_credential")
+    credential_kind = account_credential_kind("weibo", encrypted_credential)
+    if execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
+        return credential_kind == "browser_session"
+    if execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+        return False
+    if credential_kind != "weibo_oauth":
+        return False
+    try:
+        credential = decrypt_weibo_oauth_credential(encrypted_credential)
+        if not require_capability:
+            return True
+        if not required_actions:
+            return False
+        execution_revision = int(values.get("execution_revision") or 0)
+        calibration_id = str(values.get("latest_calibration_id") or "")
+        if execution_revision <= 0 or not calibration_id:
+            return False
+        capability = validate_weibo_oauth_capability_attestation(
+            values.get("latest_calibration_result"),
+            required_actions=required_actions,
+            account_id=int(values["id"]),
+            execution_revision=execution_revision,
+            calibration_fresh=bool(values.get("latest_calibration_fresh")),
+            expected_calibration_id=calibration_id,
+            expected_uid=str(credential["uid"]),
         )
+    except Exception:
+        return False
+    return capability.get("ready") is True
+
+
+async def _account_candidate_is_available(
+    row,
+    *,
+    platform: str,
+    execution_path_id: str,
+    required_actions: tuple[str, ...],
+    require_weibo_capability: bool,
+) -> bool:
+    if not row:
+        return False
+    values = dict(row)
+    if platform == "weibo" and not _weibo_candidate_supports_execution(
+        values,
+        execution_path_id=execution_path_id,
+        required_actions=required_actions,
+        require_capability=require_weibo_capability,
+    ):
+        return False
+    risk = await recent_account_risk(int(values["id"]))
+    return not risk["has_recent_risk"]
+
+
+async def _fetch_account_candidate(account_id: int, platform: str):
+    return await database.fetch_one(
+        f"{ACCOUNT_PICK_SELECT} AND a.id = :id LIMIT 1",
+        {"id": account_id, "platform": platform},
+    )
+
+
+async def pick_account(
+    account_id: int | None,
+    platform: str,
+    *,
+    execution_path_id: str = "",
+    required_actions: tuple[str, ...] | list[str] = (),
+    require_weibo_capability: bool = True,
+):
+    actions = tuple(required_actions)
+    if account_id is not None:
+        row = await _fetch_account_candidate(account_id, platform)
+        if await _account_candidate_is_available(
+            row,
+            platform=platform,
+            execution_path_id=execution_path_id,
+            required_actions=actions,
+            require_weibo_capability=require_weibo_capability,
+        ):
+            return row
+        return None
 
     recommendations = await load_strategy_account_recommendations(platform)
     recommended = first_or_none(recommendations.get(platform, []))
     if recommended:
-        row = await database.fetch_one(
-            """SELECT * FROM accounts a
-               WHERE a.id = :id
-                 AND a.platform = :platform
-                 AND a.status = 'ready'
-                 AND OCTET_LENGTH(a.encrypted_credential) > 0
-                 AND (
-                   SELECT c.status FROM account_calibrations c
-                   WHERE c.account_id = a.id
-                   ORDER BY c.created_at DESC
-                   LIMIT 1
-                 ) = 'succeeded'
-                 AND NOT EXISTS (
-                   SELECT 1 FROM account_operation_leases lease
-                   WHERE lease.account_id = a.id
-                     AND lease.released_at IS NULL
-                     AND lease.expires_at > NOW()
-                 )""",
-            {"id": recommended["account_id"], "platform": platform},
-        )
-        if row and not (await recent_account_risk(int(row["id"])))["has_recent_risk"]:
-            return row
+        try:
+            recommended_id = int(recommended["account_id"])
+        except (KeyError, TypeError, ValueError):
+            recommended_id = None
+        if recommended_id is not None:
+            row = await _fetch_account_candidate(recommended_id, platform)
+            if await _account_candidate_is_available(
+                row,
+                platform=platform,
+                execution_path_id=execution_path_id,
+                required_actions=actions,
+                require_weibo_capability=require_weibo_capability,
+            ):
+                return row
 
     candidates = await database.fetch_all(
-        """SELECT * FROM accounts a
-           WHERE a.platform = :platform
-             AND a.status = 'ready'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND (
-               SELECT c.status FROM account_calibrations c
-               WHERE c.account_id = a.id
-               ORDER BY c.created_at DESC
-               LIMIT 1
-             ) = 'succeeded'
-             AND NOT EXISTS (
-               SELECT 1 FROM account_operation_leases lease
-               WHERE lease.account_id = a.id
-                 AND lease.released_at IS NULL
-                 AND lease.expires_at > NOW()
-             )
-           ORDER BY daily_task_count ASC, id ASC
-           LIMIT 25""",
+        f"{ACCOUNT_PICK_SELECT} ORDER BY a.daily_task_count ASC, a.id ASC LIMIT 25",
         {"platform": platform},
     )
     for row in candidates:
-        if not (await recent_account_risk(int(row["id"])))["has_recent_risk"]:
+        if await _account_candidate_is_available(
+            row,
+            platform=platform,
+            execution_path_id=execution_path_id,
+            required_actions=actions,
+            require_weibo_capability=require_weibo_capability,
+        ):
             return row
-
-    return await database.fetch_one(
-        """SELECT * FROM accounts a
-           WHERE a.platform = :platform
-             AND a.status = 'ready'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND (
-               SELECT c.status FROM account_calibrations c
-               WHERE c.account_id = a.id
-               ORDER BY c.created_at DESC
-               LIMIT 1
-             ) = 'succeeded'
-             AND NOT EXISTS (
-               SELECT 1 FROM account_operation_leases lease
-               WHERE lease.account_id = a.id
-                 AND lease.released_at IS NULL
-                 AND lease.expires_at > NOW()
-             )
-           ORDER BY daily_task_count ASC, id ASC
-           LIMIT 1""",
-        {"platform": platform},
-    )
+    return None
 
 
 def resolve_task_mode(data: DispatchTaskRequest) -> str:
     if data.mode:
         return data.mode.value if hasattr(data.mode, "value") else str(data.mode)
     return "dry_run" if data.dry_run else "real_run"
+
+
+def account_execution_path_for_dispatch(
+    platform: str,
+    *,
+    task_mode: str,
+    stored_execution_path: str,
+) -> str:
+    """Choose credential transport independently from a Weibo plan's path."""
+
+    if platform != "weibo":
+        return ""
+    if task_mode == "shadow_run":
+        return WEIBO_MANUAL_EXECUTION_PATH
+    return stored_execution_path
 
 
 async def compute_strategy_item(
@@ -2618,6 +3152,7 @@ async def compute_strategy_item(
             real_run_enabled=real_run_enabled,
             breaker_allowed=breaker_allowed,
             breaker_reason=breaker_reason,
+            manual_assisted=cfg.get("execution_mode") == "manual_assisted",
         )
     else:
         recommended_mode = "blocked"

@@ -11,7 +11,8 @@ class LotteryTargetValidation:
 
 
 WEIBO_MBLOGID_PATTERN = re.compile(r"(?=.*[A-Za-z])[A-Za-z0-9]{6,16}")
-WEIBO_MID_PATTERN = re.compile(r"\d{13,19}")
+WEIBO_MID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
+WEIBO_MID_MAX = 2**63 - 1
 XIAOHONGSHU_NOTE_PATTERN = re.compile(r"[0-9a-fA-F]{24}")
 
 
@@ -108,7 +109,11 @@ def validate_weibo_target(parsed, host: str) -> LotteryTargetValidation:
 
 
 def is_weibo_status_id(value: str) -> bool:
-    return bool(WEIBO_MID_PATTERN.fullmatch(value) or WEIBO_MBLOGID_PATTERN.fullmatch(value))
+    if WEIBO_MBLOGID_PATTERN.fullmatch(value):
+        return True
+    if not WEIBO_MID_PATTERN.fullmatch(value):
+        return False
+    return int(value) <= WEIBO_MID_MAX
 
 
 def validate_xiaohongshu_target(parsed, host: str) -> LotteryTargetValidation:
@@ -140,6 +145,13 @@ def validate_douyin_target(parsed, host: str) -> LotteryTargetValidation:
     if host in {"douyin.com", "www.douyin.com"}:
         if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
             return LotteryTargetValidation(True, kind="video")
+        if (
+            host == "www.douyin.com"
+            and len(path_parts) == 2
+            and path_parts[0] == "note"
+            and re.fullmatch(r"\d{19}", path_parts[1])
+        ):
+            return LotteryTargetValidation(True, kind="note")
 
     if host == "www.iesdouyin.com":
         if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():

@@ -16,27 +16,52 @@ from typing import Any, Mapping, Protocol
 from app.action_plan import (
     ActionPlanV2Error,
     BILIBILI_API_EXECUTION_PATH,
+    DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    WEIBO_OAUTH_EXECUTION_PATH,
     ValidatedActionPlanV2,
     canonical_json_bytes,
     compute_bilibili_api_config_hash,
+    compute_config_hash,
     compute_rule_hash,
     compute_target_hash,
     validate_action_plan_v2,
 )
 from app.bilibili.preflight import API_PREFLIGHT_KIND, validate_preflight_observation
 from app.bilibili.runtime import extract_bilibili_dynamic_id
+from app.weibo.capabilities import (
+    WeiboOAuthCapabilityError,
+    validate_weibo_oauth_capability_attestation,
+)
+from app.weibo.credentials import (
+    decrypt_weibo_rip,
+    weibo_rip_hmac,
+    weibo_rip_required,
+)
 
 
 REAL_RUN_POLICY_KEY = "real_run_gate"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _EXPLICIT_FALSE = frozenset({"0", "false", "no", "off"})
-_SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE = frozenset(
-    {"weibo", "douyin"}
-)
+_SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE = frozenset()
+_MANUAL_ONLY_REAL_RUN_BLOCKS = {
+    "douyin": DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    "xiaohongshu": "xiaohongshu_no_official_interaction_api",
+}
 _BILIBILI_API_EXECUTION_PATH = BILIBILI_API_EXECUTION_PATH
-_SUPPORTED_REAL_RUN_PLATFORMS = frozenset({"bilibili"}) | (
+_SUPPORTED_REAL_RUN_PLATFORMS = frozenset({"bilibili", "weibo"}) | (
     _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE
-) | frozenset({"xiaohongshu"})
+) | frozenset(_MANUAL_ONLY_REAL_RUN_BLOCKS)
+
+
+def platform_real_run_block_reason(platform: str) -> str | None:
+    """Return the authoritative pre-execution capability blocker, if any."""
+
+    normalized = str(platform or "").strip().lower()
+    if normalized in _MANUAL_ONLY_REAL_RUN_BLOCKS:
+        return _MANUAL_ONLY_REAL_RUN_BLOCKS[normalized]
+    if normalized in _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE:
+        return "selector_evidence_binding_required"
+    return None
 
 
 class GateDatabase(Protocol):
@@ -72,6 +97,9 @@ class RealRunGateSnapshot:
     execution_evidence_id: str
     account_lease_id: str
     account_lease_generation: int
+    execution_revision: int
+    oauth_capabilities: dict[str, Any] | None
+    weibo_uid: str | None
 
 
 _TASK_DECISION_QUERY = """
@@ -98,6 +126,8 @@ SELECT
   a.platform AS account_platform,
   a.status AS account_status,
   a.execution_revision AS account_execution_revision,
+  CASE WHEN OCTET_LENGTH(a.encrypted_credential) > 0 THEN 1 ELSE 0 END
+    AS account_credential_present,
   l.id AS bound_lottery_id,
   l.platform AS lottery_platform,
   l.status AS lottery_status,
@@ -115,6 +145,18 @@ SELECT
   rs.attested_by AS rule_snapshot_attested_by,
   rs.attested_at AS rule_snapshot_attested_at,
   rs.rule_hash AS snapshot_rule_hash,
+  oauth_cal.calibration_id AS oauth_calibration_id,
+  oauth_cal.account_id AS oauth_calibration_account_id,
+  oauth_cal.platform AS oauth_calibration_platform,
+  oauth_cal.status AS oauth_calibration_status,
+  oauth_cal.result AS oauth_calibration_result,
+  oauth_cal.created_at AS oauth_calibration_created_at,
+  oauth_cal.finished_at AS oauth_calibration_finished_at,
+  CASE WHEN oauth_cal.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+             AND oauth_cal.created_at <= NOW()
+             AND oauth_cal.finished_at IS NOT NULL
+             AND oauth_cal.finished_at <= NOW()
+       THEN 1 ELSE 0 END AS oauth_calibration_fresh,
   e.id AS evidence_id,
   e.lottery_id AS evidence_lottery_id,
   e.account_id AS evidence_account_id,
@@ -218,6 +260,22 @@ LEFT JOIN accounts a ON a.id = tr.account_id
 LEFT JOIN lotteries l ON l.id = tr.lottery_id
 LEFT JOIN lottery_rule_snapshots rs
   ON rs.id = l.authoritative_rule_snapshot_id AND rs.lottery_id = l.id
+LEFT JOIN account_calibrations oauth_cal
+  ON oauth_cal.calibration_id = tr.execution_evidence_id
+ AND oauth_cal.account_id = tr.account_id
+ AND oauth_cal.platform = 'weibo'
+ AND oauth_cal.id = (
+   SELECT latest_oauth.id
+     FROM account_calibrations latest_oauth
+     WHERE latest_oauth.account_id = tr.account_id
+       AND latest_oauth.platform = 'weibo'
+       AND latest_oauth.status = 'succeeded'
+       AND JSON_UNQUOTE(
+             JSON_EXTRACT(latest_oauth.result, '$.calibration_scope')
+           ) = 'oauth_identity_and_capabilities'
+    ORDER BY latest_oauth.id DESC
+    LIMIT 1
+ )
 LEFT JOIN execution_evidence_bindings e
   ON e.id = tr.execution_evidence_id
  AND e.lottery_id = tr.lottery_id
@@ -592,6 +650,148 @@ def _validate_execution_evidence(
     return evidence_id
 
 
+def _contains_secret_material(value: Any) -> bool:
+    """Detect secret-bearing keys in non-secret calibration evidence."""
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = str(key or "").strip().casefold()
+            if normalized in {
+                "access_token",
+                "refresh_token",
+                "client_secret",
+                "oauth_token",
+            }:
+                return True
+            if _contains_secret_material(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_secret_material(item) for item in value)
+    return False
+
+
+def _validate_weibo_oauth_execution_evidence(
+    task: Mapping[str, Any],
+    row: Any,
+    *,
+    account_id: int,
+    plan: ValidatedActionPlanV2,
+) -> tuple[str, int, dict[str, Any], str]:
+    """Bind the queued task to one latest admin-attested calibration."""
+
+    if plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
+        raise RealRunGateBlocked("weibo_execution_path_not_supported")
+    if "weibo_rip" in task:
+        raise RealRunGateBlocked("weibo_rip_plaintext_forbidden")
+    evidence_id = str(task.get("execution_evidence_id") or "").strip()
+    if (
+        not evidence_id
+        or evidence_id
+        != str(_row_get(row, "task_execution_evidence_id") or "").strip()
+        or evidence_id
+        != str(_row_get(row, "oauth_calibration_id") or "").strip()
+    ):
+        raise RealRunGateBlocked("weibo_oauth_calibration_binding_invalid")
+    try:
+        calibration_account_id = int(
+            _row_get(row, "oauth_calibration_account_id")
+        )
+        execution_revision = int(_row_get(row, "account_execution_revision"))
+        message_revision = int(task.get("execution_revision"))
+    except (TypeError, ValueError) as exc:
+        raise RealRunGateBlocked("weibo_oauth_execution_revision_mismatch") from exc
+    if (
+        calibration_account_id != account_id
+        or execution_revision <= 0
+        or message_revision != execution_revision
+        or str(_row_get(row, "oauth_calibration_platform") or "")
+        .strip()
+        .lower()
+        != "weibo"
+        or str(_row_get(row, "oauth_calibration_status") or "")
+        .strip()
+        .lower()
+        != "succeeded"
+        or int(_row_get(row, "oauth_calibration_fresh", 0) or 0) != 1
+    ):
+        raise RealRunGateBlocked("weibo_oauth_capability_evidence_stale")
+    if int(_row_get(row, "account_credential_present", 0) or 0) != 1:
+        raise RealRunGateBlocked("weibo_oauth_credential_required")
+
+    rip_required = weibo_rip_required(plan.required_actions)
+    try:
+        rip = decrypt_weibo_rip(
+            task.get("weibo_rip_encrypted"), required=rip_required
+        )
+    except ValueError as exc:
+        code = getattr(exc, "code", "weibo_rip_invalid")
+        raise RealRunGateBlocked(code) from exc
+    expected_target_hash = compute_target_hash(
+        str(_row_get(row, "lottery_canonical_url") or "").strip()
+    )
+    expected_config_hash = compute_config_hash(
+        {
+            "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+            "execution_revision": execution_revision,
+            "runtime_capability_requirements": plan.runtime_capability_requirements,
+            "weibo_rip_hash": weibo_rip_hmac(rip) if rip else "",
+        }
+    )
+    if (
+        str(task.get("target_hash") or "").strip() != expected_target_hash
+        or str(_row_get(row, "task_target_hash") or "").strip()
+        != expected_target_hash
+        or str(task.get("config_hash") or "").strip() != expected_config_hash
+        or str(_row_get(row, "task_config_hash") or "").strip()
+        != expected_config_hash
+    ):
+        raise RealRunGateBlocked("weibo_oauth_task_binding_invalid")
+
+    result = _json_object(
+        _row_get(row, "oauth_calibration_result"),
+        code="weibo_oauth_capability_evidence_required",
+    )
+    if set(result) != {
+        "identity",
+        "calibration_scope",
+        "requires_manual_identity_review",
+        "account_status_target",
+        "oauth_capabilities",
+    } or _contains_secret_material(result):
+        raise RealRunGateBlocked("weibo_oauth_capability_contract_mismatch")
+    identity = result.get("identity")
+    if (
+        not isinstance(identity, Mapping)
+        or set(identity) != {"verified", "method", "uid"}
+        or identity.get("verified") is not True
+        or identity.get("method") != "weibo_account_get_uid"
+    ):
+        raise RealRunGateBlocked("weibo_oauth_identity_verification_required")
+    uid = identity.get("uid")
+    if (
+        not isinstance(uid, str)
+        or not uid.isascii()
+        or not uid.isdecimal()
+        or not 1 <= len(uid) <= 20
+        or int(uid) <= 0
+        or result.get("calibration_scope") != "oauth_identity_and_capabilities"
+        or result.get("requires_manual_identity_review") is not False
+        or result.get("account_status_target") != "ready"
+    ):
+        raise RealRunGateBlocked("weibo_oauth_identity_verification_required")
+    try:
+        capabilities = validate_weibo_oauth_capability_attestation(
+            result.get("oauth_capabilities"),
+            calibration_id=evidence_id,
+            account_id=account_id,
+            execution_revision=execution_revision,
+            runtime_capability_requirements=plan.runtime_capability_requirements,
+        )
+    except WeiboOAuthCapabilityError as exc:
+        raise RealRunGateBlocked(exc.code) from exc
+    return evidence_id, execution_revision, capabilities, uid
+
+
 def _validate_account_lease(
     task: Mapping[str, Any],
     row: Any,
@@ -660,12 +860,17 @@ async def enforce_real_run_gate(
 
         if platform not in _SUPPORTED_REAL_RUN_PLATFORMS:
             raise RealRunGateBlocked("unsupported_real_run_platform")
-        if platform == "xiaohongshu":
+        capability_block = platform_real_run_block_reason(platform)
+        if capability_block:
             # Respect the process and durable global opt-ins first, then stop
             # before loading a page, selector config, evidence or credentials.
-            raise RealRunGateBlocked("xiaohongshu_no_official_interaction_api")
-        if platform in _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE:
-            raise RealRunGateBlocked("selector_evidence_binding_required")
+            raise RealRunGateBlocked(capability_block)
+        if platform == "weibo" and not str(
+            task.get("execution_evidence_id") or ""
+        ).strip():
+            raise RealRunGateBlocked(
+                "weibo_oauth_capability_evidence_required"
+            )
 
         row = await db.fetch_one(_TASK_DECISION_QUERY, {"task_id": task_id})
         if row is None:
@@ -694,16 +899,37 @@ async def enforce_real_run_gate(
             task,
             row,
         )
-        if platform == "bilibili" and plan.execution_path_id != _BILIBILI_API_EXECUTION_PATH:
-            raise RealRunGateBlocked("execution_path_not_supported")
-        evidence_id = _validate_execution_evidence(
-            task,
-            row,
-            account_id=account_id,
-            lottery_id=lottery_id,
-            platform=platform,
-            plan=plan,
-        )
+        if platform == "bilibili":
+            if plan.execution_path_id != _BILIBILI_API_EXECUTION_PATH:
+                raise RealRunGateBlocked("execution_path_not_supported")
+            evidence_id = _validate_execution_evidence(
+                task,
+                row,
+                account_id=account_id,
+                lottery_id=lottery_id,
+                platform=platform,
+                plan=plan,
+            )
+            execution_revision = _as_int(
+                _row_get(row, "account_execution_revision"),
+                code="account_execution_revision_invalid",
+            )
+            oauth_capabilities = None
+            weibo_uid = None
+        elif platform == "weibo":
+            (
+                evidence_id,
+                execution_revision,
+                oauth_capabilities,
+                weibo_uid,
+            ) = _validate_weibo_oauth_execution_evidence(
+                task,
+                row,
+                account_id=account_id,
+                plan=plan,
+            )
+        else:  # guarded by _SUPPORTED_REAL_RUN_PLATFORMS above
+            raise RealRunGateBlocked("unsupported_real_run_platform")
         lease_id, lease_generation = _validate_account_lease(
             task,
             row,
@@ -790,6 +1016,9 @@ async def enforce_real_run_gate(
             execution_evidence_id=evidence_id,
             account_lease_id=lease_id,
             account_lease_generation=lease_generation,
+            execution_revision=execution_revision,
+            oauth_capabilities=oauth_capabilities,
+            weibo_uid=weibo_uid,
         )
     except RealRunGateBlocked:
         raise

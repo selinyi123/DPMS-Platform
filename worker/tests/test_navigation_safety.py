@@ -90,6 +90,11 @@ class NavigationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "canonical://weibo/status/4890123456789012",
             ),
             (
+                "weibo",
+                "https://m.weibo.cn/detail/7987885345",
+                "canonical://weibo/status/7987885345",
+            ),
+            (
                 "xiaohongshu",
                 "https://www.xiaohongshu.com/discovery/item/64F1A2B3C4D5E6F7A8B9C0D1",
                 "canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0d1",
@@ -103,6 +108,11 @@ class NavigationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "douyin",
                 "https://www.iesdouyin.com/share/video/7300000000000000000/",
                 "canonical://douyin/video/7300000000000000000",
+            ),
+            (
+                "douyin",
+                "https://www.douyin.com/note/7520000000000000000",
+                "canonical://douyin/note/7520000000000000000",
             ),
         )
         for platform, final_url, canonical_uri in cases:
@@ -139,6 +149,16 @@ class NavigationSafetyTests(unittest.IsolatedAsyncioTestCase):
                 "https://www.douyin.com/video/7300000000000000001",
                 "canonical://douyin/video/7300000000000000000",
             ),
+            (
+                "douyin",
+                "https://douyin.com/note/7520000000000000000",
+                "canonical://douyin/note/7520000000000000000",
+            ),
+            (
+                "douyin",
+                "https://www.iesdouyin.com/share/note/7520000000000000000",
+                "canonical://douyin/note/7520000000000000000",
+            ),
         )
         for platform, final_url, canonical_uri in cases:
             with self.subTest(platform=platform, final_url=final_url):
@@ -150,7 +170,14 @@ class NavigationSafetyTests(unittest.IsolatedAsyncioTestCase):
             ("bilibili", "https://t.bilibili.com/123456789"),
             ("bilibili", "canonical://weibo/status/123456789"),
             ("weibo", "canonical://weibo/video/123456789"),
+            ("weibo", "canonical://weibo/status/invalid_slug"),
+            ("weibo", "canonical://weibo/status/0"),
+            ("weibo", "canonical://weibo/status/07987885345"),
+            ("weibo", "canonical://weibo/status/9223372036854775808"),
+            ("weibo", "canonical://weibo/status/７９８７８８５３４５"),
             ("douyin", "canonical://douyin/video/"),
+            ("douyin", "canonical://douyin/note/abc"),
+            ("douyin", "canonical://douyin/note/752000000000000000"),
         ):
             with self.subTest(platform=platform, canonical_uri=canonical_uri):
                 with self.assertRaisesRegex(ValueError, "canonical_identity_invalid"):

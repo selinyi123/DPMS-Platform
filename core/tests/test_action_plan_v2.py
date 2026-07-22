@@ -3,6 +3,9 @@ import unittest
 
 from app.action_plan import (
     ACTION_ORDER,
+    DOUYIN_ACTION_ORDER,
+    DOUYIN_MANUAL_EXECUTION_PATH,
+    DOUYIN_NO_OFFICIAL_API_BLOCKER,
     XIAOHONGSHU_ACTION_ORDER,
     XIAOHONGSHU_MANUAL_EXECUTION_PATH,
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
@@ -110,12 +113,110 @@ def complete_xiaohongshu_plan() -> dict:
     return plan
 
 
+def complete_douyin_plan(*, use_favorite: bool = True) -> dict:
+    last_action = "favorited" if use_favorite else "reposted"
+    action_payloads = {
+        "followed": {"target_handle": "@抖音博主"},
+        "liked": {},
+        "commented": {
+            "text": "#夏日好物# @品牌官方 参与抽奖",
+            "topic_tags": ["#夏日好物#"],
+            "mentions": ["@品牌官方"],
+        },
+        last_action: {} if use_favorite else {"text": "转发参与"},
+    }
+    plan = {
+        "version": 2,
+        "platform": "douyin",
+        "is_lottery": True,
+        "required_actions": ["followed", "liked", "commented", last_action],
+        "action_payloads": action_payloads,
+        "content_requirements": {
+            "follow_targets": ["@抖音博主"],
+            "commented": {
+                "topic_tags": ["#夏日好物#"],
+                "mentions": ["@品牌官方"],
+            },
+            "reposted": {"topic_tags": [], "mentions": []},
+        },
+        "execution_path_id": DOUYIN_MANUAL_EXECUTION_PATH,
+        "rule_snapshot_id": 303,
+        "rule_hash": "c" * 64,
+        "review_required": False,
+        "executable": False,
+        "confidence": 1.0,
+        "source": "operator_complete_attestation",
+        "reviewed_by": "operator-1",
+        "rule_complete_confirmed": True,
+        "unsupported_actions": ["topic_tag", "mention_account"],
+        "represented_requirements": ["topic_tag", "mention_account"],
+        "unresolved_requirements": [],
+        "ambiguity_patterns": [],
+        "payload_validation_errors": [],
+        "capability_blockers": [DOUYIN_NO_OFFICIAL_API_BLOCKER],
+    }
+    plan["plan_hash"] = compute_action_plan_hash(plan)
+    return plan
+
+
 class ActionPlanV2Tests(unittest.TestCase):
     def test_global_order_adds_favorite_without_reordering_existing_actions(self):
         self.assertEqual(
             ("followed", "liked", "commented", "favorited", "reposted"),
             ACTION_ORDER,
         )
+
+    def test_douyin_explicitly_supports_favorite_and_repost_as_distinct_actions(self):
+        self.assertEqual(ACTION_ORDER, DOUYIN_ACTION_ORDER)
+
+        favorite_plan = validate_action_plan_v2(
+            complete_douyin_plan(use_favorite=True), require_executable=False
+        )
+        repost_plan = validate_action_plan_v2(
+            complete_douyin_plan(use_favorite=False), require_executable=False
+        )
+
+        self.assertIn("favorited", favorite_plan.required_actions)
+        self.assertNotIn("reposted", favorite_plan.required_actions)
+        self.assertIn("reposted", repost_plan.required_actions)
+        self.assertNotIn("favorited", repost_plan.required_actions)
+
+        combined = complete_douyin_plan(use_favorite=True)
+        combined["required_actions"].append("reposted")
+        combined["action_payloads"]["reposted"] = {"text": "转发参与"}
+        combined["plan_hash"] = compute_action_plan_hash(combined)
+        combined_plan = validate_action_plan_v2(combined, require_executable=False)
+        self.assertEqual(DOUYIN_ACTION_ORDER, combined_plan.required_actions)
+
+    def test_douyin_plain_repost_does_not_require_invented_text(self):
+        plan = complete_douyin_plan(use_favorite=False)
+        plan["action_payloads"]["reposted"] = {}
+        plan["plan_hash"] = compute_action_plan_hash(plan)
+
+        validated = validate_action_plan_v2(plan, require_executable=False)
+
+        self.assertEqual({}, validated.payload_for("reposted"))
+
+    def test_douyin_manual_plan_never_satisfies_executable_validation(self):
+        with self.assertRaisesRegex(ActionPlanV2Error, "action_plan_not_executable"):
+            validate_action_plan_v2(complete_douyin_plan())
+
+    def test_douyin_rejects_executable_claim_and_foreign_path(self):
+        executable = complete_douyin_plan()
+        executable["executable"] = True
+        executable["plan_hash"] = compute_action_plan_hash(executable)
+        with self.assertRaisesRegex(
+            ActionPlanV2Error, "douyin_manual_plan_must_be_non_executable"
+        ):
+            validate_action_plan_v2(executable, require_executable=False)
+
+        foreign_path = complete_douyin_plan()
+        foreign_path["execution_path_id"] = "bilibili_api_v2"
+        foreign_path["plan_hash"] = compute_action_plan_hash(foreign_path)
+        with self.assertRaisesRegex(
+            ActionPlanV2Error, "douyin_execution_path_invalid"
+        ):
+            validate_action_plan_v2(foreign_path, require_executable=False)
 
     def test_complete_exact_plan_is_valid(self):
         validated = validate_action_plan_v2(complete_plan(), reject_media=True)

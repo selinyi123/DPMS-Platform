@@ -9,16 +9,21 @@ being re-enqueued.
 """
 
 import asyncio
+import ipaddress
 import json
 
 from app.action_plan import (
     ActionPlanV2Error,
     BILIBILI_API_EXECUTION_PATH,
+    WEIBO_OAUTH_EXECUTION_PATH,
+    WEIBO_RIP_ACTIONS,
     compute_bilibili_api_config_hash,
+    compute_config_hash,
 )
 from app.db import database, redis
 from app.services.outbox import LOTTERY_TASK_FIELDS
 from app.services.real_run_gate import evaluate_real_run_decision
+from app.utils.crypto import decrypt_weibo_rip, weibo_rip_hmac
 from app.utils.log import structured_log
 
 
@@ -42,6 +47,18 @@ def pending_idle_ms(entry: dict) -> int:
     return int(entry.get("time_since_delivered") or 0)
 
 
+async def _ack_converged_stream_message(message_id: str, fields: dict) -> None:
+    """Remove legacy plaintext only after authoritative task convergence."""
+
+    if "weibo_rip" in fields:
+        # XACK only clears the PEL; it does not remove stream entry bytes.
+        # Delete the exact legacy entry first so an XACK failure cannot leave
+        # plaintext resident indefinitely. The authoritative task has already
+        # converged at every call site below.
+        await redis.xdel(STREAM_KEY, message_id)
+    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+
+
 async def start_recovery_daemon():
     while True:
         try:
@@ -63,7 +80,7 @@ async def start_recovery_daemon():
                     continue
                 if decision == "ack_terminal_task":
                     structured_log("info", "recovery_ack_terminal_task", task_id=task_id, message_id=message_id)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, fields)
                     await redis.delete(f"recovery_count:{task_id}")
                     continue
 
@@ -85,16 +102,16 @@ async def start_recovery_daemon():
                     structured_log("info", "recovery_claim_recheck_skipped", task_id=task_id, message_id=message_id)
                     continue
                 if recovery_state == "ack_terminal_task":
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, claimed_fields)
                     await redis.delete(f"recovery_count:{task_id}")
                     continue
                 if recovery_state == "task_missing":
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, claimed_fields)
                     await redis.delete(f"recovery_count:{task_id}")
                     continue
                 if recovery_state == "real_run_reconciliation_required":
                     structured_log("error", "recovery_real_run_quarantined", task_id=task_id, message_id=message_id)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, claimed_fields)
                     await redis.delete(f"recovery_count:{task_id}")
                     continue
 
@@ -104,7 +121,7 @@ async def start_recovery_daemon():
                     structured_log("error", "task_permanent_failure", task_id=task_id, recovery_count=current_count)
                     settled = await _mark_recovery_exhausted(task_id)
                     if settled:
-                        await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                        await _ack_converged_stream_message(message_id, claimed_fields)
                         await redis.delete(recovery_key)
                     else:
                         structured_log(
@@ -121,7 +138,7 @@ async def start_recovery_daemon():
                     structured_log("warning", "recovery_task_replay_blocked", task_id=task_id, reason=str(exc))
                     settled = await _mark_recovery_blocked(task_id, str(exc))
                     if settled:
-                        await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                        await _ack_converged_stream_message(message_id, claimed_fields)
                         await redis.delete(recovery_key)
                     else:
                         structured_log(
@@ -133,7 +150,7 @@ async def start_recovery_daemon():
                     continue
                 if payload is None:
                     structured_log("error", "recovery_task_row_missing", task_id=task_id)
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, claimed_fields)
                     await redis.delete(recovery_key)
                     continue
 
@@ -146,7 +163,7 @@ async def start_recovery_daemon():
                 structured_log("warning", "recovered_pending_task", task_id=task_id, recovery_count=new_count, mode=payload.get("mode"))
                 retry_msg_id = await redis.xadd(STREAM_KEY, payload)
                 if retry_msg_id:
-                    await redis.xack(STREAM_KEY, GROUP_NAME, message_id)
+                    await _ack_converged_stream_message(message_id, claimed_fields)
                 else:
                     structured_log("error", "recovery_enqueue_failed", task_id=task_id)
 
@@ -475,6 +492,42 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
     if not outbox or str(outbox["stream_key"] or "").strip() != STREAM_KEY:
         raise TaskRecoveryBlocked("immutable_task_payload_missing")
     payload = _parse_outbox_payload(outbox["payload"])
+    if "weibo_rip" in payload:
+        raise TaskRecoveryBlocked("legacy_plaintext_weibo_rip_forbidden")
+    if execution_path_id == WEIBO_OAUTH_EXECUTION_PATH:
+        parsed_plan = _parse_json_value(payload.get("action_plan"))
+        if not isinstance(parsed_plan, dict):
+            raise TaskRecoveryBlocked("immutable_task_action_plan_invalid")
+        weibo_rip_encrypted = str(payload.get("weibo_rip_encrypted") or "")
+        required_actions = set(parsed_plan.get("required_actions") or [])
+        rip_required = bool(
+            task_mode == "real_run"
+            and required_actions.intersection(WEIBO_RIP_ACTIONS)
+        )
+        if rip_required:
+            try:
+                weibo_rip = decrypt_weibo_rip(weibo_rip_encrypted)
+                parsed_rip = ipaddress.ip_address(weibo_rip)
+            except (TypeError, ValueError) as exc:
+                raise TaskRecoveryBlocked("weibo_public_rip_required") from exc
+            if not parsed_rip.is_global or parsed_rip.compressed != weibo_rip:
+                raise TaskRecoveryBlocked("weibo_public_rip_required")
+        else:
+            if weibo_rip_encrypted:
+                raise TaskRecoveryBlocked("weibo_rip_not_applicable")
+            weibo_rip = ""
+        current_config_hash = compute_config_hash(
+            {
+                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                "execution_revision": current_execution_revision,
+                "runtime_capability_requirements": dict(
+                    parsed_plan.get("runtime_capability_requirements") or {}
+                ),
+                "weibo_rip_hash": weibo_rip_hmac(weibo_rip),
+            }
+        )
+        if str(row["config_hash"] or "") != current_config_hash:
+            raise TaskRecoveryBlocked("account_execution_revision_changed")
 
     expected = {
         "task_id": str(task_id),
@@ -494,7 +547,8 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
         "config_hash": str(row["config_hash"] or ""),
         "execution_revision": (
             str(current_execution_revision)
-            if execution_path_id == BILIBILI_API_EXECUTION_PATH
+            if execution_path_id
+            in {BILIBILI_API_EXECUTION_PATH, WEIBO_OAUTH_EXECUTION_PATH}
             else ""
         ),
         "account_lease_id": str(row["account_lease_id"] or ""),
@@ -507,6 +561,10 @@ async def _rebuild_task_payload(task_id: str) -> dict | None:
     # a non-empty expected revision above and therefore still fails closed.
     if "execution_revision" not in payload and not expected["execution_revision"]:
         payload["execution_revision"] = ""
+    if "weibo_rip_encrypted" not in payload:
+        if execution_path_id == WEIBO_OAUTH_EXECUTION_PATH:
+            raise TaskRecoveryBlocked("immutable_task_payload_incomplete")
+        payload["weibo_rip_encrypted"] = ""
     if any(field not in payload for field in LOTTERY_TASK_FIELDS):
         raise TaskRecoveryBlocked("immutable_task_payload_incomplete")
     for field in ("selector_config", "action_plan"):

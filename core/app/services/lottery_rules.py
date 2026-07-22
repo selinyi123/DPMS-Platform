@@ -39,13 +39,26 @@ BILIBILI_AMBIGUOUS_PATTERNS = (
     r"任选",
 )
 
-# Weibo lotteries often add a friend-mention requirement. The adapters cannot
-# fulfill that safely, so it is surfaced through unsupported_actions.
+# Weibo lotteries often add an action-scoped friend-mention count. It remains
+# unsupported until concrete reviewed handles are bound to the correct payload;
+# the OAuth adapter may then use those exact handles without inventing users.
 WEIBO_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|本账户|博主|主播)?",),
-    "liked": (r"点赞", r"点个赞", r"\b赞\b"),
-    "commented": (r"评论", r"留言"),
-    "reposted": (r"转发", r"转发(?:本条|这条)?微博", r"转起"),
+    "followed": (
+        r"关注\s*(?:我|本账号|本账户|博主|主播|@[-\w\u4e00-\u9fff]{1,64})?",
+    ),
+    "liked": (r"点赞", r"点个赞", BILIBILI_COMBINED_ACTION_PATTERN, r"\b赞\b"),
+    "commented": (r"评论", r"留言", BILIBILI_COMBINED_ACTION_PATTERN),
+    "favorited": (
+        r"收藏(?:本|该|这)(?:条)?微博",
+        r"(?:\+|＋|、|并|及|和)\s*收藏(?:参与)?",
+        r"(?:关注|点赞|评论|留言|转发)\s*收藏(?:参与)?",
+    ),
+    "reposted": (
+        r"转发",
+        r"转发(?:本条|这条)?微博",
+        r"转起",
+        BILIBILI_COMBINED_ACTION_PATTERN,
+    ),
 }
 WEIBO_LOTTERY_PATTERNS = (
     r"抽奖",
@@ -53,14 +66,19 @@ WEIBO_LOTTERY_PATTERNS = (
     r"抽取",
     r"包邮",
     r"福利",
+    r"奖品",
+    r"送出",
     r"中奖",
     r"开奖",
+    r"评论区抽",
+    r"赢(?:取|得)?[^，。！？\r\n]{0,30}(?:奖品|好礼|礼物|礼包|键盘|鼠标|周边|实物|资格|名额|券|京东[eE]?卡|购物卡|礼品卡|充值卡|会员卡|电话卡|流量卡|游戏点卡|点卡)",
+    r"抽[A-Za-z0-9][A-Za-z0-9._+-]{0,20}(?:键盘|鼠标|耳机|手机|电脑|主机|手柄|周边|礼包|礼物|好礼|奖品)",
     r"抽[\d一二三四五六七八九十]+[位名]",
 )
 WEIBO_AMBIGUOUS_PATTERNS = (
-    r"无需(?:关注|点赞|评论|留言|转发|分享)",
-    r"不用(?:关注|点赞|评论|留言|转发|分享)",
-    r"禁止(?:关注|点赞|评论|留言|转发|分享)",
+    r"无需(?:关注|点赞|评论|留言|收藏|转发|分享)",
+    r"不用(?:关注|点赞|评论|留言|收藏|转发|分享)",
+    r"禁止(?:关注|点赞|评论|留言|收藏|转发|分享)",
     r"可选",
     r"任选",
 )
@@ -94,10 +112,26 @@ XIAOHONGSHU_AMBIGUOUS_PATTERNS = (
 )
 
 DOUYIN_ACTION_PATTERNS = {
-    "followed": (r"关注(?:我|本账号|本账户|up主)?",),
+    "followed": (r"关注(?:我|本账号|本账户|up主|博主|主播)?",),
     "liked": (r"点赞", r"双击点赞"),
     "commented": (r"评论", r"留言"),
-    "reposted": (r"分享", r"转发"),
+    # Collection and share/repost are different user-visible side effects on
+    # Douyin.  Keep them as separate action-plan phases so an activity cannot
+    # silently exchange one requirement for the other.
+    "favorited": (
+        r"收藏(?:本|该|这)(?:条|个)?(?:视频|作品|图文)",
+        r"(?:\+|＋|、|并|及|和)\s*收藏(?:参与)?",
+        r"(?:关注|点赞|评论|留言)\s*收藏(?:参与)?",
+    ),
+    # A bare ``分享`` inside wording such as ``评论区分享你的故事`` describes
+    # comment content, not a share action. Accept bare share only in an action
+    # list; explicit target wording and ``转发`` remain unambiguous.
+    "reposted": (
+        r"转发(?:本|该|这)?(?:条|个)?(?:视频|作品|图文)?",
+        r"分享(?:本|该|这)(?:条|个)?(?:视频|作品|图文)",
+        r"(?:\+|＋|、|并|及|和)\s*分享(?:参与)?",
+        r"(?:关注|点赞|评论|留言|收藏)\s*分享(?:参与)?",
+    ),
 }
 DOUYIN_LOTTERY_PATTERNS = (
     r"抽奖",
@@ -109,9 +143,9 @@ DOUYIN_LOTTERY_PATTERNS = (
     r"抽[\d一二三四五六七八九十]+[位名]",
 )
 DOUYIN_AMBIGUOUS_PATTERNS = (
-    r"无需(?:关注|点赞|评论|留言|转发|分享)",
-    r"不用(?:关注|点赞|评论|留言|转发|分享)",
-    r"禁止(?:关注|点赞|评论|留言|转发|分享)",
+    r"无需(?:关注|点赞|评论|留言|收藏|转发|分享)",
+    r"不用(?:关注|点赞|评论|留言|收藏|转发|分享)",
+    r"禁止(?:关注|点赞|评论|留言|收藏|转发|分享)",
     r"可选",
     r"任选",
 )
@@ -236,8 +270,8 @@ PLATFORM_UNSUPPORTED_ACTION_PATTERNS: dict[str, dict[str, tuple[str, ...]]] = {
     "weibo": {
         **COMMON_CONTENT_UNSUPPORTED_ACTION_PATTERNS,
         "mention_friends": (
-            r"@[\d一二三四五六七八九十]*个?(?:好友|朋友)",
-            r"艾特.*?(?:好友|朋友)",
+            r"@[\d一二三四五六七八九十两几若干]+(?:位|个)?(?:好友|朋友)",
+            r"(?:艾特|提及|邀请)[^。；;！？!?\r\n]{0,16}(?:好友|朋友)",
         ),
     },
     "xiaohongshu": {
@@ -256,7 +290,17 @@ MOJIBAKE_MARKERS = ("Ã", "Â", "â", "ä", "å", "æ", "ç", "è", "é", "ï")
 EXACT_TOPIC_TAG_PATTERN = re.compile(r"#[^#\r\n]{1,64}#")
 EXACT_MENTION_PATTERN = re.compile(r"@[\w\u4e00-\u9fff-]{1,64}")
 GENERIC_FRIEND_MENTION_PREFIX_PATTERN = re.compile(
-    r"@[\d一二三四五六七八九十两]+(?:位|个)?(?:好友|朋友)"
+    r"@[\d一二三四五六七八九十两几若干]+(?:位|个)?(?:好友|朋友)"
+)
+FRIEND_MENTION_REQUIREMENT_PATTERN = re.compile(
+    r"(?:@|艾特|提及|邀请)\s*"
+    r"(?P<count>\d{1,2}|[一二三四五六七八九十两]{1,3})"
+    r"\s*(?:位|个)?(?:好友|朋友)",
+    re.IGNORECASE,
+)
+FRIEND_MENTION_EXACT_PREFIX_PATTERN = re.compile(
+    r"(?:恰好|正好|仅|只)(?:需(?:要)?|要)?[^。；;！？!?\r\n]{0,8}$",
+    re.IGNORECASE,
 )
 FOLLOW_TARGET_PATTERN = re.compile(
     r"关注\s*(?P<handle>@[\w\u4e00-\u9fff-]{1,64})",
@@ -277,6 +321,76 @@ def _empty_content_requirements() -> dict[str, Any]:
         "commented": {"topic_tags": [], "mentions": []},
         "reposted": {"topic_tags": [], "mentions": []},
     }
+
+
+def _chinese_count(value: str) -> int | None:
+    """Parse a bounded Arabic/Chinese friend count without guessing.
+
+    The action-plan metadata caps mention lists at 32 items, so larger or
+    malformed values remain unresolved instead of creating an unfulfillable
+    checklist.
+    """
+
+    token = str(value or "").strip()
+    if token.isdigit():
+        count = int(token)
+    else:
+        digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9}
+        if token == "十":
+            count = 10
+        elif "十" in token and token.count("十") == 1:
+            tens, ones = token.split("十")
+            if tens not in {"", *digits} or ones not in {"", *digits}:
+                return None
+            count = (digits.get(tens, 1) * 10) + digits.get(ones, 0)
+        elif len(token) == 1 and token in digits:
+            count = digits[token]
+        else:
+            return None
+    return count if 1 <= count <= 32 else None
+
+
+def extract_friend_mention_requirements(
+    normalized_rule: str,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Extract action-scoped friend counts; report conflicting constraints.
+
+    Only an explicit nearby exactness word creates an ``exact`` constraint.
+    Ordinary ``@3位好友`` wording is treated as a minimum, avoiding an unsafe
+    under-count. Multiple compatible minimums collapse to the strictest count;
+    contradictory exact requirements fail closed through the ambiguity flag.
+    """
+
+    result: dict[str, dict[str, Any]] = {}
+    conflict = False
+    for match in FRIEND_MENTION_REQUIREMENT_PATTERN.finditer(normalized_rule):
+        count = _chinese_count(match.group("count"))
+        if count is None:
+            continue
+        action = _token_action_scope(normalized_rule, match.start(), match.end())
+        prefix = normalized_rule[max(0, match.start() - 16) : match.start()]
+        mode = (
+            "exact"
+            if FRIEND_MENTION_EXACT_PREFIX_PATTERN.search(prefix)
+            else "minimum"
+        )
+        existing = result.get(action)
+        if existing is None:
+            result[action] = {"mode": mode, "count": count}
+            continue
+        if existing == {"mode": mode, "count": count}:
+            continue
+        if existing["mode"] == mode == "minimum":
+            existing["count"] = max(existing["count"], count)
+            continue
+        exact = existing if existing["mode"] == "exact" else {"mode": mode, "count": count}
+        minimum = existing if existing["mode"] == "minimum" else {"mode": mode, "count": count}
+        if exact["mode"] == "exact" and minimum["mode"] == "minimum" and minimum["count"] <= exact["count"]:
+            result[action] = dict(exact)
+            continue
+        conflict = True
+    return result, conflict
 
 
 def _token_action_scope(normalized_rule: str, start: int, end: int) -> str:
@@ -406,6 +520,13 @@ def parse_lottery_rule(text: str, platform: str = "bilibili") -> dict[str, Any]:
         normalized,
         unsupported_actions,
     )
+    friend_mention_requirements: dict[str, dict[str, Any]] = {}
+    if platform_key == "weibo" and "mention_friends" in unsupported_actions:
+        friend_mention_requirements, friend_requirement_conflict = (
+            extract_friend_mention_requirements(normalized)
+        )
+        if friend_requirement_conflict:
+            ambiguity.append("friend_mention_requirement_conflict")
 
     is_lottery = bool(lottery_matches)
     review_required = (
@@ -436,6 +557,7 @@ def parse_lottery_rule(text: str, platform: str = "bilibili") -> dict[str, Any]:
         "ambiguity_patterns": ambiguity,
         "unsupported_actions": unsupported_actions,
         "content_requirements": content_requirements,
+        "friend_mention_requirements": friend_mention_requirements,
     }
 
 

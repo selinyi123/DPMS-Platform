@@ -227,7 +227,7 @@ class DispatchCommitTests(unittest.IsolatedAsyncioTestCase):
                     object(),
                 )
 
-        self.assertEqual(409, caught.exception.status_code)
+        self.assertEqual(503, caught.exception.status_code)
         self.assertEqual(
             "repair_intent_binding_not_implemented",
             caught.exception.detail["code"],

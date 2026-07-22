@@ -40,6 +40,14 @@ class CookieVault:
                 raise
             return self._aesgcm.decrypt(nonce, ct, None).decode()
 
+    def decrypt_strict(self, ciphertext: bytes, *, aad: str | bytes) -> str:
+        """Decrypt purpose-bound data without the legacy no-AAD fallback."""
+
+        if not isinstance(ciphertext, bytes) or len(ciphertext) < 29:
+            raise ValueError("ciphertext_invalid")
+        nonce, ct = ciphertext[:12], ciphertext[12:]
+        return self._aesgcm.decrypt(nonce, ct, _aad_bytes(aad)).decode("utf-8")
+
 
 class LazyCookieVault:
     def __init__(self):
@@ -55,6 +63,9 @@ class LazyCookieVault:
 
     def decrypt(self, *args, **kwargs):
         return self._get().decrypt(*args, **kwargs)
+
+    def decrypt_strict(self, *args, **kwargs):
+        return self._get().decrypt_strict(*args, **kwargs)
 
 
 cookie_vault = LazyCookieVault()

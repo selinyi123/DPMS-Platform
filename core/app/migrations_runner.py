@@ -31,6 +31,7 @@ PRODUCTION_REQUIRED_TABLES = {
     "adapter_calibrations",
     "schema_migrations",
     "task_runs",
+    "task_phases",
     "lotteries",
     "lottery_rule_snapshots",
     "accounts",
@@ -45,6 +46,7 @@ PRODUCTION_REQUIRED_TABLES = {
 }
 
 PRODUCTION_REQUIRED_COLUMNS = {
+    "task_phases": {"phase"},
     "task_runs": {
         "task_id",
         "status",
@@ -425,6 +427,11 @@ PRODUCTION_REQUIRED_CHECK_CONSTRAINTS = {
 # drift into a silent authorization bypass. Values are compared against
 # information_schema after normalising MySQL's string representation.
 PRODUCTION_REQUIRED_COLUMN_DEFINITIONS = {
+    ("task_phases", "phase"): (
+        "enum('init','followed','liked','commented','favorited','reposted','completed')",
+        "YES",
+        "init",
+    ),
     ("accounts", "execution_revision"): ("bigint unsigned", "NO", "1"),
     ("account_operation_leases", "generation"): ("bigint unsigned", "NO", None),
     ("task_runs", "reconciliation_required"): ("tinyint unsigned", "NO", "0"),

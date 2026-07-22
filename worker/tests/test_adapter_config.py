@@ -145,12 +145,20 @@ class HasCompleteSelectorsTests(unittest.TestCase):
                 self._set({platform: complete_structured_config()})
                 self.assertEqual(
                     has_complete_selectors(platform),
-                    platform != "xiaohongshu",
+                    platform not in {"douyin", "weibo", "xiaohongshu"},
                 )
 
     def test_xiaohongshu_selectors_are_observation_only(self):
         self._set({"xiaohongshu": complete_structured_config()})
         self.assertFalse(has_complete_selectors("xiaohongshu"))
+
+    def test_douyin_selectors_are_observation_only(self):
+        self._set({"douyin": complete_structured_config()})
+        self.assertFalse(has_complete_selectors("douyin"))
+
+    def test_weibo_selectors_are_observation_only(self):
+        self._set({"weibo": complete_structured_config()})
+        self.assertFalse(has_complete_selectors("weibo"))
 
     def test_missing_phase_is_incomplete(self):
         config = complete_structured_config()
@@ -175,8 +183,8 @@ class HasCompleteSelectorsTests(unittest.TestCase):
     def test_comment_must_be_dict(self):
         config = complete_structured_config()
         config["commented"] = ["button.send"]  # wrong shape
-        self._set({"douyin": config})
-        self.assertFalse(has_complete_selectors("douyin"))
+        self._set({"weibo": config})
+        self.assertFalse(has_complete_selectors("weibo"))
 
     def test_no_config_is_incomplete(self):
         self.assertFalse(has_complete_selectors("bilibili"))

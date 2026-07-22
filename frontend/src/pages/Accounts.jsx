@@ -2,8 +2,23 @@ import { useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
 
 import { authenticatedApiPath, deleteJSON, fetchJSON, postJSON, putJSON } from '../api';
+import {
+  calibrationNeedsIdentityReview,
+  isWeiboOAuthAccount,
+  weiboOAuthCapabilityPresentation,
+} from '../accountCalibration';
 import StatusBadge from '../components/StatusBadge';
 import { useUi } from '../uiContext';
+
+const WEIBO_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
+
+function defaultWeiboAttestationDraft() {
+  return {
+    app_review_status: 'unknown',
+    client_type: 'other',
+    granted_actions: Object.fromEntries(WEIBO_ACTIONS.map(action => [action, false])),
+  };
+}
 
 export default function Accounts() {
   const { language, notify, t } = useUi();
@@ -20,12 +35,14 @@ export default function Accounts() {
   const [imageReady, setImageReady] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [recheckResult, setRecheckResult] = useState(null);
+  const [weiboAttestationDrafts, setWeiboAttestationDrafts] = useState({});
   const text = accountText[language] || accountText.zh;
 
   const selectedPlatform = useMemo(
     () => platforms.find(platform => platform.id === form.platform),
     [platforms, form.platform],
   );
+  const formUsesWeiboOAuth = form.platform === 'weibo';
 
   const load = async () => {
     try {
@@ -174,6 +191,45 @@ export default function Accounts() {
     }
   };
 
+  const updateWeiboAttestation = (accountId, update) => {
+    setWeiboAttestationDrafts(previous => ({
+      ...previous,
+      [accountId]: {
+        ...defaultWeiboAttestationDraft(),
+        ...(previous[accountId] || {}),
+        ...update,
+      },
+    }));
+  };
+
+  const updateWeiboGrant = (accountId, action, granted) => {
+    const current = weiboAttestationDrafts[accountId] || defaultWeiboAttestationDraft();
+    updateWeiboAttestation(accountId, {
+      granted_actions: { ...current.granted_actions, [action]: granted },
+    });
+  };
+
+  const attestWeiboCapabilities = async (account) => {
+    if (!window.confirm(t('accounts.weiboOAuthAttestationConfirm'))) return;
+    const draft = weiboAttestationDrafts[account.id] || defaultWeiboAttestationDraft();
+    setBusy(true);
+    setError('');
+    try {
+      await postJSON(
+        `/accounts/${account.id}/weibo-oauth-capability-attestation`,
+        { ...draft, confirm: true },
+        { confirm: true },
+      );
+      notify(t('accounts.weiboOAuthAttestationQueued'), 'success');
+      await load();
+    } catch (err) {
+      setError(err.message);
+      notify(err.message, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const recheckHealth = async () => {
     setBusy(true);
     setError('');
@@ -236,21 +292,47 @@ export default function Accounts() {
     );
   };
 
-  const canMarkReady = account => account.status === 'cooling' && account.credential_ready;
+  const canMarkReady = account => {
+    const weiboCapability = weiboOAuthCapabilityPresentation(account);
+    return ['warming', 'cooling'].includes(account.status)
+      && account.credential_ready
+      && account.latest_calibration?.status === 'succeeded'
+      && (!weiboCapability || (
+        weiboCapability.blockers.length === 0
+        && weiboCapability.grantedActions.length > 0
+      ));
+  };
   const canMarkCooling = account => ['ready', 'warming', 'executing'].includes(account.status);
   const canFreeze = account => !['frozen', 'banned'].includes(account.status);
-  const canCalibrate = account => account.credential_ready && !['executing', 'banned'].includes(account.status);
+  // A generic identity-only OAuth calibration becomes the newest evidence and
+  // intentionally invalidates an older capability attestation. OAuth accounts
+  // therefore refresh through the explicit admin-attestation workflow below.
+  const canCalibrate = account => account.credential_ready
+    && !isWeiboOAuthAccount(account)
+    && !['executing', 'banned'].includes(account.status);
   const proxyOptionsFor = account => proxies.filter(proxy => (
     !proxy.assigned_account || proxy.assigned_account.id === account.id
   ));
 
   const renderCalibration = (account) => {
     const calibration = account.latest_calibration;
-    if (!calibration) return <span className="badge badge-muted">{t('accounts.notChecked')}</span>;
+    const weiboCapability = weiboOAuthCapabilityPresentation(account);
+    const weiboOAuthAccount = isWeiboOAuthAccount(account);
+    const attestationDraft = weiboAttestationDrafts[account.id] || defaultWeiboAttestationDraft();
+    if (!calibration && !weiboOAuthAccount) {
+      return <span className="badge badge-muted">{t('accounts.notChecked')}</span>;
+    }
     return (
       <div className="calibration-summary">
-        <StatusBadge status={calibration.status} />
-        {calibration.screenshot_path && calibration.calibration_id && (
+        {calibration
+          ? <StatusBadge status={calibration.status} />
+          : <span className="badge badge-muted">{t('accounts.notChecked')}</span>}
+        {calibrationNeedsIdentityReview(calibration) && (
+          <span className="badge badge-warn" title={t('accounts.sessionOnlyHint')}>
+            {t('accounts.sessionOnly')}
+          </span>
+        )}
+        {calibration?.screenshot_path && calibration.calibration_id && (
           <a
             className="badge badge-info evidence-link"
             href={authenticatedApiPath(`/accounts/calibrations/${calibration.calibration_id}/screenshot`)}
@@ -260,7 +342,113 @@ export default function Accounts() {
             {t('accounts.evidence')}
           </a>
         )}
-        {calibration.error_message && <span className="mono small-text">{calibration.error_message}</span>}
+        {calibration?.error_message && <span className="mono small-text">{calibration.error_message}</span>}
+        {weiboCapability && (
+          <div className="runtime-summary">
+            <span className={`badge ${weiboCapability.blockers.length ? 'badge-warn' : 'badge-ready'}`}>
+              {t(weiboCapability.blockers.length
+                ? 'accounts.weiboOAuthNeedsEvidence'
+                : 'accounts.weiboOAuthVerified')}
+            </span>
+            {weiboCapability.present && (
+              <>
+                <span className="small-text">
+                  {t('accounts.weiboOAuthClient')}: {weiboCapability.clientType || '-'}
+                </span>
+                <span className="small-text">
+                  {t('accounts.weiboOAuthGranted')}: {weiboCapability.grantedActions.length
+                    ? weiboCapability.grantedActions.map(action => t(`lotteries.actions.${action}`)).join(' / ')
+                    : t('common.none')}
+                </span>
+                {!!weiboCapability.deniedActions.length && (
+                  <span className="small-text warning-text">
+                    {t('accounts.weiboOAuthDenied')}: {weiboCapability.deniedActions
+                      .map(action => t(`lotteries.actions.${action}`)).join(' / ')}
+                  </span>
+                )}
+                {weiboCapability.verifiedAt && (
+                  <span className="mono small-text">
+                    {t('accounts.weiboOAuthVerifiedAt')}: {weiboCapability.verifiedAt}
+                  </span>
+                )}
+                {weiboCapability.attestedAt && (
+                  <span className="mono small-text">
+                    {t('accounts.weiboOAuthAttestedAt')}: {weiboCapability.attestedAt}
+                  </span>
+                )}
+                {weiboCapability.attestedBy && (
+                  <span className="small-text">
+                    {t('accounts.weiboOAuthAttestedBy')}: {weiboCapability.attestedBy}
+                  </span>
+                )}
+              </>
+            )}
+            {weiboCapability.blockers.map(code => (
+              <span className="badge badge-warn" key={code}>
+                {t(`accounts.weiboOAuthBlockers.${code}`)}
+              </span>
+            ))}
+          </div>
+        )}
+        {weiboOAuthAccount && (
+          <details className="runtime-summary">
+            <summary>{t('accounts.weiboOAuthAttestationTitle')}</summary>
+            <span className="small-text warning-text">
+              {t('accounts.weiboOAuthAttestationWarning')}
+            </span>
+            <label>
+              <span>{t('accounts.weiboOAuthAppReviewStatus')}</span>
+              <select
+                className="input compact-input"
+                value={attestationDraft.app_review_status}
+                onChange={event => updateWeiboAttestation(account.id, {
+                  app_review_status: event.target.value,
+                })}
+              >
+                {['unknown', 'test_only', 'approved'].map(value => (
+                  <option value={value} key={value}>
+                    {t(`accounts.weiboOAuthAppReviewStatuses.${value}`)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>{t('accounts.weiboOAuthClientType')}</span>
+              <select
+                className="input compact-input"
+                value={attestationDraft.client_type}
+                onChange={event => updateWeiboAttestation(account.id, {
+                  client_type: event.target.value,
+                })}
+              >
+                {['other', 'weibo'].map(value => (
+                  <option value={value} key={value}>
+                    {t(`accounts.weiboOAuthClientTypes.${value}`)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="check-grid">
+              {WEIBO_ACTIONS.map(action => (
+                <label className="check-item" key={action}>
+                  <input
+                    type="checkbox"
+                    checked={attestationDraft.granted_actions[action]}
+                    onChange={event => updateWeiboGrant(account.id, action, event.target.checked)}
+                  />
+                  <span>{t(`lotteries.actions.${action}`)}</span>
+                </label>
+              ))}
+            </div>
+            <button
+              className="btn-danger"
+              disabled={busy || !account.credential_ready || ['executing', 'banned'].includes(account.status)}
+              onClick={() => attestWeiboCapabilities(account)}
+            >
+              {t('accounts.weiboOAuthAttestationSubmit')}
+            </button>
+          </details>
+        )}
       </div>
     );
   };
@@ -356,8 +544,12 @@ export default function Accounts() {
         </div>
 
         <div className="panel">
-          <div className="panel-kicker">{t('accounts.cookieLogin')}</div>
-          <div className="panel-title">{t('accounts.cookieImport')}</div>
+          <div className="panel-kicker">{t(formUsesWeiboOAuth
+            ? 'accounts.weiboOAuthLogin'
+            : 'accounts.cookieLogin')}</div>
+          <div className="panel-title">{t(formUsesWeiboOAuth
+            ? 'accounts.weiboOAuthImport'
+            : 'accounts.cookieImport')}</div>
           <form onSubmit={createAccount} className="stack-form">
             <label>
               <span>{t('accounts.platform')}</span>
@@ -366,15 +558,19 @@ export default function Accounts() {
               </select>
             </label>
             <label>
-              <span>{t('accounts.cookie')}</span>
+              <span>{t(formUsesWeiboOAuth ? 'accounts.weiboOAuthCredential' : 'accounts.cookie')}</span>
               <textarea
                 className="input textarea tall-textarea"
                 value={form.encrypted_credential}
                 onChange={e => setForm({ ...form, encrypted_credential: e.target.value })}
-                placeholder={t('accounts.cookiePlaceholder')}
+                placeholder={t(formUsesWeiboOAuth
+                  ? 'accounts.weiboOAuthCredentialPlaceholder'
+                  : 'accounts.cookiePlaceholder')}
               />
             </label>
-            <p className="muted-text tight-text">{t('accounts.rawCookieHint')}</p>
+            <p className="muted-text tight-text">{t(formUsesWeiboOAuth
+              ? 'accounts.weiboOAuthCredentialHint'
+              : 'accounts.rawCookieHint')}</p>
             <button className="btn-primary" disabled={busy || !form.encrypted_credential} type="submit">{t('accounts.importCreate')}</button>
           </form>
           {error && <div className="alert-danger">{error}</div>}
@@ -471,7 +667,11 @@ export default function Accounts() {
                 className="input textarea"
                 value={credentialDrafts[account.id] || ''}
                 onChange={e => setCredentialDrafts(prev => ({ ...prev, [account.id]: e.target.value }))}
-                placeholder={t('accounts.cookiePlaceholder')}
+                placeholder={t(account.platform === 'weibo'
+                  ? (isWeiboOAuthAccount(account)
+                    ? 'accounts.weiboOAuthCredentialPlaceholder'
+                    : 'accounts.cookiePlaceholder')
+                  : 'accounts.cookiePlaceholder')}
               />
               <button className="btn-primary" disabled={busy || !credentialDrafts[account.id]} onClick={() => saveCredential(account.id)}>{text.save}</button>
             </div>
