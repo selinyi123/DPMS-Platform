@@ -44,16 +44,14 @@ async def lifespan(app: FastAPI):
         warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
         await ensure_runtime_schema()
         # Versioned migrations run after the idempotent ensure_* safety net so
-        # every referenced table is present. Development logs migration
-        # failures for diagnosis; production fails closed.
-        try:
-            applied = await run_migrations()
-            if applied:
-                structured_log("info", "migrations_applied", versions=",".join(applied))
-        except Exception as exc:
-            structured_log("error", "migrations_failed", exception=exc)
-            if settings.deployment_mode == "production":
-                raise
+        # every referenced table is present.  The real-run v2 schema contains
+        # fencing and reconciliation invariants, so *every* environment must
+        # fail startup on migration or contract-verification failure.  A local
+        # service that starts against a partial 0010 schema is no safer than a
+        # production service and must never report healthy.
+        applied = await run_migrations()
+        if applied:
+            structured_log("info", "migrations_applied", versions=",".join(applied))
 
     # Production secret-posture guard (Phase 4): never run a real deployment on
     # the shipped default ADMIN_TOKEN / UPDATE_SECRET or an unset ENCRYPTION_KEY.

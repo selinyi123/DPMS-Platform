@@ -1,7 +1,7 @@
 
 import time, psutil, json, asyncio
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from fastapi.responses import StreamingResponse
 
@@ -9,6 +9,7 @@ from app.config import settings
 from app.adapter_config import (
     load_runtime_selector_config,
     platform_has_runtime_real_adapter,
+    platform_probe_ready_for_real_actions,
     platform_real_adapter_kind,
     selector_config_complete,
 )
@@ -17,6 +18,10 @@ from app.event_store.service import record_event
 from app.api.notify import configured_channels
 from app.models.schemas import RealRunSettingUpdate, RuntimeRollbackRequest
 from app.platforms import get_platforms
+from app.action_plan import action_order_for_platform
+from app.services.real_run_readiness import (
+    validate_weibo_oauth_capability_attestation,
+)
 from app.security import audit_event, is_real_run_enabled, require_confirmation, require_min_role, set_runtime_setting
 
 from app.utils.log import structured_log
@@ -24,6 +29,82 @@ from app.utils.log import structured_log
 
 
 router = APIRouter()
+
+
+EXTERNAL_ACTION_INTENT_STATUSES = frozenset(
+    {"pending", "prepared", "started", "succeeded", "failed", "unknown"}
+)
+def _intent_observation(row):
+    item = dict(row)
+    # Remote references are written from third-party responses.  Even a
+    # superficially harmless token may embed a session identifier, so the
+    # general metrics API exposes presence only.  A future platform-specific
+    # reconciliation flow can define a strict typed remote-reference schema.
+    item.pop("remote_ref", None)
+    item["remote_ref_redacted"] = bool(item.pop("has_remote_ref", 0))
+    item["reconciliation_required"] = bool(item.get("reconciliation_required"))
+    item["has_error"] = bool(item.get("has_error"))
+    return item
+
+
+async def _real_run_inflight_counts():
+    row = await database.fetch_one(
+        """SELECT COALESCE(SUM(status = 'queued'), 0) AS queued,
+                  COALESCE(SUM(status = 'running'), 0) AS running
+           FROM task_runs
+           WHERE task_mode = 'real_run'"""
+    )
+    return {
+        "queued": int(row["queued"] or 0) if row else 0,
+        "running": int(row["running"] or 0) if row else 0,
+    }
+
+
+def _worker_gate_contract():
+    return {
+        "authoritative_source": (
+            "process_env.REAL_RUN_ENABLED AND runtime_settings.real_run_enabled"
+        ),
+        "process_capability_required": True,
+        "recheck_points": ["before_task_claim", "before_each_external_mutation"],
+        "setting_change_cancels_tasks": False,
+    }
+
+
+def weibo_oauth_capability_summary(rows) -> dict:
+    """Summarize generic platform readiness without overstating partial grants."""
+
+    actions = action_order_for_platform("weibo")
+    action_accounts = {action: 0 for action in actions}
+    any_action_accounts = 0
+    full_action_accounts = 0
+    for row in rows:
+        ready_actions = []
+        for action in actions:
+            attestation = validate_weibo_oauth_capability_attestation(
+                row["result"],
+                required_actions=(action,),
+                account_id=int(row["id"]),
+                execution_revision=int(row["execution_revision"] or 0),
+                calibration_fresh=bool(row["calibration_fresh"]),
+            )
+            if attestation["ready"]:
+                ready_actions.append(action)
+                action_accounts[action] += 1
+        any_action_accounts += int(bool(ready_actions))
+        full_attestation = validate_weibo_oauth_capability_attestation(
+            row["result"],
+            required_actions=actions,
+            account_id=int(row["id"]),
+            execution_revision=int(row["execution_revision"] or 0),
+            calibration_fresh=bool(row["calibration_fresh"]),
+        )
+        full_action_accounts += int(full_attestation["ready"])
+    return {
+        "full_action_accounts": full_action_accounts,
+        "any_action_accounts": any_action_accounts,
+        "action_accounts": action_accounts,
+    }
 
 
 
@@ -89,6 +170,8 @@ async def readiness():
 
     for platform, cfg in get_platforms().items():
 
+        dry_run_supported = cfg.get("execution_mode") != "manual_assisted"
+
         safe_accounts = await database.fetch_one(
 
             """SELECT COUNT(*) AS cnt FROM accounts a
@@ -125,8 +208,47 @@ async def readiness():
         runtime_adapter_ready = platform_selectors_complete(selector_config, platform)
         adapter_kind = platform_real_adapter_kind(selector_config, platform)
         action_adapter_enabled = bool(cfg.get("action_adapter")) or platform_has_runtime_real_adapter(selector_config, platform)
-        probe_ready = bool(probe_summary and probe_summary.get("ready_for_real_actions"))
-        real_actions_ready = action_adapter_enabled and (adapter_kind == "api" or probe_ready)
+        oauth_capability_accounts = 0
+        oauth_any_capability_accounts = 0
+        oauth_capability_actions = (
+            {action: 0 for action in action_order_for_platform("weibo")}
+            if platform == "weibo"
+            else {}
+        )
+        if platform == "weibo":
+            oauth_rows = await database.fetch_all(
+                """SELECT a.id, a.execution_revision, c.result,
+                          (c.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)) AS calibration_fresh
+                     FROM accounts a
+                     JOIN account_calibrations c
+                       ON c.id = (
+                         SELECT latest.id
+                         FROM account_calibrations latest
+                         WHERE latest.account_id = a.id
+                           AND latest.platform = 'weibo'
+                         ORDER BY latest.id DESC
+                         LIMIT 1
+                       )
+                    WHERE a.platform = 'weibo'
+                      AND a.status = 'ready'
+                      AND a.deleted_at IS NULL
+                      AND OCTET_LENGTH(a.encrypted_credential) > 0
+                      AND c.status = 'succeeded'"""
+            )
+            capability_summary = weibo_oauth_capability_summary(oauth_rows)
+            oauth_capability_accounts = capability_summary[
+                "full_action_accounts"
+            ]
+            oauth_any_capability_accounts = capability_summary[
+                "any_action_accounts"
+            ]
+            oauth_capability_actions = capability_summary["action_accounts"]
+        probe_ready = (
+            oauth_capability_accounts > 0
+            if adapter_kind == "oauth"
+            else platform_probe_ready_for_real_actions(platform, probe_summary)
+        )
+        real_actions_ready = action_adapter_enabled and probe_ready
 
         blockers = []
         blocker_codes = []
@@ -141,7 +263,12 @@ async def readiness():
             blockers.append("real adapter not enabled")
             blocker_codes.append("real_adapter_not_enabled")
 
-        if action_adapter_enabled and adapter_kind != "api" and not real_actions_ready:
+        if adapter_kind == "oauth" and not oauth_capability_accounts:
+
+            blockers.append("official OAuth capability evidence is missing")
+            blocker_codes.append("weibo_oauth_capability_evidence_required")
+
+        elif action_adapter_enabled and not real_actions_ready:
 
             blockers.append("adapter probe is incomplete")
             blocker_codes.append("adapter_probe_incomplete")
@@ -165,10 +292,22 @@ async def readiness():
 
                 "cookie_login": bool(cfg.get("cookie_login")),
 
-                "adapter_status": "configured" if action_adapter_enabled else cfg.get("adapter_status", "planned"),
+                "adapter_status": (
+                    cfg.get("adapter_status", "planned")
+                    if adapter_kind in {"oauth", "manual_assisted"}
+                    else (
+                        "configured"
+                        if action_adapter_enabled
+                        else cfg.get("adapter_status", "planned")
+                    )
+                ),
                 "adapter_kind": adapter_kind,
 
                 "action_adapter": action_adapter_enabled,
+                "selector_observation_configured": runtime_adapter_ready,
+                "oauth_capability_accounts": oauth_capability_accounts,
+                "oauth_any_capability_accounts": oauth_any_capability_accounts,
+                "oauth_capability_actions": oauth_capability_actions,
 
                 "real_actions_ready": real_actions_ready,
 
@@ -189,7 +328,9 @@ async def readiness():
                 "blockers": blockers,
                 "blocker_codes": blocker_codes,
 
-                "ready_for_dry_run": bool(safe_accounts["cnt"]),
+                "dry_run_supported": dry_run_supported,
+                "ready_for_dry_run": dry_run_supported and bool(safe_accounts["cnt"]),
+                "ready_for_shadow_run": bool(safe_accounts["cnt"]),
 
                 "ready_for_real_run": real_run_enabled and real_actions_ready and bool(safe_accounts["cnt"]),
 
@@ -224,6 +365,8 @@ async def readiness():
     summary = {
 
         "platforms_total": len(platforms),
+
+        "dry_run_supported": sum(1 for item in platforms if item["dry_run_supported"]),
 
         "dry_run_ready": sum(1 for item in platforms if item["ready_for_dry_run"]),
 
@@ -457,7 +600,23 @@ def build_next_actions(platforms, summary):
 
             })
 
-        if platform["action_adapter"] and platform.get("adapter_kind") != "api" and not platform["real_actions_ready"]:
+        if platform.get("adapter_kind") == "oauth" and not platform["real_actions_ready"]:
+
+            actions.append({
+
+                "code": "configure_weibo_oauth",
+
+                "priority": "P0",
+
+                "target": platform["platform"],
+
+                "title": f"Authorize official OAuth actions for {platform['label']}",
+
+                "detail": "Configure an approved OAuth application and refresh account-bound capability evidence. Advanced like/follow permissions remain denied until explicitly granted.",
+
+            })
+
+        if platform["action_adapter"] and platform.get("adapter_kind") == "selector" and not platform["real_actions_ready"]:
 
             actions.append({
 
@@ -473,7 +632,7 @@ def build_next_actions(platforms, summary):
 
             })
 
-        if not platform["action_adapter"]:
+        if not platform["action_adapter"] and platform.get("adapter_kind") != "manual_assisted":
 
             actions.append({
 
@@ -673,6 +832,7 @@ def strategy_item(code, priority, target, title, detail, evidence):
 def build_production_checks(platforms, summary):
     platform_count = summary.get("platforms_total", 0)
     dry_ready = summary.get("dry_run_ready", 0)
+    dry_supported = summary.get("dry_run_supported", platform_count)
     real_ready = summary.get("real_run_ready", 0)
     safe_accounts = summary.get("safe_accounts_total", 0)
     checks = [
@@ -707,9 +867,9 @@ def build_production_checks(platforms, summary):
         {
             "code": "all_platforms_dry_ready",
             "priority": "P0",
-            "passed": platform_count > 0 and dry_ready == platform_count,
-            "title": "All platforms have calibrated accounts for dry-run dispatch",
-            "detail": f"{dry_ready}/{platform_count} platform(s) are dry-run ready.",
+            "passed": dry_supported > 0 and dry_ready == dry_supported,
+            "title": "All dry-run-capable platforms have calibrated accounts",
+            "detail": f"{dry_ready}/{dry_supported} dry-run-capable platform(s) are ready.",
         },
         {
             "code": "real_run_available",
@@ -741,6 +901,103 @@ def build_production_checks(platforms, summary):
         },
     ]
     return checks
+
+
+@router.get("/external-action-intents")
+async def external_action_intents(
+    limit: int = Query(default=50, ge=1, le=200),
+    status: str | None = Query(default=None),
+    task_id: str | None = Query(default=None, min_length=1, max_length=64),
+):
+    """Read-only, payload-free view of durable external action attempts."""
+
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status and normalized_status not in EXTERNAL_ACTION_INTENT_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid external action intent status")
+    normalized_task_id = str(task_id or "").strip()
+    clauses = []
+    values = {"limit": limit}
+    if normalized_status:
+        clauses.append("eai.status = :status")
+        values["status"] = normalized_status
+    if normalized_task_id:
+        clauses.append("eai.task_id = :task_id")
+        values["task_id"] = normalized_task_id
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = await database.fetch_all(
+        f"""SELECT eai.intent_id, eai.task_id, eai.account_id, eai.lottery_id,
+                   eai.lease_id, eai.lease_generation, eai.action,
+                   eai.payload_hash, eai.status, eai.effect_certainty,
+                   eai.attempt_no,
+                   eai.started_at, eai.completed_at, eai.outcome,
+                   CASE WHEN eai.remote_ref IS NULL THEN 0 ELSE 1 END AS has_remote_ref,
+                   CASE WHEN eai.error_message IS NULL THEN 0 ELSE 1 END AS has_error,
+                   eai.created_at, eai.updated_at,
+                   tr.status AS task_status, tr.task_mode,
+                   tr.reconciliation_required,
+                   l.platform
+            FROM external_action_intents eai
+            JOIN task_runs tr ON tr.task_id = eai.task_id
+            JOIN lotteries l ON l.id = eai.lottery_id
+            {where}
+            ORDER BY eai.updated_at DESC, eai.intent_id DESC
+            LIMIT :limit""",
+        values,
+    )
+    return {
+        "items": [_intent_observation(row) for row in rows],
+        "count": len(rows),
+        "payload_exposed": False,
+    }
+
+
+@router.get("/reconciliation")
+async def reconciliation_queue(
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Tasks quarantined by structured reconciliation state, newest first."""
+
+    rows = await database.fetch_all(
+        """SELECT tr.task_id, tr.account_id, tr.lottery_id, tr.task_mode,
+                  tr.status AS task_status, tr.reconciliation_required,
+                  tr.created_at, tr.started_at, tr.finished_at,
+                  l.platform,
+                  COUNT(eai.intent_id) AS intent_count,
+                  COALESCE(SUM(eai.status = 'started'), 0) AS started_intent_count,
+                  COALESCE(SUM(eai.status = 'unknown'), 0) AS unknown_intent_count,
+                  COALESCE(SUM(eai.effect_certainty = 'unknown'), 0) AS unknown_effect_count,
+                  COALESCE(SUM(eai.status = 'succeeded'), 0) AS succeeded_intent_count,
+                  MAX(eai.updated_at) AS latest_intent_at
+           FROM task_runs tr
+           JOIN lotteries l ON l.id = tr.lottery_id
+           LEFT JOIN external_action_intents eai ON eai.task_id = tr.task_id
+           WHERE tr.reconciliation_required = 1
+              OR EXISTS (
+                   SELECT 1 FROM external_action_intents unsettled
+                   WHERE unsettled.task_id = tr.task_id
+                     AND unsettled.status IN ('started', 'unknown')
+              )
+           GROUP BY tr.task_id, tr.account_id, tr.lottery_id, tr.task_mode,
+                    tr.status, tr.reconciliation_required, tr.created_at,
+                    tr.started_at, tr.finished_at, l.platform
+           ORDER BY COALESCE(MAX(eai.updated_at), tr.finished_at, tr.started_at, tr.created_at) DESC
+           LIMIT :limit""",
+        {"limit": limit},
+    )
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["reconciliation_required"] = bool(item.get("reconciliation_required"))
+        for field in (
+            "intent_count",
+            "started_intent_count",
+            "unknown_intent_count",
+            "unknown_effect_count",
+            "succeeded_intent_count",
+        ):
+            item[field] = int(item.get(field) or 0)
+        items.append(item)
+    return {"items": items, "count": len(items), "payload_exposed": False}
 
 
 
@@ -788,25 +1045,46 @@ async def runtime_settings():
     breaker = await database.fetch_one(
         "SELECT status, reason, opened_at, updated_at FROM circuit_breakers WHERE scope = 'global'"
     )
+    setting = await database.fetch_one(
+        """SELECT updated_at FROM runtime_settings
+           WHERE setting_key = 'real_run_enabled'"""
+    )
     return {
         "real_run_enabled": await is_real_run_enabled(),
+        "real_run_setting_updated_at": setting["updated_at"] if setting else None,
+        "inflight_real_runs": await _real_run_inflight_counts(),
+        "worker_gate_contract": _worker_gate_contract(),
         "global_circuit_breaker": dict(breaker) if breaker else None,
     }
 
 
 @router.put("/runtime/settings/real-run")
 async def update_real_run_setting(payload: RealRunSettingUpdate, request: Request):
-    require_min_role(request, "owner")
+    actor = require_min_role(request, "owner")
     require_confirmation(request)
-    await set_runtime_setting("real_run_enabled", "true" if payload.enabled else "false")
-    if payload.enabled:
-        await database.execute(
-            """UPDATE circuit_breakers
-               SET status = 'closed',
-                   reason = NULL,
-                   updated_at = NOW()
-               WHERE scope = 'global'"""
+    if payload.enabled and not settings.real_run_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Process REAL_RUN_ENABLED capability is disabled; restart the "
+                "local services with an explicit deployment-level enablement "
+                "before changing the runtime switch"
+            ),
         )
+    await set_runtime_setting("real_run_enabled", "true" if payload.enabled else "false")
+    inflight = await _real_run_inflight_counts()
+    contract = _worker_gate_contract()
+    result = {
+        "status": "updated",
+        "real_run_enabled": payload.enabled,
+        "inflight_real_runs": inflight,
+        "worker_gate_contract": contract,
+        "enforcement": (
+            "enabled_for_fresh_worker_gate_checks"
+            if payload.enabled
+            else "disabled_at_next_worker_gate_check"
+        ),
+    }
     await audit_event(
         request,
         action="runtime.real_run.update",
@@ -814,9 +1092,22 @@ async def update_real_run_setting(payload: RealRunSettingUpdate, request: Reques
         resource_id="real_run_enabled",
         result="enabled" if payload.enabled else "disabled",
         risk_level="critical" if payload.enabled else "high",
-        detail={"enabled": payload.enabled, "global_circuit_breaker": "closed" if payload.enabled else "unchanged"},
+        detail={
+            "enabled": payload.enabled,
+            "global_circuit_breaker": "unchanged",
+            "inflight_real_runs": inflight,
+            "worker_gate_contract": contract,
+        },
     )
-    return {"status": "updated", "real_run_enabled": payload.enabled}
+    await record_event(
+        aggregate="runtime",
+        aggregate_id="real_run_enabled",
+        event_type="RealRunRuntimeSettingChanged",
+        payload=result,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return result
 
 
 @router.post("/runtime/rollback")
@@ -849,6 +1140,11 @@ async def runtime_rollback(payload: RuntimeRollbackRequest, request: Request):
              updated_at = NOW()""",
         {"reason": reason},
     )
+    breaker = await database.fetch_one(
+        "SELECT status FROM circuit_breakers WHERE scope = 'global'"
+    )
+    if not breaker or str(breaker["status"] or "").strip().lower() != "open":
+        raise HTTPException(500, detail="Global circuit breaker write was not persisted")
     await database.execute(
         """UPDATE lotteries l
            JOIN task_runs tr ON tr.lottery_id = l.id

@@ -33,6 +33,7 @@ def choose_strategy_mode(
     real_run_enabled: bool,
     breaker_allowed: bool,
     breaker_reason: str | None,
+    manual_assisted: bool = False,
 ) -> tuple[str, list[str], list[str]]:
     """Pick the safest next execution mode for a target.
 
@@ -48,6 +49,12 @@ def choose_strategy_mode(
         return "blocked", ["no_safe_account"], ["no calibrated ready account"]
     if not breaker_allowed:
         return "blocked", ["circuit_breaker_open"], [breaker_reason or "circuit breaker open"]
+    # Manual-assisted platforms intentionally have no executable dry-run path:
+    # their only automated validation is a side-effect-free Shadow observation.
+    # Recommend that mode directly so the strategy queue never sends operators
+    # into a dry-run that the dispatch gate will permanently reject.
+    if manual_assisted:
+        return "shadow_run", ["manual_assisted_shadow_only"], blockers
     if dry_success <= 0:
         return "dry_run", ["dry_validation_needed"], blockers
     if shadow_success <= 0:

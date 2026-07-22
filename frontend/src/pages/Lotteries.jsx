@@ -1,20 +1,69 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { authenticatedApiPath, fetchJSON, postJSON, putJSON } from '../api';
 import StatusBadge from '../components/StatusBadge';
 import { formatText } from '../i18n/format';
+import {
+  actionTextContainsRequiredToken,
+  actionPlanHasMediaRequirement,
+  actionPlanV2Blockers,
+  actionPlanV2Ready,
+  actionPlanV2ReviewBlockers,
+  actionPlanV2ReviewReady,
+  buildActionPlanV2Update,
+  dispatchSafetyBlocker,
+  executionEvidencePresentation,
+  isFixedManualActionPlatform,
+  isManualAssistedPlan,
+  isManualAssistedPlatform,
+  lotteryActionsForPlatform,
+  manualAssistedChecklist,
+  manualShadowObservation,
+  mentionIdentityKey,
+  platformDispatchBlocker,
+  platformExecutionPathId,
+  realRunEvidencePath,
+  sourceRuleCorrectionPath,
+  targetTransportCompatibilityIssue,
+  targetValidationErrorCode,
+  unresolvedRuleRequirements,
+  WEIBO_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MAX_UNIQUE_HANDLES,
+  WEIBO_OAUTH_EXECUTION_PATH_ID,
+} from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
+import {
+  DOUYIN_IMPORT_MAX_BYTES,
+  WEIBO_IMPORT_MAX_BYTES,
+  XIAOHONGSHU_IMPORT_MAX_BYTES,
+  TARGET_IMPORT_PASSTHROUGH_MAX_BYTES,
+  TargetImportError,
+  normalizeTargetImportForPlatform,
+} from '../xiaohongshuImport';
 
-const LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
+function probePhaseTotal(summary, platform) {
+  return Array.isArray(summary?.required_phases) && summary.required_phases.length
+    ? summary.required_phases.length
+    : lotteryActionsForPlatform(platform).length;
+}
+
 const API_ACTION_PHASES = {
   follow: 'followed',
   like: 'liked',
   comment: 'commented',
+  favorite: 'favorited',
   repost: 'reposted',
 };
+const REAL_RUN_EVIDENCE_TTL_MS = 65000;
 
 export default function Lotteries() {
   const { notify, t } = useUi();
+  const loadInFlightRef = useRef(false);
+  const evidenceRefreshPendingRef = useRef(false);
+  const evidenceExpiryTimerRef = useRef(null);
+  const selectedAccountRef = useRef('');
+  const targetFileReadIdRef = useRef(0);
+  const mountedRef = useRef(true);
   const [lotteries, setLotteries] = useState([]);
   const [runs, setRuns] = useState([]);
   const [probes, setProbes] = useState([]);
@@ -62,8 +111,19 @@ export default function Lotteries() {
   const realRunEnabled = Boolean(realRunEvidence[0]?.real_run_enabled);
   const safeAccountCount = platformId => safeAccounts.filter(account => account.platform === platformId).length;
   const selectedSafeAccount = safeAccounts.find(account => String(account.id) === String(selectedAccount));
+  const manualTargetIssue = targetTransportCompatibilityIssue(form.platform, form.raw_url);
 
-  const load = async () => {
+  const load = async (includeRealRunEvidence = true) => {
+    if (!mountedRef.current) return;
+    if (includeRealRunEvidence) {
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+      setRealRunEvidence([]);
+    }
+    if (loadInFlightRef.current) {
+      evidenceRefreshPendingRef.current ||= includeRealRunEvidence;
+      return;
+    }
+    loadInFlightRef.current = true;
     try {
       const [lotteryRows, runRows, probeRows, sourceRows, strategyRows, accountRows, platformRows, adapterRows] = await Promise.all([
         fetchJSON('/lotteries/'),
@@ -77,8 +137,11 @@ export default function Lotteries() {
       ]);
       const [readinessRows, evidenceRows] = await Promise.all([
         fetchJSON('/metrics/readiness'),
-        fetchJSON('/lotteries/real-run/evidence'),
+        includeRealRunEvidence
+          ? fetchJSON(realRunEvidencePath(selectedAccountRef.current))
+          : Promise.resolve(null),
       ]);
+      if (!mountedRef.current) return;
       setLotteries(lotteryRows);
       setRuns(runRows);
       setProbes(probeRows);
@@ -88,17 +151,47 @@ export default function Lotteries() {
       setPlatforms(platformRows);
       setAdapters(adapterRows);
       setReadiness(readinessRows);
-      setRealRunEvidence(evidenceRows.items || []);
+      if (evidenceRows) {
+        setRealRunEvidence(evidenceRows.items || []);
+        window.clearTimeout(evidenceExpiryTimerRef.current);
+        evidenceExpiryTimerRef.current = window.setTimeout(() => {
+          if (mountedRef.current) setRealRunEvidence([]);
+        }, REAL_RUN_EVIDENCE_TTL_MS);
+      }
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      if (!mountedRef.current) return;
+      if (includeRealRunEvidence) setRealRunEvidence([]);
+      const message = targetValidationErrorText(err.message, t);
+      setError(message);
+      notify(message, 'error');
+    } finally {
+      loadInFlightRef.current = false;
+      if (mountedRef.current && evidenceRefreshPendingRef.current) {
+        evidenceRefreshPendingRef.current = false;
+        void load(true);
+      } else if (!mountedRef.current) {
+        evidenceRefreshPendingRef.current = false;
+      }
     }
   };
 
   useEffect(() => {
-    load();
-    const timer = setInterval(load, 3000);
-    return () => clearInterval(timer);
+    mountedRef.current = true;
+    load(true);
+    let pollCount = 0;
+    const timer = setInterval(() => {
+      pollCount += 1;
+      // Probe and Shadow completion is asynchronous. Refresh their evidence at
+      // least once per minute so the displayed gate cannot remain stale for the
+      // lifetime of the page, while keeping the 15-second polls lightweight.
+      load(pollCount % 4 === 0);
+    }, 15000);
+    return () => {
+      mountedRef.current = false;
+      evidenceRefreshPendingRef.current = false;
+      clearInterval(timer);
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+    };
   }, []);
 
   const createLottery = async (e) => {
@@ -115,8 +208,9 @@ export default function Lotteries() {
       notify(t('lotteries.activityCreated'), 'success');
       await load();
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      const message = targetValidationErrorText(err.message, t);
+      setError(message);
+      notify(message, 'error');
     }
   };
 
@@ -125,30 +219,82 @@ export default function Lotteries() {
     setError('');
     setTargetImportResult(null);
     try {
+      const normalizedImport = normalizeTargetImport(targetImport, platforms);
+      if (normalizedImport.converted) {
+        setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
+        const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+        notify(formatText(t(messageKey), {
+          count: normalizedImport.targetCount,
+          discarded: normalizedImport.discardedSensitiveFields,
+          skipped: normalizedImport.discardedRows,
+        }), 'warning');
+      }
       const result = await postJSON('/lotteries/targets/import', {
         platform: targetImport.platform,
-        content: targetImport.content,
+        content: normalizedImport.content,
         value_score: Number(targetImport.value_score || 0),
+      }, {
+        timeoutMs: targetImportTimeout(normalizedImport),
       });
-      setTargetImportResult(result);
+      const displayedResult = {
+        ...result,
+        local_skipped_count: normalizedImport.discardedRows || 0,
+      };
+      setTargetImportResult(displayedResult);
       const message = formatText(t('lotteries.targetsImported'), result);
       notify(message, result.invalid_count ? 'warning' : 'success');
       await load();
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      const message = targetImportErrorText(err, t);
+      setError(message);
+      notify(message, 'error');
     }
   };
 
   const readTargetFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const readId = targetFileReadIdRef.current + 1;
+    targetFileReadIdRef.current = readId;
+    setError('');
+    setTargetImportResult(null);
+    setTargetImport(prev => ({ ...prev, content: '' }));
     try {
+      const importPlatform = String(targetImport.platform || '').trim().toLowerCase();
+      const maxBytes = importPlatform === 'xiaohongshu'
+        ? XIAOHONGSHU_IMPORT_MAX_BYTES
+        : (importPlatform === 'douyin'
+            ? DOUYIN_IMPORT_MAX_BYTES
+            : (importPlatform === 'weibo' ? WEIBO_IMPORT_MAX_BYTES : TARGET_IMPORT_PASSTHROUGH_MAX_BYTES));
+      if (file.size > maxBytes) {
+        const code = importPlatform === 'xiaohongshu'
+          ? 'xiaohongshu_import_too_large'
+          : (importPlatform === 'douyin'
+              ? 'douyin_import_too_large'
+              : (importPlatform === 'weibo' ? 'weibo_import_too_large' : 'target_import_content_too_large'));
+        throw new TargetImportError(code);
+      }
       const text = await file.text();
-      setTargetImport(prev => ({ ...prev, content: text }));
-      notify(formatText(t('lotteries.targetFileLoaded'), { name: file.name }), 'success');
+      if (readId !== targetFileReadIdRef.current) return;
+      const normalizedImport = normalizeTargetImport(
+        { ...targetImport, content: text },
+        platforms,
+      );
+      setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
+      const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+      const message = normalizedImport.converted
+        ? formatText(t(messageKey), {
+            count: normalizedImport.targetCount,
+            discarded: normalizedImport.discardedSensitiveFields,
+            skipped: normalizedImport.discardedRows,
+          })
+        : formatText(t('lotteries.targetFileLoaded'), { name: file.name });
+      notify(message, normalizedImport.converted ? 'warning' : 'success');
     } catch (err) {
-      notify(err.message, 'error');
+      if (readId !== targetFileReadIdRef.current) return;
+      const message = targetImportErrorText(err, t);
+      setError(message);
+      notify(message, 'error');
     } finally {
       e.target.value = '';
     }
@@ -187,15 +333,26 @@ export default function Lotteries() {
     }
   };
 
-  const saveActionPlan = async (lottery, requiredActions, ruleText) => {
+  const saveActionPlan = async (lottery, draft) => {
     setError('');
     try {
-      await putJSON(`/lotteries/${lottery.id}/action-plan`, {
-        required_actions: requiredActions,
-        rule_text: ruleText,
-        reviewed: true,
-      });
-      notify(t('lotteries.ruleSaved'), 'success');
+      const result = await putJSON(
+        `/lotteries/${lottery.id}/action-plan`,
+        buildActionPlanV2Update({ ...draft, platform: lottery.platform }),
+      );
+      const manualAssisted = isManualAssistedPlan(
+        lottery.platform,
+        result?.action_plan,
+      );
+      const stillBlocked = manualAssisted
+        ? !actionPlanV2ReviewReady(result?.action_plan, lottery.platform)
+        : !actionPlanV2Ready(result?.action_plan, lottery.platform);
+      notify(
+        stillBlocked
+          ? t('lotteries.ruleNeedsReview')
+          : t(manualAssisted ? 'lotteries.manualRuleSaved' : 'lotteries.ruleSaved'),
+        stillBlocked ? 'warning' : 'success',
+      );
       await load();
     } catch (err) {
       setError(err.message);
@@ -203,11 +360,45 @@ export default function Lotteries() {
     }
   };
 
+  const dispatchBlockerFor = (lottery, mode) => dispatchSafetyBlocker({
+    lottery,
+    mode,
+    gate: lottery ? gateByLotteryId[lottery.id] : null,
+    safeAccountAvailable: Boolean(lottery && safeAccountCount(lottery.platform)),
+    accountScopeBound: Boolean(
+      lottery
+      && selectedSafeAccount
+      && selectedSafeAccount.platform === lottery.platform
+    ),
+  });
+
+  const dispatchBlockerMessage = (blocker, lottery) => {
+    if (blocker === 'xiaohongshu_manual_only') return t('lotteries.xiaohongshuManualOnlyHint');
+    if (blocker === 'xiaohongshu_manual_shadow_only') return t('lotteries.xiaohongshuManualShadowOnlyHint');
+    if (blocker === 'douyin_manual_only') return t('lotteries.douyinManualOnlyHint');
+    if (blocker === 'douyin_manual_shadow_only') return t('lotteries.douyinManualShadowOnlyHint');
+    if (blocker === 'weibo_manual_only') return t('lotteries.weiboManualOnlyHint');
+    if (blocker === 'weibo_manual_shadow_only') return t('lotteries.weiboManualShadowOnlyHint');
+    if (blocker === 'legacy_http_target') return t('lotteries.legacyHttpTargetHint');
+    if (blocker === 'no_safe_account') return t('lotteries.noSafeAccount');
+    if (blocker === 'account_scope_required') return t('lotteries.accountScopeRequired');
+    if (blocker === 'action_plan_v2') return t('lotteries.actionPlanV2Required');
+    if (blocker === 'real_run_gate') return gateTitle(gateByLotteryId[lottery?.id], t);
+    return t('lotteries.gateUnknown');
+  };
+
   const dispatch = async (id, modeOverride = dispatchMode) => {
     setError('');
     try {
       const lottery = lotteries.find(item => item.id === id);
       const mode = modeOverride || dispatchMode;
+      const uiBlocker = dispatchBlockerFor(lottery, mode);
+      if (uiBlocker) {
+        const message = dispatchBlockerMessage(uiBlocker, lottery);
+        setError(message);
+        notify(message, 'warning');
+        return;
+      }
       const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
       await postJSON(`/lotteries/${id}/dispatch`, {
         mode,
@@ -268,6 +459,15 @@ export default function Lotteries() {
     return result?._summary || null;
   };
 
+  const selectorObservationComplete = summary => {
+    if (!summary) return false;
+    if (typeof summary.selector_observation_complete === 'boolean') {
+      return summary.selector_observation_complete;
+    }
+    // Older persisted probe results expose only this misleading legacy key.
+    return summary.ready_for_real_actions === true;
+  };
+
   const markResult = async (id, status) => {
     setError('');
     try {
@@ -288,7 +488,16 @@ export default function Lotteries() {
           <h1>{t('lotteries.title')}</h1>
         </div>
         <div className="toolbar">
-          <select className="input compact-input" value={selectedAccount} onChange={e => setSelectedAccount(e.target.value)}>
+          <select
+            className="input compact-input"
+            value={selectedAccount}
+            onChange={e => {
+              const accountId = e.target.value;
+              selectedAccountRef.current = accountId;
+              setSelectedAccount(accountId);
+              void load(true);
+            }}
+          >
             <option value="">{t('lotteries.autoPick')}</option>
             {safeAccounts.map(account => <option value={account.id} key={account.id}>A{account.id} / {account.platform} / {t('lotteries.calibrated')}</option>)}
           </select>
@@ -320,7 +529,7 @@ export default function Lotteries() {
             </div>
             <div className="capability-row"><span>{t('lotteries.adapter')}</span><span className="mono small-text">{platform.adapter_status || 'planned'}</span></div>
             <div className="capability-row"><span>{t('lotteries.safeAccounts')}</span><span className="mono small-text">{safeAccountCount(platform.id)}</span></div>
-            <div className="capability-row"><span>{t('lotteries.probe')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/4` : '-'}</span></div>
+            <div className="capability-row"><span>{t('lotteries.selectorObservation')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/${lotteryActionsForPlatform(platform.id).length}` : '-'}</span></div>
             <p className="muted-text tight-text">{adapterById[platform.id]?.notes || t('lotteries.adapterLoading')}</p>
             {!!ready?.blocker_codes?.length && (
               <div className="blocker-list compact-blockers">
@@ -354,7 +563,12 @@ export default function Lotteries() {
               </tr>
             </thead>
             <tbody>
-              {strategyQueue.map(item => (
+              {strategyQueue.map(item => {
+                const lottery = lotteries.find(candidate => candidate.id === item.lottery_id);
+                const strategyBlocker = item.recommended_mode === 'blocked'
+                  ? 'mode_blocked'
+                  : dispatchBlockerFor(lottery, item.recommended_mode);
+                return (
                 <tr key={item.lottery_id}>
                   <td className="mono">#{item.rank}</td>
                   <td>
@@ -395,14 +609,16 @@ export default function Lotteries() {
                   <td>
                     <button
                       className={item.recommended_mode === 'real_run' ? 'btn-danger' : 'btn-primary'}
-                      disabled={item.recommended_mode === 'blocked'}
+                      disabled={Boolean(strategyBlocker)}
+                      title={strategyBlocker ? dispatchBlockerMessage(strategyBlocker, lottery) : ''}
                       onClick={() => dispatch(item.lottery_id, item.recommended_mode)}
                     >
                       {t('lotteries.dispatchRecommended')}
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
               {!strategyQueue.length && <tr><td className="empty-cell" colSpan="9">{t('lotteries.noStrategyTargets')}</td></tr>}
             </tbody>
           </table>
@@ -422,6 +638,11 @@ export default function Lotteries() {
             <label className="url-field">
               <span>{t('lotteries.activityUrl')}</span>
               <input className="input" value={form.raw_url} onChange={e => setForm({ ...form, raw_url: e.target.value })} />
+              {manualTargetIssue && (
+                <span className="small-text warning-text" role="note">
+                  {t('lotteries.targetErrors.https_required')}
+                </span>
+              )}
             </label>
             <label>
               <span>{t('lotteries.score')}</span>
@@ -432,7 +653,14 @@ export default function Lotteries() {
           <form onSubmit={importTargets} className="form-grid target-import-form">
             <label>
               <span>{t('lotteries.defaultPlatform')}</span>
-              <select className="input" value={targetImport.platform} onChange={e => setTargetImport({ ...targetImport, platform: e.target.value })}>
+              <select
+                className="input"
+                value={targetImport.platform}
+                onChange={(e) => {
+                  targetFileReadIdRef.current += 1;
+                  setTargetImport({ ...targetImport, platform: e.target.value });
+                }}
+              >
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
               </select>
             </label>
@@ -442,14 +670,24 @@ export default function Lotteries() {
             </label>
             <label className="btn-ghost file-button target-file-button">
               {t('lotteries.uploadTargets')}
-              <input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={readTargetFile} hidden />
+              <input
+                type="file"
+                accept={['douyin', 'weibo', 'xiaohongshu'].includes(String(targetImport.platform).toLowerCase())
+                  ? '.txt,.csv,.json,.jsonl,text/plain,text/csv,application/json'
+                  : '.txt,.csv,text/plain,text/csv'}
+                onChange={readTargetFile}
+                hidden
+              />
             </label>
             <label className="target-text-field">
               <span>{t('lotteries.targetList')}</span>
               <textarea
                 className="input textarea"
                 value={targetImport.content}
-                onChange={e => setTargetImport({ ...targetImport, content: e.target.value })}
+                onChange={(e) => {
+                  targetFileReadIdRef.current += 1;
+                  setTargetImport({ ...targetImport, content: e.target.value });
+                }}
                 placeholder={t('lotteries.targetPlaceholder')}
               />
             </label>
@@ -461,7 +699,10 @@ export default function Lotteries() {
             {formatText(t('lotteries.importSummary'), targetImportResult)}
             {!!targetImportResult.invalid?.length && (
               <div className="small-text">
-                {targetImportResult.invalid.slice(0, 3).map(item => `#${item.line}: ${item.error}`).join(' / ')}
+                {targetImportResult.invalid
+                  .slice(0, 3)
+                  .map(item => `#${item.line}: ${targetValidationErrorText(item.error, t)}`)
+                  .join(' / ')}
               </div>
             )}
           </div>
@@ -538,11 +779,67 @@ export default function Lotteries() {
               {lotteries.map(lottery => {
                 const gate = gateByLotteryId[lottery.id];
                 const repairPlan = gate?.repair_plan;
-                const gateBlocked = dispatchMode === 'real_run' && !gate?.allowed;
-                const gateCanRunNext = gateBlocked && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
-                const repairAvailable = Boolean(repairPlan?.eligible);
-                const repairBlocked = repairAvailable && (!gate?.allowed || !safeAccountCount(lottery.platform));
-                const repairBlockReason = repairBlocked ? gateTitle(gate, t) : '';
+                const executionPathId = lottery.action_plan?.execution_path_id || '';
+                const manualAssisted = isManualAssistedPlan(lottery.platform, executionPathId);
+                const platformModeBlocker = platformDispatchBlocker(
+                  lottery.platform,
+                  dispatchMode,
+                  executionPathId,
+                );
+                const targetIssue = targetTransportCompatibilityIssue(lottery.platform, lottery.raw_url);
+                const transportBlocksSelectedMode = Boolean(targetIssue && dispatchMode !== 'dry_run');
+                const safeAccountAvailable = safeAccountCount(lottery.platform) > 0;
+                const accountScopeReady = Boolean(
+                  selectedSafeAccount && selectedSafeAccount.platform === lottery.platform
+                );
+                const accountScopeBlocked = dispatchMode !== 'dry_run' && !accountScopeReady;
+                const actionPlanReady = manualAssisted
+                  ? actionPlanV2ReviewReady(lottery.action_plan, lottery.platform)
+                  : actionPlanV2Ready(lottery.action_plan, lottery.platform);
+                const actionPlanBlocked = dispatchMode !== 'dry_run' && !actionPlanReady;
+                const gateBlocked = dispatchMode === 'real_run'
+                  && (Boolean(platformModeBlocker) || !gate?.allowed || actionPlanBlocked);
+                const gateCanRunNext = gateBlocked
+                  && !platformModeBlocker
+                  && !actionPlanBlocked
+                  && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
+                const repairAvailable = Boolean(repairPlan?.executable);
+                const repairUnavailable = Boolean(
+                  repairPlan?.eligible && !repairPlan?.executable,
+                );
+                const repairBlocked = repairAvailable && (
+                  manualAssisted
+                  || Boolean(platformModeBlocker)
+                  || Boolean(targetIssue)
+                  || !gate?.allowed
+                  || !safeAccountAvailable
+                  || !accountScopeReady
+                  || !actionPlanReady
+                );
+                const repairBlockReason = manualAssisted
+                  ? t(manualOnlyHintKey(lottery.platform))
+                  : (targetIssue ? t('lotteries.legacyHttpTargetHint')
+                  : (!accountScopeReady
+                    ? t('lotteries.accountScopeRequired')
+                    : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : (repairBlocked ? gateTitle(gate, t) : ''))));
+                const dispatchDisabled = Boolean(platformModeBlocker)
+                  || transportBlocksSelectedMode
+                  || !safeAccountAvailable
+                  || accountScopeBlocked
+                  || actionPlanBlocked
+                  || (gateBlocked && !gateCanRunNext);
+                let dispatchTitle = '';
+                if (platformModeBlocker) dispatchTitle = dispatchBlockerMessage(platformModeBlocker, lottery);
+                else if (transportBlocksSelectedMode) dispatchTitle = t('lotteries.legacyHttpTargetHint');
+                else if (actionPlanBlocked) dispatchTitle = t('lotteries.actionPlanV2Required');
+                else if (gateBlocked) dispatchTitle = gateTitle(gate, t);
+                let dispatchLabel = t(`lotteries.dispatch_${dispatchMode}`);
+                if (platformModeBlocker) dispatchLabel = t('lotteries.manualAssistedOnly');
+                else if (transportBlocksSelectedMode) dispatchLabel = t('lotteries.compatibilityBlocked');
+                else if (!safeAccountAvailable) dispatchLabel = t('lotteries.noSafeAccount');
+                else if (accountScopeBlocked) dispatchLabel = t('lotteries.selectAccount');
+                else if (actionPlanBlocked) dispatchLabel = t('lotteries.nextActions.review_rule');
+                else if (gateBlocked) dispatchLabel = t(`lotteries.nextActions.${gate?.next_action || 'blocked'}`);
                 return (
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
@@ -550,30 +847,44 @@ export default function Lotteries() {
                   <td className="truncate-cell" title={lottery.rule_text || lottery.raw_url}>
                     {lottery.title && <div className="table-primary">{lottery.title}</div>}
                     <div className="small-text">{lottery.raw_url}</div>
+                    {targetIssue && <span className="badge badge-danger">{t('lotteries.legacyHttpTarget')}</span>}
                   </td>
-                  <td><RulePlanEditor lottery={lottery} onSave={saveActionPlan} t={t} /></td>
+                  <td><RulePlanEditor lottery={lottery} gate={gate} onSave={saveActionPlan} t={t} /></td>
                   <td><StatusBadge status={lottery.status} /></td>
                   <td>{lottery.value_score}</td>
                   <td>
-                    <RealGateCell gate={gate} t={t} />
+                    <RealGateCell
+                      gate={gate}
+                      platform={lottery.platform}
+                      executionPathId={executionPathId}
+                      targetIssue={targetIssue}
+                      t={t}
+                    />
                   </td>
                   <td className="small-text">{lottery.expires_at || '-'}</td>
                   <td className="action-cell">
                     <button
                       onClick={() => gateBlocked ? runGateNextAction(lottery, gate) : dispatch(lottery.id)}
-                      disabled={!safeAccountCount(lottery.platform) || (gateBlocked && !gateCanRunNext)}
-                      title={gateBlocked ? gateTitle(gate, t) : ''}
-                      className={dispatchMode === 'real_run' && !gateCanRunNext ? 'btn-danger' : 'btn-primary'}
+                      disabled={dispatchDisabled}
+                      title={dispatchTitle}
+                      className={platformModeBlocker || transportBlocksSelectedMode || (dispatchMode === 'real_run' && !gateCanRunNext) ? 'btn-danger' : 'btn-primary'}
                     >
-                      {!safeAccountCount(lottery.platform)
-                        ? t('lotteries.noSafeAccount')
-                        : (gateBlocked
-                            ? t(`lotteries.nextActions.${gate?.next_action || 'blocked'}`)
-                            : t(`lotteries.dispatch_${dispatchMode}`))}
+                      {dispatchLabel}
                     </button>
                     <button onClick={() => markResult(lottery.id, 'won')} className="btn-ghost">{t('lotteries.won')}</button>
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
-                    <button onClick={() => probe(lottery.id)} disabled={!safeAccountCount(lottery.platform)} className="btn-ghost">{t('lotteries.probe')}</button>
+                    <button
+                      onClick={() => probe(lottery.id)}
+                      disabled={Boolean(targetIssue) || !safeAccountAvailable || !accountScopeReady || !actionPlanReady}
+                      title={targetIssue
+                        ? t('lotteries.legacyHttpTargetHint')
+                        : (!accountScopeReady
+                          ? t('lotteries.accountScopeRequired')
+                          : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : ''))}
+                      className="btn-ghost"
+                    >
+                      {t('lotteries.probe')}
+                    </button>
                     {repairAvailable && (
                       <div className="repair-action">
                         <button
@@ -585,6 +896,11 @@ export default function Lotteries() {
                           {t('lotteries.repairMissing')}
                         </button>
                         {repairBlocked && <div className="small-text muted-text">{repairBlockReason}</div>}
+                      </div>
+                    )}
+                    {repairUnavailable && (
+                      <div className="small-text warning-text">
+                        {t('lotteries.repairExecutionUnavailable')}
                       </div>
                     )}
                   </td>
@@ -599,14 +915,16 @@ export default function Lotteries() {
 
       <div className="panel">
         <div className="panel-title">{t('lotteries.adapterProbes')}</div>
+        <div className="notice notice-warning">{t('lotteries.probeSelectorObservationOnly')}</div>
         <div className="table-wrap">
           <table className="data-table">
             <thead>
-              <tr><th>{t('lotteries.probe')}</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.account')}</th><th>{t('lotteries.activity')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.visiblePhases')}</th><th>{t('lotteries.quality')}</th><th>{t('lotteries.evidence')}</th></tr>
+              <tr><th>{t('lotteries.probe')}</th><th>{t('lotteries.platform')}</th><th>{t('lotteries.account')}</th><th>{t('lotteries.activity')}</th><th>{t('lotteries.status')}</th><th>{t('lotteries.visiblePhases')}</th><th>{t('lotteries.selectorObservation')}</th><th>{t('lotteries.evidence')}</th></tr>
             </thead>
             <tbody>
               {probes.map(item => {
                 const summary = probeSummary(item);
+                const observationComplete = selectorObservationComplete(summary);
                 return (
                   <tr key={item.id}>
                     <td className="mono">{item.probe_id?.slice(0, 8)}</td>
@@ -614,10 +932,14 @@ export default function Lotteries() {
                     <td>A{item.account_id}</td>
                     <td>{item.lottery_id ? `L${item.lottery_id}` : '-'}</td>
                     <td><StatusBadge status={item.status} /></td>
-                    <td>{summary ? `${summary.ready_phase_count}/4` : '-'}</td>
+                    <td>{summary ? `${summary.ready_phase_count}/${probePhaseTotal(summary, item.platform)}` : '-'}</td>
                     <td>
                       {summary ? (
-                        <StatusBadge status={summary.ready_for_real_actions ? 'ready' : 'pending'} />
+                        <span className={`badge ${observationComplete ? 'badge-ready' : 'badge-warn'}`}>
+                          {t(observationComplete
+                            ? 'lotteries.selectorObservationComplete'
+                            : 'lotteries.selectorObservationIncomplete')}
+                        </span>
                       ) : (
                         <span className="badge badge-muted">{t('lotteries.raw')}</span>
                       )}
@@ -707,7 +1029,18 @@ function reasonText(code, t) {
 
 function gateBlockerText(code, t) {
   const label = t(`lotteries.realGateBlockers.${code}`);
-  return label === `lotteries.realGateBlockers.${code}` ? code : label;
+  if (label !== `lotteries.realGateBlockers.${code}`) return label;
+  return actionPlanBlockerText(code, t);
+}
+
+function actionPlanBlockerText(code, t) {
+  const label = t(`lotteries.actionPlanBlockers.${code}`);
+  return label === `lotteries.actionPlanBlockers.${code}` ? code : label;
+}
+
+function shortIdentity(value) {
+  const text = String(value || '');
+  return text.length > 12 ? `${text.slice(0, 12)}…` : (text || '-');
 }
 
 function gateTitle(gate, t) {
@@ -728,6 +1061,57 @@ function actionSummary(actions = [], t) {
   return actions.map(action => t(`lotteries.actions.${action}`)).join(' / ');
 }
 
+function targetValidationErrorText(value, t) {
+  const code = targetValidationErrorCode(value);
+  if (!code) return value;
+  const key = `lotteries.targetErrors.${code}`;
+  const translated = t(key);
+  return translated === key ? value : translated;
+}
+
+function normalizeTargetImport(targetImport, platforms = []) {
+  return normalizeTargetImportForPlatform(targetImport?.platform, targetImport?.content, {
+    allowedPlatformIds: platforms.map(platform => platform.id),
+  });
+}
+
+function targetImportSanitizedMessageKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'xiaohongshu') return 'lotteries.xiaohongshuExportSanitized';
+  if (normalized === 'douyin') return 'lotteries.douyinExportSanitized';
+  if (normalized === 'weibo') return 'lotteries.weiboExportSanitized';
+  return 'lotteries.targetImportSanitized';
+}
+
+function manualOnlyHintKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'douyin') return 'lotteries.douyinManualOnlyHint';
+  if (normalized === 'weibo') return 'lotteries.weiboManualOnlyHint';
+  return 'lotteries.xiaohongshuManualOnlyHint';
+}
+
+function manualMediaRequirementKey(platform) {
+  const normalized = String(platform || '').trim().toLowerCase();
+  if (normalized === 'douyin') return 'lotteries.douyinMediaRequirementManual';
+  if (normalized === 'weibo') return 'lotteries.weiboMediaRequirementManual';
+  return 'lotteries.xiaohongshuMediaRequirementManual';
+}
+
+function targetImportTimeout(normalizedImport) {
+  if (!normalizedImport?.targetCount) return undefined;
+  const configuredTimeout = Number(import.meta.env.VITE_API_TIMEOUT_MS || 15_000);
+  const rowBudget = normalizedImport.targetCount * 40;
+  const shortLinkBudget = normalizedImport.shortLinkCount ? 42_000 : 0;
+  return Math.max(configuredTimeout, Math.min(58_000, 15_000 + rowBudget + shortLinkBudget));
+}
+
+function targetImportErrorText(error, t) {
+  const code = String(error?.code || error?.message || '');
+  const key = `lotteries.targetImportErrors.${code}`;
+  const translated = t(key);
+  return translated === key ? (error?.message || code) : translated;
+}
+
 function displayTime(value) {
   if (!value) return '-';
   const date = new Date(value);
@@ -745,7 +1129,49 @@ function riskCooldownText(gate, t) {
   });
 }
 
-function RealGateCell({ gate, t }) {
+function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
+  if (targetIssue) {
+    return (
+      <div className="gate-cell">
+        <span className="badge badge-danger">{t('lotteries.compatibilityBlocked')}</span>
+        <div className="small-text warning-text">{t('lotteries.legacyHttpTargetHint')}</div>
+        {!!gate?.blockers?.length && (
+          <div className="blocker-list compact-blockers">
+            {gate.blockers.slice(0, 3).map(code => (
+              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (isManualAssistedPlatform(platform, executionPathId)) {
+    const shadowObservation = manualShadowObservation(gate);
+    return (
+      <div className="gate-cell">
+        <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
+        <div className="small-text warning-text">{t(manualOnlyHintKey(platform))}</div>
+        <div className="capability-row">
+          <span>{t('lotteries.shadowEvidence')}</span>
+          <span className={`badge ${shadowObservation.complete ? 'badge-ready' : 'badge-muted'}`}>
+            {shadowObservation.complete
+              ? t('lotteries.shadowEvidenceReady')
+              : t('lotteries.shadowEvidenceMissing')}
+          </span>
+        </div>
+        {!!gate?.blockers?.length && (
+          <div className="blocker-list compact-blockers">
+            {gate.blockers.slice(0, 4).map(code => (
+              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+            ))}
+          </div>
+        )}
+        {!!shadowObservation.taskId && (
+          <div className="small-text mono">Shadow {shortIdentity(shadowObservation.taskId)}</div>
+        )}
+      </div>
+    );
+  }
   if (!gate) return <span className="badge badge-muted">{t('lotteries.gateUnknown')}</span>;
   const repairPlan = gate.repair_plan;
   const riskText = riskCooldownText(gate, t);
@@ -764,6 +1190,7 @@ function RealGateCell({ gate, t }) {
         {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
       </div>
       {riskText && <div className="small-text warning-text">{riskText}</div>}
+      <ExecutionEvidenceDetails gate={gate} t={t} />
       {!!(repairPlan?.completed_actions?.length || repairPlan?.missing_actions?.length) && (
         <div className="repair-plan-summary">
           {!!repairPlan.completed_actions?.length && (
@@ -774,9 +1201,61 @@ function RealGateCell({ gate, t }) {
           )}
         </div>
       )}
+      {repairPlan?.eligible && !repairPlan?.executable && (
+        <div className="small-text warning-text">
+          {t('lotteries.repairExecutionUnavailable')}
+        </div>
+      )}
       <ActionLedgerSummary ledger={gate.action_ledger} repairPlan={repairPlan} t={t} />
     </div>
   );
+}
+
+function ExecutionEvidenceDetails({ gate, t }) {
+  const evidence = executionEvidencePresentation(gate);
+  return (
+    <div className="action-ledger-summary">
+      <div className="capability-row">
+        <span>{t('lotteries.executionEvidenceBinding')}</span>
+        <span className={`badge ${evidence.bound && evidence.status === 'verified' ? 'badge-ready' : 'badge-warn'}`}>
+          {evidenceStatusText(evidence.status, t)}
+        </span>
+      </div>
+      {!!evidence.id && <div className="small-text mono">ID {shortIdentity(evidence.id)}</div>}
+      {!!evidence.executionPathId && (
+        <div className="small-text mono">{t('lotteries.executionPath')}: {evidence.executionPathId}</div>
+      )}
+      {!!evidence.accountId && (
+        <div className="small-text mono">
+          {t('lotteries.account')}: A{evidence.accountId} / {evidence.accountScopeMatchesPlatform
+            ? t('lotteries.accountScopeMatched')
+            : t('lotteries.accountScopeMismatch')}
+        </div>
+      )}
+      {!!evidence.probeId && <div className="small-text mono">Probe {shortIdentity(evidence.probeId)}</div>}
+      {!!evidence.shadowTaskId && <div className="small-text mono">Shadow {shortIdentity(evidence.shadowTaskId)}</div>}
+      {!!evidence.verifiedAt && (
+        <div className="small-text muted-text">{t('lotteries.evidenceVerifiedAt')}: {displayTime(evidence.verifiedAt)}</div>
+      )}
+      {!!evidence.expiresAt && (
+        <div className="small-text muted-text">{t('lotteries.evidenceExpiresAt')}: {displayTime(evidence.expiresAt)}</div>
+      )}
+      {!evidence.bound && !!evidence.reasons.length && (
+        <div className="blocker-list compact-blockers">
+          {evidence.reasons.slice(0, 4).map(code => (
+            <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function evidenceStatusText(status, t) {
+  const normalized = String(status || 'unbound').trim().toLowerCase();
+  const key = `lotteries.evidenceStatuses.${normalized}`;
+  const translated = t(key);
+  return translated === key ? normalized : translated;
 }
 
 function ActionLedgerSummary({ ledger = [], repairPlan, t }) {
@@ -819,29 +1298,144 @@ function ledgerOutcomeClass(row) {
   return 'badge-muted';
 }
 
-function RulePlanEditor({ lottery, onSave, t }) {
+function RulePlanEditor({ lottery, gate, onSave, t }) {
   const { notify } = useUi();
   const plan = lottery.action_plan || {};
-  const initialActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
-  const planSignature = JSON.stringify(initialActions);
+  const fixedManualActions = isFixedManualActionPlatform(lottery.platform);
+  const availableActions = lotteryActionsForPlatform(lottery.platform);
+  const savedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+  const savedExecutionPathId = platformExecutionPathId(
+    lottery.platform,
+    plan.execution_path_id,
+  );
+  const savedManualAssisted = isManualAssistedPlan(lottery.platform, plan);
+  const initialActions = fixedManualActions ? availableActions : savedActions;
+  const savedPayloads = actionPayloadDraft(
+    savedActions,
+    plan.action_payloads,
+    null,
+    lottery.platform,
+  );
+  const initialPayloads = actionPayloadDraft(
+    initialActions,
+    plan.action_payloads,
+    null,
+    lottery.platform,
+  );
+  const planSignature = JSON.stringify({
+    actions: savedActions,
+    payloads: savedPayloads,
+    contentRequirements: plan.content_requirements,
+    sourceContentRequirements: plan.source_content_requirements,
+    friendMentionRequirements: plan.friend_mention_requirements,
+    executionPathId: savedExecutionPathId,
+    version: plan.version,
+    hash: plan.plan_hash,
+  });
   const [actions, setActions] = useState(initialActions);
+  const [payloads, setPayloads] = useState(initialPayloads);
   const [ruleText, setRuleText] = useState(lottery.rule_text || '');
+  const [executionPathId, setExecutionPathId] = useState(savedExecutionPathId);
+  const [ruleCompleteConfirmed, setRuleCompleteConfirmed] = useState(false);
+  const [reviewedConfirmed, setReviewedConfirmed] = useState(false);
   const [suggestion, setSuggestion] = useState(null);
   const [suggesting, setSuggesting] = useState(false);
   const suggestionActions = Array.isArray(suggestion?.required_actions) ? suggestion.required_actions : [];
-  const draftChanged = !sameActionSet(actions, initialActions);
-  const missingSuggestedActions = suggestionActions.filter(action => !initialActions.includes(action));
+  const draftPayloads = actionPayloadDraft(actions, payloads, null, lottery.platform);
+  const semanticSource = suggestion || plan;
+  const friendMentionRequirements = (
+    semanticSource.friend_mention_requirements
+    && typeof semanticSource.friend_mention_requirements === 'object'
+  ) ? semanticSource.friend_mention_requirements : {};
+  const manualAssisted = isManualAssistedPlatform(lottery.platform, executionPathId);
+  const unresolvedRequirements = unresolvedRuleRequirements(semanticSource, draftPayloads);
+  const payloadErrors = exactPayloadErrors(actions, draftPayloads, lottery.platform);
+  const persistedPlanBlockers = savedManualAssisted
+    ? actionPlanV2ReviewBlockers(plan, lottery.platform)
+    : [
+      ...actionPlanV2Blockers(plan, lottery.platform),
+      ...(Array.isArray(plan.payload_validation_errors) ? plan.payload_validation_errors : []),
+      ...(Array.isArray(plan.capability_blockers) ? plan.capability_blockers : []),
+    ];
+  const planBlockers = [...new Set([
+    ...persistedPlanBlockers,
+  ])];
+  const planReady = savedManualAssisted
+    ? actionPlanV2ReviewReady(plan, lottery.platform)
+    : actionPlanV2Ready(plan, lottery.platform);
+  const draftChanged = !sameActionSet(actions, savedActions)
+    || JSON.stringify(draftPayloads) !== JSON.stringify(savedPayloads)
+    || executionPathId !== savedExecutionPathId;
+  const missingSuggestedActions = suggestionActions.filter(action => !savedActions.includes(action));
+  const sourceRuleLocked = Boolean(String(lottery.rule_text || '').trim());
+  const discoveryManagedSource = sourceRuleCorrectionPath(lottery.platform, lottery.source_type) === 'discovery_refresh';
+  const sourceRuleHelpId = `lottery-${lottery.id}-source-rule-help`;
+  const mediaRequired = actionPlanHasMediaRequirement({ action_payloads: draftPayloads });
+  const mediaRequirementNotice = t(manualAssisted
+    ? manualMediaRequirementKey(lottery.platform)
+    : 'lotteries.mediaRuleStoredButUnsupported');
+  const requiredActionSetComplete = !fixedManualActions
+    || (actions.length === availableActions.length && sameActionSet(actions, availableActions));
+  const saveDisabled = !actions.length
+    || !ruleText.trim()
+    || !executionPathId
+    || !ruleCompleteConfirmed
+    || !reviewedConfirmed
+    || !requiredActionSetComplete
+    || unresolvedRequirements.length > 0
+    || payloadErrors.length > 0;
 
   useEffect(() => {
-    setActions(Array.isArray(plan.required_actions) ? plan.required_actions : []);
+    const persistedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
+    const nextActions = isFixedManualActionPlatform(lottery.platform)
+      ? lotteryActionsForPlatform(lottery.platform)
+      : persistedActions;
+    setActions(nextActions);
+    setPayloads(actionPayloadDraft(nextActions, plan.action_payloads, null, lottery.platform));
     setRuleText(lottery.rule_text || '');
+    setExecutionPathId(platformExecutionPathId(lottery.platform, plan.execution_path_id));
+    setRuleCompleteConfirmed(false);
+    setReviewedConfirmed(false);
     setSuggestion(null);
-  }, [lottery.id, lottery.rule_text, planSignature]);
+  }, [lottery.id, lottery.platform, lottery.rule_text, planSignature]);
 
   const toggle = action => {
-    setActions(current => current.includes(action)
-      ? current.filter(item => item !== action)
-      : [...current, action]);
+    setActions(current => availableActions.filter(candidate => (
+      candidate === action ? !current.includes(candidate) : current.includes(candidate)
+    )));
+    setPayloads(current => ({
+      ...current,
+      [action]: current[action] || (
+        ['commented', 'reposted'].includes(action)
+          ? { text: '' }
+          : (action === 'followed' ? { target_handle: '' } : {})
+      ),
+    }));
+    setRuleCompleteConfirmed(false);
+    setReviewedConfirmed(false);
+  };
+
+  const updateTextPayload = (action, field, value) => {
+    setPayloads(current => ({
+      ...current,
+      [action]: {
+        ...(current[action] || { text: '' }),
+        [field]: ['topic_tags', 'mentions', 'media_refs'].includes(field)
+          ? parseMetadataLines(value)
+          : value,
+      },
+    }));
+    setRuleCompleteConfirmed(false);
+    setReviewedConfirmed(false);
+  };
+
+  const updateFollowTarget = value => {
+    setPayloads(current => ({
+      ...current,
+      followed: { target_handle: value },
+    }));
+    setRuleCompleteConfirmed(false);
+    setReviewedConfirmed(false);
   };
 
   const requestSuggestion = async () => {
@@ -849,7 +1443,21 @@ function RulePlanEditor({ lottery, onSave, t }) {
     try {
       const response = await fetchJSON(`/lotteries/${lottery.id}/action-plan/suggest?rule_text=${encodeURIComponent(ruleText)}`);
       const suggested = response.suggested_action_plan || {};
-      setActions(Array.isArray(suggested.required_actions) ? suggested.required_actions : []);
+      const suggestedActions = Array.isArray(suggested.required_actions)
+        ? suggested.required_actions
+        : [];
+      const nextActions = fixedManualActions
+        ? availableActions
+        : availableActions.filter(action => suggestedActions.includes(action));
+      setActions(nextActions);
+      setPayloads(current => actionPayloadDraft(
+        nextActions,
+        current,
+        suggested.content_requirements,
+        lottery.platform,
+      ));
+      setRuleCompleteConfirmed(false);
+      setReviewedConfirmed(false);
       setSuggestion(suggested);
     } catch (err) {
       notify(err.message, 'error');
@@ -861,20 +1469,22 @@ function RulePlanEditor({ lottery, onSave, t }) {
   return (
     <details className="rule-plan-editor">
       <summary>
-        <span className={`badge ${plan.review_required || !initialActions.length || draftChanged ? 'badge-warn' : 'badge-ready'}`}>
-          {plan.review_required || !initialActions.length ? t('lotteries.ruleNeedsReview') : t('lotteries.ruleReady')}
+        <span className={`badge ${planReady && !draftChanged ? 'badge-ready' : 'badge-warn'}`}>
+          {planReady
+            ? t(savedManualAssisted ? 'lotteries.manualRuleReady' : 'lotteries.ruleReady')
+            : t('lotteries.ruleNeedsReview')}
         </span>
-        <span className="small-text">{actionSummary(initialActions, t)}</span>
+        <span className="small-text">{actionSummary(savedActions, t)}</span>
         {draftChanged && <span className="badge badge-warn">{t('lotteries.ruleDraftUnsavedBadge')}</span>}
       </summary>
       <div className="rule-plan-body">
         <div className="rule-plan-snapshots">
           <div className="rule-plan-snapshot">
-            <span>{t('lotteries.savedExecutionPlan')}</span>
-            <strong>{actionSummary(initialActions, t)}</strong>
+            <span>{t(savedManualAssisted ? 'lotteries.manualSavedPlan' : 'lotteries.savedExecutionPlan')}</span>
+            <strong>{actionSummary(savedActions, t)}</strong>
           </div>
           <div className={`rule-plan-snapshot ${draftChanged ? 'is-dirty' : ''}`}>
-            <span>{t('lotteries.draftExecutionPlan')}</span>
+            <span>{t(manualAssisted ? 'lotteries.manualDraftPlan' : 'lotteries.draftExecutionPlan')}</span>
             <strong>{actionSummary(actions, t)}</strong>
           </div>
           {!!suggestionActions.length && (
@@ -884,7 +1494,60 @@ function RulePlanEditor({ lottery, onSave, t }) {
             </div>
           )}
         </div>
-        {draftChanged && <div className="notice notice-warning">{t('lotteries.ruleDraftNotSaved')}</div>}
+
+        <div className="small-text mono">
+          v{plan.version || 1} / {plan.execution_path_id || '-'} / snapshot {plan.rule_snapshot_id || '-'}
+        </div>
+        <div className="small-text mono" title={plan.rule_hash || ''}>
+          rule {shortIdentity(plan.rule_hash)} / plan {shortIdentity(plan.plan_hash)}
+        </div>
+        {!!planBlockers.length && (
+          <div className="blocker-list compact-blockers" role="alert">
+            {planBlockers.map(code => (
+              <span className="badge badge-warn" key={code}>{actionPlanBlockerText(code, t)}</span>
+            ))}
+          </div>
+        )}
+        {actionPlanHasMediaRequirement(plan) && (
+          <div className="notice notice-warning">{mediaRequirementNotice}</div>
+        )}
+        <SavedExactPayloads payloads={savedPayloads} t={t} />
+        {savedManualAssisted && (
+          <ManualAssistedChecklist plan={plan} gate={gate} platform={lottery.platform} t={t} />
+        )}
+
+        {String(lottery.platform || '').trim().toLowerCase() === 'weibo' && (
+          <label>
+            <span>{t('lotteries.executionPath')}</span>
+            <select
+              className="input"
+              value={executionPathId}
+              onChange={event => {
+                setExecutionPathId(event.target.value);
+                setRuleCompleteConfirmed(false);
+                setReviewedConfirmed(false);
+              }}
+            >
+              <option value={WEIBO_OAUTH_EXECUTION_PATH_ID}>
+                {t('lotteries.weiboOAuthExecutionPath')}
+              </option>
+              <option value={WEIBO_MANUAL_EXECUTION_PATH_ID}>
+                {t('lotteries.weiboManualExecutionPath')}
+              </option>
+            </select>
+            <div className="small-text muted-text">
+              {t(manualAssisted
+                ? 'lotteries.weiboManualExecutionPathHint'
+                : 'lotteries.weiboOAuthExecutionPathHint')}
+            </div>
+          </label>
+        )}
+
+        {draftChanged && (
+          <div className="notice notice-warning">
+            {t(manualAssisted ? 'lotteries.manualRuleDraftNotSaved' : 'lotteries.ruleDraftNotSaved')}
+          </div>
+        )}
         {!!missingSuggestedActions.length && (
           <div className="notice notice-warning">
             {formatText(t('lotteries.suggestedActionsMissingSaved'), { actions: actionSummary(missingSuggestedActions, t) })}
@@ -893,9 +1556,25 @@ function RulePlanEditor({ lottery, onSave, t }) {
         <textarea
           className="input textarea"
           value={ruleText}
-          onChange={event => setRuleText(event.target.value)}
+          onChange={event => {
+            setRuleText(event.target.value);
+            setRuleCompleteConfirmed(false);
+            setReviewedConfirmed(false);
+            setSuggestion(null);
+          }}
+          readOnly={sourceRuleLocked}
+          aria-readonly={sourceRuleLocked}
+          aria-describedby={sourceRuleLocked ? sourceRuleHelpId : undefined}
           placeholder={t('lotteries.ruleTextPlaceholder')}
         />
+        {sourceRuleLocked && (
+          <div className="notice notice-warning small-text" id={sourceRuleHelpId} role="note">
+            <div>{t('lotteries.sourceRuleReadOnly')}</div>
+            <div>{t(discoveryManagedSource
+              ? 'lotteries.sourceRuleDiscoveryCorrectionHint'
+              : 'lotteries.sourceRuleCorrectionUnavailable')}</div>
+          </div>
+        )}
         <button className="btn-ghost" type="button" disabled={!ruleText.trim() || suggesting} onClick={requestSuggestion}>
           {suggesting ? t('lotteries.suggesting') : t('lotteries.suggestRule')}
         </button>
@@ -907,24 +1586,345 @@ function RulePlanEditor({ lottery, onSave, t }) {
             )}
             {suggestion.unsupported_actions?.map(action => (
               <div className="badge badge-warn" key={action}>
-                {t('lotteries.suggestionUnsupportedPrefix')}{t(`lotteries.unsupportedActions.${action}`)}
+                {t('lotteries.requirementPrefix')}{t(`lotteries.unsupportedActions.${action}`)}
               </div>
             ))}
           </div>
         )}
         <div className="rule-action-grid">
-          {LOTTERY_ACTIONS.map(action => (
+          {availableActions.map(action => (
             <label key={action}>
-              <input type="checkbox" checked={actions.includes(action)} onChange={() => toggle(action)} />
+              <input
+                type="checkbox"
+                checked={actions.includes(action)}
+                disabled={fixedManualActions}
+                onChange={() => toggle(action)}
+              />
               <span>{t(`lotteries.actions.${action}`)}</span>
             </label>
           ))}
         </div>
-        <button className="btn-primary" type="button" disabled={!actions.length} onClick={() => onSave(lottery, actions, ruleText)}>
+        {fixedManualActions && (
+          <div className="small-text muted-text">{t('lotteries.xiaohongshuFourActionsFixed')}</div>
+        )}
+
+        {actions.includes('followed') && (
+          <fieldset className="exact-payload-editor">
+            <legend>{t('lotteries.followTarget')}</legend>
+            <label>
+              <span>{t('lotteries.followTarget')}</span>
+              <input
+                className="input"
+                type="text"
+                value={draftPayloads.followed?.target_handle || ''}
+                onChange={event => updateFollowTarget(event.target.value)}
+                placeholder={t('lotteries.followTargetPlaceholder')}
+                autoComplete="off"
+              />
+            </label>
+            <div className="small-text muted-text">{t('lotteries.followTargetHint')}</div>
+          </fieldset>
+        )}
+
+        {actions.filter(action => ['commented', 'reposted'].includes(action)).map(action => {
+          const payload = draftPayloads[action] || { text: '' };
+          return (
+            <fieldset className="exact-payload-editor" key={`payload-${action}`}>
+              <legend>{t(`lotteries.exactPayloads.${action}`)}</legend>
+              <label>
+                <span>{t(manualAssisted ? 'lotteries.manualExactText' : 'lotteries.exactText')}</span>
+                <textarea
+                  className="input textarea"
+                  value={payload.text || ''}
+                  onChange={event => updateTextPayload(action, 'text', event.target.value)}
+                  placeholder={t(`lotteries.exactTextPlaceholders.${action}`)}
+                />
+              </label>
+              {['topic_tags', 'mentions', 'media_refs'].map(field => (
+                <label key={field}>
+                  <span>{t(`lotteries.payloadFields.${field}`)}</span>
+                  <textarea
+                    className="input textarea"
+                    value={metadataLines(payload[field])}
+                    onChange={event => updateTextPayload(action, field, event.target.value)}
+                    placeholder={t('lotteries.onePerLine')}
+                  />
+                  {field === 'mentions' && friendMentionRequirements[action] && (
+                    <span className="small-text muted-text">
+                      {formatText(t('lotteries.friendMentionRequirement'), {
+                        count: friendMentionRequirements[action].count,
+                        mode: t(`lotteries.friendMentionModes.${friendMentionRequirements[action].mode}`),
+                      })}
+                    </span>
+                  )}
+                </label>
+              ))}
+              <label>
+                <span>{t('lotteries.payloadFields.translation')}</span>
+                <textarea
+                  className="input textarea"
+                  value={translationText(payload.translation)}
+                  onChange={event => updateTextPayload(action, 'translation', event.target.value)}
+                  placeholder={t('lotteries.translationPlaceholder')}
+                />
+              </label>
+            </fieldset>
+          );
+        })}
+
+        {!!unresolvedRequirements.length && (
+          <div className="notice notice-warning" role="alert">
+            {t('lotteries.unresolvedRequirements')}: {unresolvedRequirements.map(code => (
+              t(`lotteries.unsupportedActions.${code}`)
+            )).join(' / ')}
+          </div>
+        )}
+        {!!payloadErrors.length && (
+          <div className="notice notice-warning" role="alert">
+            {payloadErrors.map(code => actionPlanBlockerText(code, t)).join(' / ')}
+          </div>
+        )}
+        {fixedManualActions && !requiredActionSetComplete && (
+          <div className="notice notice-warning" role="alert">
+            {t('lotteries.xiaohongshuFourActionsRequired')}
+          </div>
+        )}
+        {mediaRequired && (
+          <div className="notice notice-warning">{mediaRequirementNotice}</div>
+        )}
+        <label className="notice notice-warning">
+          <input
+            type="checkbox"
+            checked={ruleCompleteConfirmed}
+            onChange={event => setRuleCompleteConfirmed(event.target.checked)}
+          />
+          <span>{t('lotteries.completeRuleConfirmation')}</span>
+        </label>
+        <label className="notice notice-warning">
+          <input
+            type="checkbox"
+            checked={reviewedConfirmed}
+            onChange={event => setReviewedConfirmed(event.target.checked)}
+          />
+          <span>{t(manualAssisted
+            ? 'lotteries.manualReviewedPlanConfirmation'
+            : 'lotteries.reviewedPlanConfirmation')}</span>
+        </label>
+        <button
+          className="btn-primary"
+          type="button"
+          disabled={saveDisabled}
+          title={saveDisabled ? t('lotteries.completeRuleBeforeSave') : ''}
+          onClick={() => onSave(lottery, {
+            requiredActions: actions,
+            actionPayloads: draftPayloads,
+            ruleText,
+            ruleCompleteConfirmed,
+            reviewed: reviewedConfirmed,
+            executionPathId,
+            platform: lottery.platform,
+          })}
+        >
           {t('lotteries.saveCurrentRule')}
         </button>
       </div>
     </details>
+  );
+}
+
+function actionPayloadDraft(actions, payloads, contentRequirements = null, platform = 'bilibili') {
+  const source = payloads && typeof payloads === 'object' ? payloads : {};
+  const requirements = contentRequirements && typeof contentRequirements === 'object'
+    ? contentRequirements
+    : {};
+  return lotteryActionsForPlatform(platform).reduce((result, action) => {
+    if (!actions.includes(action)) return result;
+    if (action === 'followed') {
+      const followTargets = Array.isArray(requirements.follow_targets)
+        ? requirements.follow_targets
+        : [];
+      const sourceTarget = source.followed && typeof source.followed.target_handle === 'string'
+        ? source.followed.target_handle
+        : '';
+      result.followed = {
+        target_handle: followTargets.length === 1 ? followTargets[0] : sourceTarget,
+      };
+      return result;
+    }
+    if (!['commented', 'reposted'].includes(action)) {
+      result[action] = {};
+      return result;
+    }
+    const payload = source[action] && typeof source[action] === 'object' ? source[action] : {};
+    result[action] = { text: typeof payload.text === 'string' ? payload.text : '' };
+    for (const field of ['topic_tags', 'mentions', 'media_refs']) {
+      const exactRequirement = requirements[action]?.[field];
+      if (Array.isArray(exactRequirement)) {
+        if (exactRequirement.length) result[action][field] = [...exactRequirement];
+      } else if (Array.isArray(payload[field]) && payload[field].length) {
+        result[action][field] = [...payload[field]];
+      }
+    }
+    if (payload.translation !== undefined && payload.translation !== null && payload.translation !== '') {
+      result[action].translation = payload.translation;
+    }
+    return result;
+  }, {});
+}
+
+function parseMetadataLines(value) {
+  return [...new Set(String(value || '').split(/\r?\n/).map(item => item.trim()).filter(Boolean))];
+}
+
+function metadataLines(value) {
+  return Array.isArray(value) ? value.join('\n') : '';
+}
+
+function translationText(value) {
+  if (value === undefined || value === null) return '';
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+function isWellFormedUnicode(value) {
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    if (unit >= 0xD800 && unit <= 0xDBFF) {
+      const next = text.charCodeAt(index + 1);
+      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
+      index += 1;
+    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function exactPayloadErrors(actions, payloads, platform = 'bilibili') {
+  const errors = [];
+  if (actions.includes('followed')) {
+    const target = payloads.followed?.target_handle;
+    if (typeof target !== 'string' || !/^@[\p{L}\p{N}_-]{1,64}$/u.test(target)) {
+      errors.push('action_payload_followed_target_invalid');
+    }
+  }
+  for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
+    const payload = payloads[action] || {};
+    const text = String(payload.text || '');
+    const plainPlatformRepost = ['douyin', 'weibo'].includes(
+      String(platform || '').trim().toLowerCase(),
+    )
+      && action === 'reposted'
+      && !text.trim()
+      && !['topic_tags', 'mentions', 'media_refs'].some(field => (
+        Array.isArray(payload[field]) && payload[field].length
+      ))
+      && !String(payload.translation || '').trim();
+    if (!text.trim() && !plainPlatformRepost) errors.push(`action_payload_${action}_text_required`);
+    if (!isWellFormedUnicode(text)) errors.push(`action_payload_${action}_text_invalid`);
+    if (utf8ByteLength(text) > 4096) errors.push(`action_payload_${action}_text_too_large`);
+    if (String(platform || '').trim().toLowerCase() === 'weibo' && text.length > 140) {
+      errors.push(`weibo_${action}_text_too_long`);
+    }
+    for (const field of ['topic_tags', 'mentions', 'media_refs']) {
+      const values = Array.isArray(payload[field]) ? payload[field] : [];
+      if (values.length > 32) errors.push(`action_payload_${field}_too_many`);
+      if (values.some(item => (
+        !isWellFormedUnicode(item)
+        || utf8ByteLength(item) > 512
+        || (field === 'mentions' && !/^@[\p{L}\p{N}_-]{1,64}$/u.test(item))
+      ))) {
+        errors.push(`action_payload_${field}_invalid`);
+      }
+    }
+    for (const token of payload.topic_tags || []) {
+      if (!actionTextContainsRequiredToken(text, token)) {
+        errors.push('action_payload_required_token_missing');
+      }
+    }
+    for (const mention of payload.mentions || []) {
+      if (!actionTextContainsRequiredToken(text, mention, { mention: true })) {
+        errors.push('action_payload_required_token_missing');
+      }
+    }
+    if (payload.translation !== undefined && payload.translation !== '') {
+      if (typeof payload.translation !== 'string' || !payload.translation.trim()) {
+        errors.push('action_payload_translation_invalid');
+      } else if (!text.includes(payload.translation)) {
+        errors.push('action_payload_translation_missing');
+      }
+    }
+  }
+  if (String(platform || '').trim().toLowerCase() === 'weibo') {
+    const handles = [];
+    if (actions.includes('followed') && payloads.followed?.target_handle) {
+      handles.push(payloads.followed.target_handle);
+    }
+    for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
+      handles.push(...(payloads[action]?.mentions || []));
+    }
+    if (new Set(handles.map(mentionIdentityKey)).size > WEIBO_MAX_UNIQUE_HANDLES) {
+      errors.push('weibo_preflight_unique_handle_limit_exceeded');
+    }
+  }
+  return [...new Set(errors)];
+}
+
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(String(value || '')).length;
+}
+
+function ManualAssistedChecklist({ plan, gate, platform, t }) {
+  const items = manualAssistedChecklist(plan, platform);
+  const shadowObservation = manualShadowObservation(gate);
+  return (
+    <section className="manual-assisted-checklist" aria-label={t('lotteries.manualChecklistTitle')}>
+      <div className="capability-row">
+        <strong>{t('lotteries.manualChecklistTitle')}</strong>
+        <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
+      </div>
+      <p className="small-text muted-text">{t('lotteries.manualChecklistHint')}</p>
+      <ol>
+        {items.map(item => (
+          <li key={item.action}>
+            <span className={`badge ${item.required ? 'badge-ready' : 'badge-danger'}`}>
+              {item.required ? t('lotteries.planIncluded') : t('lotteries.planMissing')}
+            </span>
+            <strong>{t(`lotteries.actions.${item.action}`)}</strong>
+            {item.exactValue && <span className="small-text manual-exact-value">{item.exactValue}</span>}
+          </li>
+        ))}
+      </ol>
+      <div className="small-text mono">
+        {t('lotteries.shadowEvidence')}: {shadowObservation.complete
+          ? t('lotteries.shadowEvidenceReady')
+          : t('lotteries.shadowEvidenceMissing')}
+        {shadowObservation.taskId ? ` / ${shortIdentity(shadowObservation.taskId)}` : ''}
+      </div>
+      <p className="small-text warning-text">{t('lotteries.manualChecklistNoMutation')}</p>
+    </section>
+  );
+}
+
+function SavedExactPayloads({ payloads, t }) {
+  const rows = ['commented', 'reposted'].filter(action => payloads[action]?.text);
+  const followTarget = payloads.followed?.target_handle;
+  if (!rows.length && !followTarget) return null;
+  return (
+    <div className="rule-plan-snapshots">
+      {followTarget && (
+        <div className="rule-plan-snapshot" key="saved-payload-followed">
+          <span>{t('lotteries.followTarget')}</span>
+          <strong className="small-text">{followTarget}</strong>
+        </div>
+      )}
+      {rows.map(action => (
+        <div className="rule-plan-snapshot" key={`saved-payload-${action}`}>
+          <span>{t(`lotteries.exactPayloads.${action}`)}</span>
+          <strong className="small-text">{payloads[action].text}</strong>
+        </div>
+      ))}
+    </div>
   );
 }
 

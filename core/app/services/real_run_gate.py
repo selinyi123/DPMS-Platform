@@ -31,9 +31,17 @@ from app.governance.policy import (
     REAL_RUN_GATE_POLICY_KEY,
     build_decision_record,
     gate_codes_from_reasons,
+    validate_policy,
 )
 from app.security import circuit_breaker_allows, is_real_run_enabled
 from app.services.real_run_readiness import real_run_gate_status
+
+
+ACTION_PLAN_BLOCKER_PREFIXES = (
+    "lottery_action_plan_",
+    "lottery_rule_",
+    "lottery_required_actions_",
+)
 
 
 def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
@@ -45,15 +53,29 @@ def gate_inputs(gate: dict, *, breaker_allowed: bool) -> dict:
     asserts this against ``DEFAULT_REAL_RUN_POLICY``.
     """
     blockers = set(gate.get("blockers") or [])
+    action_plan_blocked = any(
+        str(blocker).startswith(ACTION_PLAN_BLOCKER_PREFIXES)
+        for blocker in blockers
+    )
     return {
         "global_real_run_enabled": bool(gate.get("real_run_enabled")),
         "circuit_breaker_closed": bool(breaker_allowed),
         "valid_lottery_target": bool(gate.get("target_valid")),
-        "action_plan_reviewed": bool(gate.get("action_plan_ready")),
+        # Defense in depth: readiness owns the authoritative derived boolean,
+        # while the blocker set prevents a newly-added or accidentally
+        # inconsistent rule blocker from being dropped at the policy boundary.
+        "action_plan_reviewed": bool(gate.get("action_plan_ready")) and not action_plan_blocked,
         "calibrated_account_available": int(gate.get("safe_accounts") or 0) > 0,
         "real_adapter_enabled": bool(gate.get("adapter_enabled")),
         "recent_complete_probe": bool(gate.get("probe_ready")),
-        "recent_shadow_run": bool(gate.get("shadow_ready")),
+        # The persisted gate code predates official OAuth support. Browser
+        # paths still require selector shadow evidence; OAuth satisfies the
+        # same no-side-effect rehearsal boundary with an exact, account-bound
+        # local dry run. Keep the legacy code for policy compatibility without
+        # claiming a selector observation occurred.
+        "recent_shadow_run": bool(
+            gate.get("execution_preflight_ready", gate.get("shadow_ready"))
+        ),
         "no_recent_account_risk": "recent_account_risk_event" not in blockers,
     }
 
@@ -73,7 +95,10 @@ def _as_policy_dict(definition) -> dict | None:
     if isinstance(definition, dict):
         return definition
     if isinstance(definition, (bytes, bytearray)):
-        definition = definition.decode("utf-8", "ignore")
+        try:
+            definition = definition.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     if isinstance(definition, str) and definition.strip():
         try:
             parsed = json.loads(definition)
@@ -84,15 +109,32 @@ def _as_policy_dict(definition) -> dict | None:
 
 
 async def load_active_policy(policy_key: str = REAL_RUN_GATE_POLICY_KEY) -> dict:
-    """Load the active policy version from the DB, falling back to the default."""
+    """Load and validate the active policy, defaulting only when no row exists.
+
+    An active row is authoritative application state.  Silently replacing a
+    malformed definition with the built-in policy would hide corruption and
+    could evaluate a different policy than the operator activated, so any
+    malformed active row fails closed.
+    """
     row = await database.fetch_one(
         "SELECT definition FROM policy_versions WHERE policy_key = :pk AND active = 1 ORDER BY version DESC LIMIT 1",
         {"pk": policy_key},
     )
-    if row and row["definition"]:
+    if row is not None:
         definition = _as_policy_dict(row["definition"])
-        if definition is not None:
-            return definition
+        if definition is None:
+            raise RuntimeError("active_policy_definition_invalid")
+        # The row lookup is authoritative for ``policy_key``; do not let a
+        # malformed/manual definition relabel itself and thereby skip the
+        # mandatory real-run overlay in ``evaluate_policy``.
+        if definition.get("policy_key") != policy_key:
+            raise RuntimeError("active_policy_key_mismatch")
+        valid, errors = validate_policy(definition)
+        if not valid:
+            raise RuntimeError(
+                f"active_policy_definition_invalid:{','.join(errors)}"
+            )
+        return definition
     if policy_key == REAL_RUN_GATE_POLICY_KEY:
         return DEFAULT_REAL_RUN_POLICY
     from fastapi import HTTPException

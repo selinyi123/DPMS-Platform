@@ -1,14 +1,20 @@
 import uuid
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from app.db import database, redis
+from app.db import database, execute_affected_rows, redis
 from app.event_store.service import record_event
-from app.adapter_config import load_runtime_selector_config, selector_config_complete
-from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart
+from app.action_plan import WEIBO_ACTION_ORDER
+from app.adapter_config import (
+    load_runtime_selector_config,
+    platform_has_runtime_real_adapter,
+    platform_real_adapter_kind,
+)
+from app.models.schemas import AccountCalibrationRequest, AccountCreate, AccountCredentialUpdate, AccountHealthRecheckRequest, AccountProxyUpdate, AccountUpdateStatus, QRLoginStart, WeiboOAuthCapabilityAttestationRequest
 from app.platforms import get_platform, get_platforms
 from app.services.bilibili_qr import generate_bilibili_qr, poll_bilibili_qr
 from app.services.risk_engine import check_all_accounts_health
@@ -16,11 +22,64 @@ from app.security import audit_event, require_confirmation, require_min_role
 from app.services.state_machine import transition_account
 from app.utils.cookies import parse_cookie_payload, validate_required_cookies
 from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
+from app.utils.credential_kind import account_credential_kind
+from app.utils.weibo_oauth_credential import (
+    normalize_weibo_oauth_credential,
+    parse_weibo_oauth_credential,
+)
 
 
 PROFILES_DIR = Path("/profiles")
 CALIBRATION_DIR = PROFILES_DIR / "account-calibrations"
 router = APIRouter()
+
+
+async def lock_account_for_execution_contract_mutation(account_id: int):
+    """Fence credential/proxy identity changes against every active operation.
+
+    Operation acquisition locks the same account row before inserting its
+    append-only lease.  Taking that lock first here makes the active-lease
+    check and the subsequent revision bump one serializable decision.
+    """
+
+    row = await database.fetch_one(
+        """SELECT id, platform, status, proxy_id, deleted_at
+           FROM accounts
+           WHERE id = :id
+           FOR UPDATE""",
+        {"id": account_id},
+    )
+    if not row:
+        raise HTTPException(404, detail="Account not found")
+    active_lease = await database.fetch_one(
+        """SELECT lease_id
+           FROM account_operation_leases
+           WHERE account_id = :account_id
+             AND released_at IS NULL
+             AND expires_at > NOW()
+           ORDER BY generation DESC
+           LIMIT 1
+           FOR UPDATE""",
+        {"account_id": account_id},
+    )
+    if active_lease:
+        raise HTTPException(
+            409,
+            detail={
+                "message": "Account has an active operation lease",
+                "code": "account_operation_lease_active",
+                "account_id": account_id,
+            },
+        )
+    return row
+
+
+async def execute_locked_account_update(query: str, values: dict) -> int:
+    await database.execute(query, values)
+    affected = await database.fetch_one("SELECT ROW_COUNT() AS affected")
+    if affected is None:
+        raise RuntimeError("database_affected_row_count_unavailable")
+    return int(affected["affected"] or 0)
 
 
 @router.get("/platforms")
@@ -32,13 +91,20 @@ async def list_platforms():
             "label": value["label"],
             "qr_login": value.get("qr_login", False),
             "cookie_login": value.get("cookie_login", True),
-            "action_adapter": value.get("action_adapter", False) or platform_selectors_complete(selector_config, key),
-            "adapter_status": "configured" if platform_selectors_complete(selector_config, key) else value.get("adapter_status", "planned"),
+            "action_adapter": value.get("action_adapter", False) or platform_has_runtime_real_adapter(selector_config, key),
+            "adapter_status": platform_adapter_status(selector_config, key, value),
             "cookie_domain": value.get("cookie_domain"),
             "account_check_url": value.get("account_check_url"),
         }
         for key, value in get_platforms().items()
     ]
+
+
+def platform_adapter_status(selector_config: dict, platform: str, metadata: dict) -> str:
+    kind = platform_real_adapter_kind(selector_config, platform)
+    if kind in {"api", "selector"}:
+        return "configured"
+    return metadata.get("adapter_status", "planned")
 
 
 @router.get("/")
@@ -114,10 +180,18 @@ async def list_accounts():
         item = dict(row)
         credential = item.pop("encrypted_credential", None)
         item["credential_ready"] = bool(credential)
+        item["credential_kind"] = account_credential_kind(
+            str(item.get("platform") or ""),
+            credential,
+        )
         if item.get("latest_risk_event"):
             item["latest_risk_event"] = parse_json_field(item["latest_risk_event"])
         if item.get("latest_calibration"):
             item["latest_calibration"] = parse_json_field(item["latest_calibration"])
+            if isinstance(item["latest_calibration"], dict):
+                item["latest_calibration"]["result"] = parse_json_field(
+                    item["latest_calibration"].get("result")
+                )
         if item.get("current_task_run"):
             item["current_task_run"] = parse_json_field(item["current_task_run"])
         if item.get("latest_task_run"):
@@ -370,21 +444,49 @@ async def get_qr_login_image(session_id: str):
 @router.put("/{account_id}/credential")
 async def update_credential(account_id: int, data: AccountCredentialUpdate, request: Request):
     actor = require_min_role(request, "operator")
-    row = await database.fetch_one("SELECT platform FROM accounts WHERE id = :id", {"id": account_id})
+    row = await database.fetch_one(
+        "SELECT platform, status FROM accounts WHERE id = :id",
+        {"id": account_id},
+    )
     if not row:
         raise HTTPException(404, detail="Account not found")
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot replace a credential while the account is executing")
+    if row["status"] == "banned":
+        raise HTTPException(409, detail="Cannot replace a credential on a banned account")
 
     try:
         normalized = normalize_and_validate_credential(row["platform"], data.encrypted_credential)
     except Exception as e:
         raise HTTPException(400, detail=str(e))
 
-    await database.execute(
-        """UPDATE accounts
-           SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "credential": cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)},
-    )
+    encrypted_credential = cookie_vault.encrypt(normalized, aad=CREDENTIAL_AAD)
+    async with database.transaction():
+        locked = await lock_account_for_execution_contract_mutation(account_id)
+        if locked["deleted_at"]:
+            raise HTTPException(409, detail="Cannot replace a credential on a deleted account")
+        if locked["status"] in {"executing", "banned"}:
+            raise HTTPException(
+                409, detail=f"Cannot replace a credential while account is {locked['status']}"
+            )
+        if str(locked["platform"]) != str(row["platform"]):
+            raise HTTPException(409, detail="Account platform changed; retry credential update")
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET encrypted_credential = :credential, status = 'warming', updated_at = NOW(),
+                   version = version + 1, execution_revision = execution_revision + 1
+               WHERE id = :id AND status NOT IN ('executing', 'banned')
+                 AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "credential": encrypted_credential},
+        )
+    if int(updated or 0) != 1:
+        raise HTTPException(409, detail="Account changed; credential update was not applied")
     calibration = await queue_account_calibration(account_id, row["platform"])
     await audit_event(
         request,
@@ -448,17 +550,38 @@ async def change_status(account_id: int, data: AccountUpdateStatus, request: Req
 @router.put("/{account_id}/proxy")
 async def update_account_proxy(account_id: int, data: AccountProxyUpdate, request: Request):
     actor = require_min_role(request, "operator")
-    row = await database.fetch_one("SELECT id, status FROM accounts WHERE id = :id", {"id": account_id})
-    if not row:
-        raise HTTPException(404, detail="Account not found")
-    if row["status"] == "executing":
-        raise HTTPException(409, detail="Cannot change proxy while account is executing")
+    async with database.transaction():
+        row = await lock_account_for_execution_contract_mutation(account_id)
+        if row["deleted_at"]:
+            raise HTTPException(409, detail="Cannot change proxy on a deleted account")
+        if row["status"] == "executing":
+            raise HTTPException(409, detail="Cannot change proxy while account is executing")
+        if row["proxy_id"] == data.proxy_id:
+            return {
+                "status": "proxy_unassigned" if data.proxy_id is None else "proxy_assigned",
+                "id": account_id,
+                "proxy_id": data.proxy_id,
+                "changed": False,
+            }
+        if data.proxy_id is not None:
+            await validate_proxy_assignment(data.proxy_id, account_id)
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET proxy_id = :proxy_id, updated_at = NOW(), version = version + 1,
+                   execution_revision = execution_revision + 1
+               WHERE id = :id AND status <> 'executing' AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "proxy_id": data.proxy_id},
+        )
+        if int(updated or 0) != 1:
+            raise HTTPException(409, detail="Account changed; proxy update was not applied")
 
     if data.proxy_id is None:
-        await database.execute(
-            "UPDATE accounts SET proxy_id = NULL, updated_at = NOW(), version = version + 1 WHERE id = :id",
-            {"id": account_id},
-        )
         await record_event(
             aggregate="account",
             aggregate_id=account_id,
@@ -469,13 +592,6 @@ async def update_account_proxy(account_id: int, data: AccountProxyUpdate, reques
         )
         return {"status": "proxy_unassigned", "id": account_id, "proxy_id": None}
 
-    await validate_proxy_assignment(data.proxy_id, account_id)
-    await database.execute(
-        """UPDATE accounts
-           SET proxy_id = :proxy_id, updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "proxy_id": data.proxy_id},
-    )
     await record_event(
         aggregate="account",
         aggregate_id=account_id,
@@ -491,23 +607,33 @@ async def update_account_proxy(account_id: int, data: AccountProxyUpdate, reques
 async def delete_account(account_id: int, request: Request):
     actor = require_min_role(request, "admin")
     require_confirmation(request)
-    row = await database.fetch_one("SELECT id, status, deleted_at FROM accounts WHERE id = :id", {"id": account_id})
-    if not row:
-        raise HTTPException(404, detail="Account not found")
-    if row["deleted_at"]:
-        return {"status": "already_deleted", "id": account_id}
-    if row["status"] == "executing":
-        raise HTTPException(409, detail="Cannot delete an account while it is executing")
-
-    await database.execute(
-        """UPDATE accounts
-           SET status = 'frozen', encrypted_credential = '', proxy_id = NULL,
-               deleted_at = NOW(), deleted_by = :deleted_by,
-               delete_reason = 'operator soft delete', updated_at = NOW(), version = version + 1
-           WHERE id = :id""",
-        {"id": account_id, "deleted_by": actor["actor_id"]},
-    )
-    await database.execute("UPDATE login_sessions SET account_id = NULL WHERE account_id = :id", {"id": account_id})
+    async with database.transaction():
+        row = await lock_account_for_execution_contract_mutation(account_id)
+        if row["deleted_at"]:
+            return {"status": "already_deleted", "id": account_id}
+        if row["status"] == "executing":
+            raise HTTPException(409, detail="Cannot delete an account while it is executing")
+        updated = await execute_locked_account_update(
+            """UPDATE accounts
+               SET status = 'frozen', encrypted_credential = '', proxy_id = NULL,
+                   deleted_at = NOW(), deleted_by = :deleted_by,
+                   delete_reason = 'operator soft delete', updated_at = NOW(), version = version + 1,
+                   execution_revision = execution_revision + 1
+               WHERE id = :id AND status <> 'executing' AND deleted_at IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM account_operation_leases lease
+                   WHERE lease.account_id = accounts.id
+                     AND lease.released_at IS NULL
+                     AND lease.expires_at > NOW()
+                 )""",
+            {"id": account_id, "deleted_by": actor["actor_id"]},
+        )
+        if int(updated or 0) != 1:
+            raise HTTPException(409, detail="Account changed; delete was not applied")
+        await database.execute(
+            "UPDATE login_sessions SET account_id = NULL WHERE account_id = :id",
+            {"id": account_id},
+        )
     await audit_event(
         request,
         action="account.delete",
@@ -565,14 +691,22 @@ async def calibrate_account(account_id: int, data: AccountCalibrationRequest, re
         raise HTTPException(404, detail="Account not found")
     if row["credential_size"] == 0:
         raise HTTPException(400, detail="Cannot calibrate an account before importing a credential")
-    if row["status"] in {"executing", "banned"} and not data.force:
-        raise HTTPException(409, detail=f"Cannot calibrate account while status is {row['status']}")
-    await database.execute(
+    if row["status"] == "executing":
+        raise HTTPException(409, detail="Cannot calibrate an account while it is executing")
+    if row["status"] == "banned":
+        if not data.force:
+            raise HTTPException(409, detail="Cannot calibrate a banned account without an admin override")
+        require_min_role(request, "admin")
+        require_confirmation(request)
+    updated = await execute_affected_rows(
         """UPDATE accounts
            SET status = 'warming', updated_at = NOW(), version = version + 1
-           WHERE id = :id AND status NOT IN ('executing', 'banned')""",
+           WHERE id = :id AND status <> 'executing'""",
         {"id": account_id},
+        db=database,
     )
+    if int(updated or 0) != 1:
+        raise HTTPException(409, detail="Account started executing; calibration was not queued")
     calibration = await queue_account_calibration(account_id, row["platform"])
     await record_event(
         aggregate="account",
@@ -584,6 +718,193 @@ async def calibrate_account(account_id: int, data: AccountCalibrationRequest, re
         actor_id=actor["actor_id"],
     )
     return {"status": "queued", "calibration": calibration}
+
+
+@router.post("/{account_id}/weibo-oauth-capability-attestation")
+async def attest_weibo_oauth_capabilities(
+    account_id: int,
+    data: WeiboOAuthCapabilityAttestationRequest,
+    request: Request,
+):
+    """Queue identity verification for an independently admin-attested grant set."""
+
+    actor = require_min_role(request, "admin")
+    require_confirmation(request)
+    if data.confirm is not True:
+        raise HTTPException(409, detail="Weibo OAuth capability attestation body confirmation required")
+    review_status = data.app_review_status.strip().lower()
+    client_type = data.client_type.strip().lower()
+    if review_status not in {"approved", "test_only", "unknown"}:
+        raise HTTPException(
+            400,
+            detail={"code": "weibo_oauth_app_review_status_invalid"},
+        )
+    if client_type not in {"weibo", "other"}:
+        raise HTTPException(
+            400,
+            detail={"code": "weibo_oauth_client_type_invalid"},
+        )
+    grants = data.granted_actions
+    if (
+        not isinstance(grants, dict)
+        or set(grants) != set(WEIBO_ACTION_ORDER)
+        or any(type(value) is not bool for value in grants.values())
+    ):
+        raise HTTPException(
+            400,
+            detail={"code": "weibo_oauth_capability_contract_mismatch"},
+        )
+    normalized_grants = {
+        action: grants[action] for action in WEIBO_ACTION_ORDER
+    }
+    previous_account_status = None
+    calibration_id = str(uuid.uuid4())
+    attested_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    operator_attestation = {
+        "version": 1,
+        "attested_by": actor["actor_id"],
+        "attested_at": attested_at,
+        "app_review_status": review_status,
+        "client_type": client_type,
+        "granted_actions": normalized_grants,
+    }
+    check_url = "https://api.weibo.com/2/account/get_uid.json"
+    async with database.transaction():
+        locked = await lock_account_for_execution_contract_mutation(account_id)
+        previous_account_status = str(locked["status"] or "login_required")
+        if locked["deleted_at"]:
+            raise HTTPException(409, detail="Cannot attest a deleted account")
+        if str(locked["platform"]) != "weibo":
+            raise HTTPException(400, detail="OAuth capability attestation is Weibo-only")
+        if str(locked["status"]) in {"executing", "banned"}:
+            raise HTTPException(
+                409,
+                detail=f"Cannot attest capabilities while account is {locked['status']}",
+            )
+        credential_row = await database.fetch_one(
+            "SELECT encrypted_credential FROM accounts WHERE id = :id",
+            {"id": account_id},
+        )
+        if not credential_row or not credential_row["encrypted_credential"]:
+            raise HTTPException(400, detail="Weibo OAuth credential is required")
+        try:
+            decrypted = cookie_vault.decrypt(
+                credential_row["encrypted_credential"],
+                aad=CREDENTIAL_AAD,
+            )
+            parse_weibo_oauth_credential(decrypted)
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                detail={"code": "weibo_oauth_credential_invalid"},
+            ) from exc
+        await database.execute(
+            """INSERT INTO account_calibrations
+                 (calibration_id, platform, account_id, check_url, status, result)
+               VALUES
+                 (:calibration_id, 'weibo', :account_id, :check_url, 'queued', :result)""",
+            {
+                "calibration_id": calibration_id,
+                "account_id": account_id,
+                "check_url": check_url,
+                "result": json.dumps(
+                    {"operator_attestation": operator_attestation},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+        await database.execute(
+            """UPDATE accounts
+               SET status = 'warming', updated_at = NOW(), version = version + 1
+               WHERE id = :id""",
+            {"id": account_id},
+        )
+        await audit_event(
+            request,
+            action="account.weibo_oauth_capabilities.attest",
+            resource_type="account",
+            resource_id=account_id,
+            result="queued",
+            risk_level="critical",
+            detail={
+                "calibration_id": calibration_id,
+                "app_review_status": review_status,
+                "client_type": client_type,
+                "granted_actions": normalized_grants,
+            },
+        )
+    try:
+        await redis.xadd(
+            "account_calibration_requests",
+            {
+                "calibration_id": calibration_id,
+                "calibration_kind": "weibo_oauth_capability",
+                "platform": "weibo",
+                "account_id": str(account_id),
+                "check_url": check_url,
+            },
+        )
+    except Exception as exc:
+        async with database.transaction():
+            await database.execute(
+                """UPDATE account_calibrations
+                   SET status = 'failed',
+                       error_message = 'weibo_oauth_capability_queue_failed',
+                       finished_at = NOW()
+                   WHERE calibration_id = :calibration_id
+                     AND status = 'queued'""",
+                {"calibration_id": calibration_id},
+            )
+            await database.execute(
+                """UPDATE accounts a
+                   SET status = :previous_status, updated_at = NOW(),
+                       version = version + 1
+                   WHERE a.id = :account_id
+                     AND a.status = 'warming'
+                     AND a.deleted_at IS NULL
+                     AND (
+                       SELECT c.calibration_id
+                       FROM account_calibrations c
+                       WHERE c.account_id = a.id
+                       ORDER BY c.id DESC
+                       LIMIT 1
+                     ) = :calibration_id""",
+                {
+                    "account_id": account_id,
+                    "calibration_id": calibration_id,
+                    "previous_status": previous_account_status
+                    or "login_required",
+                },
+            )
+        raise HTTPException(
+            503,
+            detail={"code": "weibo_oauth_capability_queue_failed"},
+        ) from exc
+    await record_event(
+        aggregate="account",
+        aggregate_id=account_id,
+        event_type="WeiboOAuthCapabilitiesAttested",
+        payload={
+            "calibration_id": calibration_id,
+            "app_review_status": review_status,
+            "client_type": client_type,
+            "granted_actions": normalized_grants,
+            "attested_at": attested_at,
+        },
+        correlation_id=calibration_id,
+        actor_type="operator",
+        actor_id=actor["actor_id"],
+    )
+    return {
+        "status": "queued",
+        "calibration": {
+            "calibration_id": calibration_id,
+            "status": "queued",
+            "calibration_kind": "weibo_oauth_capability",
+        },
+        "attestation": operator_attestation,
+    }
 
 
 @router.get("/calibrations/{calibration_id}/screenshot")
@@ -604,8 +925,26 @@ async def queue_account_calibration(account_id: int, platform: str):
     platform_cfg = get_platform(platform)
     if not platform_cfg:
         raise HTTPException(400, detail=f"Unsupported platform: {platform}")
+    calibration_kind = "browser_session"
+    if platform == "weibo":
+        credential_row = await database.fetch_one(
+            "SELECT encrypted_credential FROM accounts WHERE id = :id",
+            {"id": account_id},
+        )
+        credential_kind = account_credential_kind(
+            platform,
+            credential_row["encrypted_credential"] if credential_row else None,
+        )
+        if credential_kind == "weibo_oauth":
+            calibration_kind = "weibo_oauth_identity"
+        elif credential_kind != "browser_session":
+            raise ValueError("account_credential_invalid")
     calibration_id = str(uuid.uuid4())
-    check_url = platform_cfg.get("account_check_url") or platform_cfg["login_url"]
+    check_url = (
+        "https://api.weibo.com/2/account/get_uid.json"
+        if calibration_kind == "weibo_oauth_identity"
+        else platform_cfg.get("account_check_url") or platform_cfg["login_url"]
+    )
     await database.execute(
         """INSERT INTO account_calibrations (calibration_id, platform, account_id, check_url, status)
            VALUES (:calibration_id, :platform, :account_id, :check_url, 'queued')""",
@@ -616,16 +955,54 @@ async def queue_account_calibration(account_id: int, platform: str):
             "check_url": check_url,
         },
     )
-    await redis.xadd(
-        "account_calibration_requests",
-        {
-            "calibration_id": calibration_id,
-            "platform": platform,
-            "account_id": str(account_id),
-            "check_url": check_url,
-        },
-    )
-    return {"calibration_id": calibration_id, "status": "queued", "check_url": check_url}
+    try:
+        await redis.xadd(
+            "account_calibration_requests",
+            {
+                "calibration_id": calibration_id,
+                "calibration_kind": calibration_kind,
+                "platform": platform,
+                "account_id": str(account_id),
+                "check_url": check_url,
+            },
+        )
+    except Exception:
+        async with database.transaction():
+            await database.execute(
+                """UPDATE account_calibrations
+                   SET status = 'failed',
+                       error_message = 'account_calibration_queue_failed',
+                       finished_at = NOW()
+                   WHERE calibration_id = :calibration_id
+                     AND status = 'queued'""",
+                {"calibration_id": calibration_id},
+            )
+            await database.execute(
+                """UPDATE accounts a
+                   SET status = 'login_required', updated_at = NOW(),
+                       version = version + 1
+                   WHERE a.id = :account_id
+                     AND a.status = 'warming'
+                     AND a.deleted_at IS NULL
+                     AND (
+                       SELECT c.calibration_id
+                       FROM account_calibrations c
+                       WHERE c.account_id = a.id
+                       ORDER BY c.id DESC
+                       LIMIT 1
+                     ) = :calibration_id""",
+                {
+                    "account_id": account_id,
+                    "calibration_id": calibration_id,
+                },
+            )
+        raise
+    return {
+        "calibration_id": calibration_id,
+        "status": "queued",
+        "calibration_kind": calibration_kind,
+        "check_url": check_url,
+    }
 
 
 def parse_json_field(value):
@@ -643,6 +1020,15 @@ def normalize_and_validate_credential(platform: str, payload: str) -> str:
     platform_cfg = get_platform(platform)
     if not platform_cfg:
         raise ValueError(f"Unsupported platform: {platform}")
+    if platform == "weibo":
+        try:
+            parsed = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict) and (
+            "credential_kind" in parsed or "access_token" in parsed
+        ):
+            return normalize_weibo_oauth_credential(payload)
     cookies = parse_cookie_payload(platform, payload)
     validate_required_cookies(cookies, platform_cfg.get("required_cookies", []))
     return json.dumps(cookies, ensure_ascii=False, separators=(",", ":"))
@@ -799,8 +1185,3 @@ async def validate_proxy_assignment(proxy_id: int, account_id: int | None = None
         raise HTTPException(400, detail="Cannot assign a dead proxy")
     if row["cooling_active"]:
         raise HTTPException(400, detail="Cannot assign a proxy that is in cooldown")
-
-
-def platform_selectors_complete(selector_config: dict, platform: str) -> bool:
-    configured = selector_config.get(platform, {})
-    return selector_config_complete(platform, configured)

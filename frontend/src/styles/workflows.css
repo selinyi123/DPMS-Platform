@@ -96,6 +96,70 @@
   background: var(--warning-bg);
 }
 
+.exact-payload-editor {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--surface-border);
+  border-radius: 10px;
+  background: var(--surface-muted-bg);
+}
+
+.exact-payload-editor legend {
+  padding: 0 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.exact-payload-editor label {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+.exact-payload-editor label > span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.exact-payload-editor .textarea {
+  min-height: 68px;
+}
+
+.manual-assisted-checklist {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--warning-text);
+  border-radius: 10px;
+  background: var(--warning-bg);
+}
+
+.manual-assisted-checklist ol {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.manual-assisted-checklist li {
+  display: grid;
+  grid-template-columns: auto minmax(72px, auto) minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.manual-exact-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .rule-action-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -62,6 +62,24 @@ class ChooseStrategyModeTests(unittest.TestCase):
         self.assertEqual(mode, "shadow_run")
         self.assertIn("shadow_validation_needed", reasons)
 
+    def test_manual_assisted_skips_unavailable_dry_run(self):
+        mode, reasons, blockers = choose_strategy_mode(
+            **{**READY_GATE, "dry_success": 0, "shadow_success": 0},
+            manual_assisted=True,
+        )
+        self.assertEqual(mode, "shadow_run")
+        self.assertEqual(reasons, ["manual_assisted_shadow_only"])
+        self.assertEqual(blockers, [])
+
+    def test_manual_assisted_does_not_bypass_hard_blockers(self):
+        mode, reasons, blockers = choose_strategy_mode(
+            **{**READY_GATE, "safe_accounts": 0},
+            manual_assisted=True,
+        )
+        self.assertEqual(mode, "blocked")
+        self.assertIn("no_safe_account", reasons)
+        self.assertTrue(blockers)
+
     def test_full_gate_recommends_real_run(self):
         mode, reasons, blockers = choose_strategy_mode(**READY_GATE)
         self.assertEqual(mode, "real_run")

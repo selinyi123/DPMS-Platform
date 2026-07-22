@@ -4,6 +4,7 @@ import { fetchJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
 import StatusBadge from '../components/StatusBadge';
 import { formatText } from '../i18n/format';
+import { lotteryActionsForPlatform } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
 
 export default function Dashboard() {
@@ -354,13 +355,15 @@ export default function Dashboard() {
                     <div className="mono">{platform.platform}</div>
                     <div className="small-text muted-text">{platform.label}</div>
                   </td>
-                  <td><StatusBadge status={platform.ready_for_dry_run ? 'ready' : 'pending'} /></td>
+                  <td>{platform.dry_run_supported === false
+                    ? <span className="badge badge-info">{t('dashboard.shadowOnly')}</span>
+                    : <StatusBadge status={platform.ready_for_dry_run ? 'ready' : 'pending'} />}</td>
                   <td><StatusBadge status={platform.ready_for_real_run ? 'ready' : 'pending'} /></td>
                   <td>{platform.safe_accounts}</td>
                   <td>
                     {platform.latest_probe ? (
                       <span className="mono small-text">
-                        {platform.latest_probe.ready_phase_count ?? '-'}/4 / {statusText(platform.latest_probe.status)}
+                        {platform.latest_probe.ready_phase_count ?? '-'}/{lotteryActionsForPlatform(platform.platform).length} / {statusText(platform.latest_probe.status)}
                       </span>
                     ) : (
                       <span className="badge badge-muted">{t('dashboard.noProbe')}</span>

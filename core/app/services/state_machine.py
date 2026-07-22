@@ -37,7 +37,10 @@ TRANSITIONS = {
 
     AccountStatus.READY: {AccountStatus.EXECUTING, AccountStatus.COOLING, AccountStatus.LOGIN_REQUIRED, AccountStatus.FROZEN},
 
-    AccountStatus.EXECUTING: {AccountStatus.READY, AccountStatus.COOLING, AccountStatus.LOGIN_REQUIRED, AccountStatus.BANNED},
+    # An operator must not release an account that a worker still owns. The
+    # worker/recovery settlement path performs the guarded executing -> ready
+    # transition; manual intervention may only quarantine it further.
+    AccountStatus.EXECUTING: {AccountStatus.COOLING, AccountStatus.LOGIN_REQUIRED, AccountStatus.BANNED},
 
     AccountStatus.COOLING: {AccountStatus.READY, AccountStatus.FROZEN, AccountStatus.LOGIN_REQUIRED},
 

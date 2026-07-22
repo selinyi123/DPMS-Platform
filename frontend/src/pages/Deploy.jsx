@@ -1,8 +1,32 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
 import { formatText } from '../i18n/format';
+import {
+  isManualAssistedPlan,
+  lotteryActionsForPlatform,
+  manualAssistedChecklist,
+  refreshedWorkflowBindings,
+  selectorExecutionEvidenceReady,
+  workflowActivityIdentity,
+  manualShadowObservation as readManualShadowObservation,
+} from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
+
+const REAL_RUN_EVIDENCE_TTL_MS = 65000;
+const REAL_RUN_EVIDENCE_REFRESH_MS = 60000;
+
+function manualOnlyHintKey(platform) {
+  if (platform === 'douyin') return 'deploy.douyinManualOnlyHint';
+  if (platform === 'weibo') return 'deploy.weiboManualOnlyHint';
+  return 'deploy.xiaohongshuManualOnlyHint';
+}
+
+function reviewedManualChecklist(evidence, platform) {
+  const rawPlan = evidence?.action_plan;
+  const plan = typeof rawPlan === 'string' ? safeJson(rawPlan) : rawPlan;
+  return manualAssistedChecklist(plan, platform);
+}
 
 export default function Deploy() {
   const { notify: toast, t } = useUi();
@@ -21,6 +45,8 @@ export default function Deploy() {
   const [adapterConfig, setAdapterConfig] = useState(null);
   const [runtimeSettings, setRuntimeSettings] = useState(null);
   const [realRunEvidence, setRealRunEvidence] = useState([]);
+  const [externalIntents, setExternalIntents] = useState([]);
+  const [reconciliationItems, setReconciliationItems] = useState([]);
   const [workflowBusy, setWorkflowBusy] = useState(false);
   const [realRunArmed, setRealRunArmed] = useState(false);
   const [rollbackArmed, setRollbackArmed] = useState(false);
@@ -30,38 +56,109 @@ export default function Deploy() {
   const [notify, setNotify] = useState({ channel: 'serverchan', title: 'DPMS test', content: 'Notification channel test' });
   const [platforms, setPlatforms] = useState([]);
   const [readinessPlatform, setReadinessPlatform] = useState('bilibili');
+  const workflowActivityIdentityRef = useRef('');
+  const evidenceBindingByPlatformRef = useRef(new Map());
+  const loadGenerationRef = useRef(0);
+  const evidenceLoadsInFlightRef = useRef(0);
+  const evidenceRefreshPendingRef = useRef(false);
+  const evidenceExpiryTimerRef = useRef(null);
+  const mountedRef = useRef(true);
 
-  const loadNotify = async () => {
-    const [channelRows, statusRows, guideRows, logRows, adapterRows, probeRows, taskRows, runtimeRows, evidenceRows, platformRows] = await Promise.all([
-      fetchJSON('/notify/channels'),
-      fetchJSON('/notify/status'),
-      fetchJSON('/notify/config-guide'),
-      fetchJSON('/notify/logs'),
-      fetchJSON('/lotteries/adapters/config'),
-      fetchJSON('/lotteries/probes'),
-      fetchJSON('/lotteries/tasks/runs'),
-      fetchJSON('/metrics/runtime/settings'),
-      fetchJSON('/lotteries/real-run/evidence'),
-      fetchJSON('/accounts/platforms'),
-    ]);
-    setChannels(channelRows);
-    setNotifyStatus(statusRows);
-    setNotifyGuide(guideRows);
-    setLogs(logRows);
-    setAdapterConfig(adapterRows);
-    setProbes(probeRows);
-    setTaskRuns(taskRows);
-    setRuntimeSettings(runtimeRows);
-    setRealRunEvidence(evidenceRows.items || []);
-    setPlatforms(platformRows);
+  const reportLoadError = (err) => {
+    if (!mountedRef.current) return;
+    const text = formatText(t('deploy.loadFailed'), { message: err.message });
+    setMessage(text);
+    toast(text, 'error');
+  };
+
+  const loadNotify = async (includeRealRunEvidence = true) => {
+    if (includeRealRunEvidence && evidenceLoadsInFlightRef.current > 0) {
+      evidenceRefreshPendingRef.current = true;
+      return;
+    }
+    if (!includeRealRunEvidence && evidenceLoadsInFlightRef.current > 0) return;
+    if (includeRealRunEvidence) {
+      evidenceLoadsInFlightRef.current += 1;
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+      if (mountedRef.current) setRealRunEvidence([]);
+    }
+    const generation = ++loadGenerationRef.current;
+    try {
+      const [
+        channelRows, statusRows, guideRows, logRows, adapterRows, probeRows,
+        taskRows, runtimeRows, evidenceRows, platformRows, intentRows,
+        reconciliationRows,
+      ] = await Promise.all([
+        fetchJSON('/notify/channels'),
+        fetchJSON('/notify/status'),
+        fetchJSON('/notify/config-guide'),
+        fetchJSON('/notify/logs'),
+        fetchJSON('/lotteries/adapters/config'),
+        fetchJSON('/lotteries/probes'),
+        fetchJSON('/lotteries/tasks/runs'),
+        fetchJSON('/metrics/runtime/settings'),
+        includeRealRunEvidence
+          ? fetchJSON('/lotteries/real-run/evidence')
+          : Promise.resolve(null),
+        fetchJSON('/accounts/platforms'),
+        fetchJSON('/metrics/external-action-intents?limit=50'),
+        fetchJSON('/metrics/reconciliation?limit=50'),
+      ]);
+      // A slow earlier poll must never overwrite a newer completion/evidence
+      // response. This also makes the active-light -> completed-heavy handoff
+      // deterministic without cancelling requests in the shared API wrapper.
+      if (generation !== loadGenerationRef.current) return;
+      setChannels(channelRows);
+      setNotifyStatus(statusRows);
+      setNotifyGuide(guideRows);
+      setLogs(logRows);
+      setAdapterConfig(adapterRows);
+      setProbes(probeRows);
+      setTaskRuns(taskRows);
+      setRuntimeSettings(runtimeRows);
+      setExternalIntents(intentRows.items || []);
+      setReconciliationItems(reconciliationRows.items || []);
+      if (evidenceRows) {
+        const evidenceItems = evidenceRows.items || [];
+        evidenceBindingByPlatformRef.current = refreshedWorkflowBindings(
+          evidenceBindingByPlatformRef.current,
+          evidenceItems,
+          probeRows,
+          taskRows,
+        );
+        setRealRunEvidence(evidenceItems);
+        window.clearTimeout(evidenceExpiryTimerRef.current);
+        evidenceExpiryTimerRef.current = window.setTimeout(() => {
+          if (mountedRef.current) setRealRunEvidence([]);
+        }, REAL_RUN_EVIDENCE_TTL_MS);
+      }
+      setPlatforms(platformRows);
+    } catch (err) {
+      if (generation !== loadGenerationRef.current) return;
+      throw err;
+    } finally {
+      if (includeRealRunEvidence) {
+        evidenceLoadsInFlightRef.current -= 1;
+        if (evidenceRefreshPendingRef.current && mountedRef.current) {
+          evidenceRefreshPendingRef.current = false;
+          void loadNotify(true).catch(reportLoadError);
+        }
+      }
+    }
   };
 
   useEffect(() => {
-    loadNotify().catch((err) => {
-      const text = formatText(t('deploy.loadFailed'), { message: err.message });
-      setMessage(text);
-      toast(text, 'error');
-    });
+    mountedRef.current = true;
+    const refreshEvidence = () => loadNotify(true).catch(reportLoadError);
+    void refreshEvidence();
+    const evidenceTimer = window.setInterval(refreshEvidence, REAL_RUN_EVIDENCE_REFRESH_MS);
+    return () => {
+      mountedRef.current = false;
+      evidenceRefreshPendingRef.current = false;
+      loadGenerationRef.current += 1;
+      window.clearInterval(evidenceTimer);
+      window.clearTimeout(evidenceExpiryTimerRef.current);
+    };
   }, [t, toast]);
 
   const restart = async () => {
@@ -219,12 +316,22 @@ export default function Deploy() {
     .filter(item => item.draft && validTargetIds.has(item.probe.lottery_id));
 
   const buildPlatformWorkflow = (platform) => {
+    const boundLotteryId = evidenceBindingByPlatformRef.current.get(platform) || null;
     const evidence = realRunEvidence.find(item => (
       item.platform === platform
       && item.target_valid
       && ['pending', 'claimed'].includes(item.status)
-    ));
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
+    )) || (!boundLotteryId ? realRunEvidence.find(item => (
+      item.platform === platform
+      && item.target_valid
+      && ['pending', 'claimed'].includes(item.status)
+    )) : null);
     const platformEvidence = realRunEvidence.find(item => item.platform === platform);
+    const manualAssisted = isManualAssistedPlan(
+      platform,
+      evidence?.action_plan || evidence?.execution_path_id || '',
+    );
     const invalidTarget = realRunEvidence.find(item => item.platform === platform && !item.target_valid);
     const adapter = adapterConfig?.platforms?.find(item => item.platform === platform);
     const probeCandidate = probeCandidates.find(item => (
@@ -232,36 +339,73 @@ export default function Deploy() {
       && item.probe.lottery_id === evidence?.lottery_id
     ));
     const selectorDraftReady = hasSelectorDraft(selectorJson, platform);
-    const nextAction = evidence?.next_action || 'add_target';
+    const reportedNextAction = evidence?.next_action || 'add_target';
+    const nextAction = manualAssisted && ['enable_real_run', 'real_run'].includes(reportedNextAction)
+      ? 'manual_assisted'
+      : reportedNextAction;
     const activeProbe = probes.find(item => (
       item.platform === platform
-      && item.lottery_id === evidence?.lottery_id
       && ['queued', 'running'].includes(item.status)
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
     ));
     const activeShadow = taskRuns.find(item => (
       item.platform === platform
-      && item.lottery_id === evidence?.lottery_id
       && item.task_mode === 'shadow_run'
       && ['queued', 'running'].includes(item.status)
+      && (!boundLotteryId || String(item.lottery_id) === String(boundLotteryId))
     ));
     const workflowActive = Boolean(activeProbe || activeShadow);
-    const readiness = buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate });
+    const activityIdentity = workflowActivityIdentity(platform, activeProbe, activeShadow);
+    const readiness = buildReadiness({
+      platform,
+      evidence,
+      platformEvidence,
+      adapter,
+      runtimeSettings,
+      probeCandidate,
+    });
     return {
       evidence, platformEvidence, invalidTarget, adapter, probeCandidate,
-      selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive, readiness,
+      selectorDraftReady, nextAction, activeProbe, activeShadow, workflowActive,
+      activityIdentity, readiness, manualAssisted,
     };
   };
 
   const workflow = buildPlatformWorkflow(readinessPlatform);
+  const workflowReadyForReal = Boolean(!workflow.manualAssisted && workflow.evidence?.allowed);
+  const manualShadowObservation = readManualShadowObservation(workflow.evidence);
+  const manualChecklist = reviewedManualChecklist(workflow.evidence, readinessPlatform);
   const readinessPlatformLabel = platforms.find(item => item.id === readinessPlatform)?.label || readinessPlatform;
 
   useEffect(() => {
-    if (!workflow.workflowActive) return undefined;
-    const timer = window.setInterval(() => {
-      loadNotify().catch(err => setMessage(err.message));
-    }, 4000);
-    return () => window.clearInterval(timer);
-  }, [workflow.workflowActive]);
+    if (!workflow.activityIdentity) return undefined;
+    let cancelled = false;
+    let timer;
+    const poll = async () => {
+      // Active workflow status is lightweight; the completion transition below
+      // performs one authoritative evidence refresh instead of hashing files
+      // every four seconds.
+      try {
+        await loadNotify(false);
+      } catch (err) {
+        setMessage(err.message);
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 4000);
+    };
+    timer = window.setTimeout(poll, 4000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [workflow.activityIdentity]);
+
+  useEffect(() => {
+    const previousIdentity = workflowActivityIdentityRef.current;
+    workflowActivityIdentityRef.current = workflow.activityIdentity;
+    if (previousIdentity && previousIdentity !== workflow.activityIdentity) {
+      loadNotify(true).catch(err => setMessage(err.message));
+    }
+  }, [workflow.activityIdentity]);
 
   const useProbeDraft = (item) => {
     setSelectorJson(JSON.stringify(item.draft, null, 2));
@@ -280,8 +424,14 @@ export default function Deploy() {
       return;
     }
 
-    const action = evidence.next_action;
+    const action = workflow.nextAction;
     const lotteryId = evidence.lottery_id;
+    if (workflow.manualAssisted && ['manual_assisted', 'enable_real_run', 'real_run'].includes(action)) {
+      const text = t(manualOnlyHintKey(readinessPlatform));
+      setMessage(text);
+      toast(text, 'warning');
+      return;
+    }
     setWorkflowBusy(true);
     try {
       let result;
@@ -479,11 +629,23 @@ export default function Deploy() {
       <div className="panel">
         <div className="notify-guide-head">
           <div>
-            <div className="panel-title">{formatText(t('deploy.realRunReadiness'), { platform: readinessPlatformLabel })}</div>
-            <p className="muted-text tight-text">{t('deploy.realRunReadinessHint')}</p>
+            <div className="panel-title">
+              {workflow.manualAssisted
+                ? formatText(t('deploy.manualAssistedReadiness'), { platform: readinessPlatformLabel })
+                : formatText(t('deploy.realRunReadiness'), { platform: readinessPlatformLabel })}
+            </div>
+            <p className="muted-text tight-text">
+              {t(workflow.manualAssisted
+                ? manualOnlyHintKey(readinessPlatform)
+                : 'deploy.realRunReadinessHint')}
+            </p>
           </div>
-          <span className={`badge ${workflow.evidence?.allowed ? 'badge-ready' : 'badge-warn'}`}>
-            {workflow.evidence?.allowed ? t('deploy.readyForReal') : t(`lotteries.nextActions.${workflow.nextAction}`)}
+          <span className={`badge ${workflowReadyForReal ? 'badge-ready' : 'badge-warn'}`}>
+            {workflow.manualAssisted
+              ? t('lotteries.manualAssistedOnly')
+              : (workflowReadyForReal
+                ? t('deploy.readyForReal')
+                : t(`lotteries.nextActions.${workflow.nextAction}`))}
           </span>
         </div>
         <div className="segmented platform-tabs">
@@ -523,6 +685,34 @@ export default function Deploy() {
             </div>
           </div>
         </div>
+        {workflow.manualAssisted && (
+          <div className="manual-assisted-checklist" role="note">
+            <div className="capability-row">
+              <strong>{t('deploy.manualChecklistTitle')}</strong>
+              <span className={`badge ${manualShadowObservation.complete ? 'badge-ready' : 'badge-muted'}`}>
+                {manualShadowObservation.complete
+                  ? t('lotteries.shadowEvidenceReady')
+                  : t('lotteries.shadowEvidenceMissing')}
+              </span>
+            </div>
+            <p className="small-text muted-text">{t('deploy.manualChecklistHint')}</p>
+            {manualChecklist.length ? (
+              <ol>
+                {manualChecklist.map(item => (
+                  <li key={item.action}>
+                    <span className="badge badge-warn">{t('lotteries.manualPending')}</span>
+                    <strong>{t(`lotteries.actions.${item.action}`)}</strong>
+                    {item.exactValue && (
+                      <span className="small-text manual-exact-value">{item.exactValue}</span>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="small-text muted-text">{t('deploy.manualChecklistUnavailable')}</p>
+            )}
+          </div>
+        )}
         <div className="bilibili-readiness-grid">
           {workflow.readiness.map(step => (
             <div className="bilibili-readiness-step" key={step.code}>
@@ -546,6 +736,7 @@ export default function Deploy() {
               || Boolean(workflow.activeProbe)
               || Boolean(workflow.activeShadow)
               || !workflow.evidence
+              || workflow.nextAction === 'manual_assisted'
               || ['add_account', 'review_risk', 'blocked'].includes(workflow.evidence?.next_action)
             }
             onClick={advanceWorkflow}
@@ -556,7 +747,9 @@ export default function Deploy() {
                 ? t('deploy.probeRunning')
                 : workflow.activeShadow
                   ? t('deploy.shadowRunning')
-                  : workflow.evidence?.next_action === 'real_run'
+                  : workflow.nextAction === 'manual_assisted'
+                    ? t('lotteries.manualAssistedOnly')
+                    : workflow.evidence?.next_action === 'real_run'
                     ? t('deploy.reviewRealRunTask')
                     : workflow.evidence?.next_action === 'enable_real_run'
                       ? t('deploy.reviewRealRunSwitchButton')
@@ -578,6 +771,87 @@ export default function Deploy() {
           <button className="btn-ghost" type="button" onClick={loadNotify}>
             {t('common.refresh')}
           </button>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="notify-guide-head">
+          <div>
+            <div className="panel-title">{t('deploy.reconciliationTitle')}</div>
+            <p className="muted-text tight-text">{t('deploy.reconciliationHint')}</p>
+          </div>
+          <span className={`badge ${reconciliationItems.length ? 'badge-danger' : 'badge-ready'}`}>
+            {formatText(t('deploy.reconciliationCount'), { count: reconciliationItems.length })}
+          </span>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t('deploy.task')}</th>
+                <th>{t('deploy.platform')}</th>
+                <th>{t('deploy.result')}</th>
+                <th>{t('deploy.unknownIntents')}</th>
+                <th>{t('deploy.succeededIntents')}</th>
+                <th>{t('deploy.updated')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reconciliationItems.map(item => (
+                <tr key={item.task_id}>
+                  <td className="mono" title={item.task_id}>{String(item.task_id || '').slice(0, 12)}</td>
+                  <td>{item.platform || '-'}</td>
+                  <td>
+                    <span className="badge badge-danger">
+                      {item.reconciliation_required ? t('deploy.reconciliationRequired') : item.task_status}
+                    </span>
+                  </td>
+                  <td>{item.unknown_effect_count || item.unknown_intent_count || 0}</td>
+                  <td>{item.succeeded_intent_count || 0}</td>
+                  <td className="small-text">{item.latest_intent_at || item.finished_at || '-'}</td>
+                </tr>
+              ))}
+              {!reconciliationItems.length && (
+                <tr><td colSpan="6" className="empty-cell">{t('deploy.noReconciliationItems')}</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="panel-title compact-title">{t('deploy.externalIntentTitle')}</div>
+        <p className="muted-text tight-text">{t('deploy.externalIntentHint')}</p>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{t('deploy.task')}</th>
+                <th>{t('deploy.action')}</th>
+                <th>{t('deploy.result')}</th>
+                <th>{t('deploy.effectCertainty')}</th>
+                <th>{t('deploy.attempt')}</th>
+                <th>{t('deploy.payloadHash')}</th>
+                <th>{t('deploy.updated')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {externalIntents.map(item => (
+                <tr key={item.intent_id}>
+                  <td className="mono" title={item.task_id}>{String(item.task_id || '').slice(0, 12)}</td>
+                  <td>{item.action || '-'}</td>
+                  <td>
+                    <span className={`badge ${intentStatusClass(item.status)}`}>{item.status || '-'}</span>
+                  </td>
+                  <td className="mono">{item.effect_certainty || '-'}</td>
+                  <td>{item.attempt_no || 0}</td>
+                  <td className="mono" title={item.payload_hash}>{shortHash(item.payload_hash)}</td>
+                  <td className="small-text">{item.updated_at || '-'}</td>
+                </tr>
+              ))}
+              {!externalIntents.length && (
+                <tr><td colSpan="7" className="empty-cell">{t('deploy.noExternalIntents')}</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -728,7 +1002,11 @@ export default function Deploy() {
               {adapterConfig?.platforms?.map(item => (
                 <div className="config-status-row" key={item.platform}>
                   <span className="mono">{item.platform}</span>
-                  <span className={`badge ${item.configured ? 'badge-ready' : 'badge-muted'}`}>{item.configured ? t('deploy.configured') : t('deploy.planned')}</span>
+                  <span className={`badge ${item.configured ? 'badge-ready' : 'badge-muted'}`}>
+                    {item.configured
+                      ? t(item.configuration_kind === 'observation' ? 'deploy.observationConfigured' : 'deploy.configured')
+                      : t('deploy.planned')}
+                  </span>
                   <button className="btn-ghost" type="button" onClick={() => clearSelectorConfig(item.platform)}>{t('deploy.clearRuntimeSelectors')}</button>
                 </div>
               ))}
@@ -760,7 +1038,7 @@ export default function Deploy() {
                       <td className="mono">{item.probe.probe_id?.slice(0, 8)}</td>
                       <td>{item.probe.platform}</td>
                       <td>{item.probe.lottery_id ? `L${item.probe.lottery_id}` : '-'}</td>
-                      <td>{probeReadyPhaseCount(item.probe)}/4</td>
+                      <td>{probeReadyPhaseCount(item.probe)}/{probePhaseTotal(item.probe)}</td>
                       <td><button className="btn-ghost" type="button" onClick={() => useProbeDraft(item)}>{t('deploy.useDraft')}</button></td>
                     </tr>
                   ))}
@@ -805,6 +1083,7 @@ const defaultSelectorJson = JSON.stringify(
       followed: ["text=followed"],
       liked: ["text=liked"],
       commented: { input: ["textarea"], submit: ["text=submit"], text: "Participate" },
+      favorited: ["text=favorited"],
       reposted: ["text=reposted"],
     },
   },
@@ -834,7 +1113,7 @@ function buildDraftFromProbe(probe) {
     return parsed._recommended_config;
   }
   const phases = {};
-  for (const phase of ['followed', 'liked', 'commented', 'reposted']) {
+  for (const phase of lotteryActionsForPlatform(probe.platform)) {
     const candidates = Array.isArray(parsed?.[phase]) ? parsed[phase] : [];
     const visible = candidates.find(item => item?.visible && item?.selector);
     if (visible) phases[phase] = [visible.selector];
@@ -848,10 +1127,30 @@ function probeReadyPhaseCount(probe) {
   return result?._summary?.ready_phase_count ?? Object.keys(buildDraftFromProbe(probe)?.[probe.platform] || {}).length;
 }
 
-function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
+function probePhaseTotal(probe) {
+  const result = typeof probe?.result === 'string' ? safeJson(probe.result) : probe?.result;
+  const requiredPhases = result?._summary?.required_phases;
+  return Array.isArray(requiredPhases) && requiredPhases.length
+    ? requiredPhases.length
+    : lotteryActionsForPlatform(probe?.platform).length;
+}
+
+function buildReadiness({ platform, evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
   const blockers = new Set(evidence?.blockers || []);
+  const manualAssisted = isManualAssistedPlan(
+    platform,
+    evidence?.action_plan || evidence?.execution_path_id || '',
+  );
+  const oauthExecution = evidence?.execution_mode === 'oauth';
+  const manualShadowObservation = readManualShadowObservation(evidence);
   const phaseCount = probeCandidate ? probeReadyPhaseCount(probeCandidate.probe) : 0;
-  return [
+  const phaseTotal = probeCandidate
+    ? probePhaseTotal(probeCandidate.probe)
+    : lotteryActionsForPlatform(platform).length;
+  const selectorEvidenceReady = selectorExecutionEvidenceReady(adapter, evidence);
+  const selectorEvidenceUnbound = blockers.has('api_path_probe_evidence_not_implemented')
+    || blockers.has('selector_config_evidence_binding_not_implemented');
+  const readiness = [
     {
       code: 'target',
       ready: Boolean(evidence?.target_valid),
@@ -868,27 +1167,45 @@ function buildReadiness({ evidence, platformEvidence, adapter, runtimeSettings, 
       code: 'probe',
       ready: Boolean(evidence?.probe_ready),
       severity: 'warning',
-      meta: evidence?.probe_ready ? 'complete' : `${phaseCount}/4`,
+      meta: oauthExecution
+        ? (evidence?.probe_ready ? 'OAuth capabilities verified' : 'OAuth capability proof required')
+        : (evidence?.probe_ready ? 'complete' : `${phaseCount}/${phaseTotal}`),
     },
     {
       code: 'selector',
-      ready: Boolean(adapter?.configured || evidence?.selector_ready),
+      ready: oauthExecution ? Boolean(evidence?.oauth_adapter_ready) : selectorEvidenceReady,
       severity: 'warning',
-      meta: adapter?.configured || evidence?.selector_ready ? 'configured' : 'missing',
+      meta: oauthExecution
+        ? (evidence?.oauth_adapter_ready ? 'official OAuth adapter' : 'OAuth adapter unavailable')
+        : (selectorEvidenceUnbound
+          ? 'evidence binding required'
+          : (selectorEvidenceReady ? 'configured' : 'missing')),
     },
     {
       code: 'shadow',
-      ready: Boolean(evidence?.shadow_ready),
+      ready: manualAssisted
+        ? manualShadowObservation.complete
+        : Boolean(evidence?.shadow_ready),
       severity: 'warning',
-      meta: evidence?.shadow_ready ? '24h ok' : blockers.has('recent_shadow_run_required') ? 'required' : 'unknown',
-    },
-    {
-      code: 'global',
-      ready: Boolean(runtimeSettings?.real_run_enabled),
-      severity: 'danger',
-      meta: runtimeSettings?.real_run_enabled ? 'enabled' : 'disabled',
+      meta: manualAssisted
+        ? (manualShadowObservation.complete ? 'observation complete' : 'observation required')
+        : (evidence?.shadow_ready
+          ? '24h ok'
+          : blockers.has('recent_shadow_run_required') ? 'required' : 'unknown'),
     },
   ];
+  readiness.push(manualAssisted ? {
+    code: 'manual',
+    ready: false,
+    severity: 'warning',
+    meta: 'manual only',
+  } : {
+    code: 'global',
+    ready: Boolean(runtimeSettings?.real_run_enabled),
+    severity: 'danger',
+    meta: runtimeSettings?.real_run_enabled ? 'enabled' : 'disabled',
+  });
+  return readiness;
 }
 
 function safeJson(value) {
@@ -902,6 +1219,18 @@ function safeJson(value) {
 function hasSelectorDraft(value, platform) {
   const parsed = safeJson(value);
   return Boolean(parsed?.[platform] && Object.keys(parsed[platform]).length);
+}
+
+function shortHash(value) {
+  const text = String(value || '');
+  return text ? `${text.slice(0, 12)}…` : '-';
+}
+
+function intentStatusClass(status) {
+  if (status === 'succeeded') return 'badge-ready';
+  if (['unknown', 'started'].includes(status)) return 'badge-danger';
+  if (status === 'failed') return 'badge-warn';
+  return 'badge-muted';
 }
 
 const secretFieldByEnv = {

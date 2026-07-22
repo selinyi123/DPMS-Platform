@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 
 from app.db import database, redis
@@ -5,11 +6,13 @@ from app.utils.log import structured_log
 
 
 WINDOW_SECONDS = 10 * 60
-WINDOW_MAX_ACTIONS = 2
+# This Redis window counts task starts. Per-target remote POST attempts,
+# including retries, are bounded separately by BiliEngineConfig.
+WINDOW_MAX_TASK_STARTS = 2
 DAILY_MAX_TASKS = 8
 # Xiaohongshu's risk control is known to be stricter than the other
 # platforms, so its accounts get tighter compliance limits by default.
-PLATFORM_WINDOW_MAX_ACTIONS = {
+PLATFORM_WINDOW_MAX_TASK_STARTS = {
     "xiaohongshu": 1,
 }
 PLATFORM_DAILY_MAX_TASKS = {
@@ -60,6 +63,18 @@ LOGIN_URL_MARKERS = (
 )
 
 
+class AccountStatusPersistenceFailed(RuntimeError):
+    """The canonical account risk state and audit commit could not be confirmed."""
+
+    def __init__(self, account_id: int, status: str, reason: str, cause: BaseException):
+        self.account_id = account_id
+        self.status = status
+        self.reason = reason
+        super().__init__(
+            f"account_status_persistence_failed:{account_id}:{status}:{type(cause).__name__}"
+        )
+
+
 async def ensure_account_can_run(account_id: int, platform: str | None = None) -> None:
     row = await database.fetch_one(
         "SELECT status, daily_task_count, encrypted_credential FROM accounts WHERE id = :id",
@@ -84,8 +99,10 @@ async def ensure_account_can_run(account_id: int, platform: str | None = None) -
     pipe.zcard(key)
     pipe.expire(key, WINDOW_SECONDS * 2)
     _, _, count, _ = await pipe.execute()
-    window_max_actions = PLATFORM_WINDOW_MAX_ACTIONS.get(platform or "", WINDOW_MAX_ACTIONS)
-    if count > window_max_actions:
+    window_max_task_starts = PLATFORM_WINDOW_MAX_TASK_STARTS.get(
+        platform or "", WINDOW_MAX_TASK_STARTS
+    )
+    if count > window_max_task_starts:
         await set_account_status(account_id, "cooling", "action_window")
         raise ValueError(f"Account {account_id} exceeded action window")
 
@@ -108,25 +125,61 @@ async def detect_page_risk(page, account_id: int, platform: str | None = None) -
 
 
 async def set_account_status(account_id: int, status: str, reason: str):
-    await database.execute(
-        "UPDATE accounts SET status = :status, updated_at = NOW(), version = version + 1 WHERE id = :id",
-        {"id": account_id, "status": status},
-    )
-    await database.execute(
-        """INSERT INTO risk_events (account_id, event_type, detail)
-           VALUES (:account_id, :event_type, JSON_OBJECT('reason', :reason))""",
-        {"account_id": account_id, "event_type": status, "reason": reason},
-    )
-    await redis.xadd(
-        "notify_events",
-        {
-            "event_type": "account_risk",
-            "severity": "warning" if status in {"cooling", "login_required"} else "critical",
-            "title": f"Account A{account_id} moved to {status}",
-            "content": f"Account A{account_id} status changed to {status}. Reason: {reason}",
-            "account_id": str(account_id),
-            "status": status,
-            "channels": "all",
-        },
-    )
+    try:
+        # The account state and its durable audit evidence form one safety
+        # settlement.  Committing only one of them either releases a risky
+        # account or makes the state change unauditable.
+        async with database.transaction():
+            await database.execute(
+                "UPDATE accounts SET status = :status, updated_at = NOW(), version = version + 1 WHERE id = :id",
+                {"id": account_id, "status": status},
+            )
+            await database.execute(
+                """INSERT INTO risk_events (account_id, event_type, detail)
+                   VALUES (:account_id, :event_type, JSON_OBJECT('reason', :reason))""",
+                {"account_id": account_id, "event_type": status, "reason": reason},
+            )
+    except asyncio.CancelledError:
+        # Preserve cooperative shutdown semantics.  The claimed task/message
+        # remains unsettled and Recovery applies the real-run quarantine path;
+        # a cancellation during commit cannot truthfully be classified as a
+        # confirmed rollback or a confirmed commit here.
+        raise
+    except Exception as exc:
+        raise AccountStatusPersistenceFailed(account_id, status, reason, exc) from exc
+
+    # Notification delivery is not part of the canonical safety settlement.
+    # A transient Redis outage must not turn an already-quarantined account
+    # into a failed task whose generic cleanup can release it again.
+    try:
+        notification_id = await redis.xadd(
+            "notify_events",
+            {
+                "event_type": "account_risk",
+                "severity": "warning" if status in {"cooling", "login_required"} else "critical",
+                "title": f"Account A{account_id} moved to {status}",
+                "content": f"Account A{account_id} status changed to {status}. Reason: {reason}",
+                "account_id": str(account_id),
+                "status": status,
+                "channels": "all",
+            },
+        )
+        if not notification_id:
+            structured_log(
+                "warning",
+                "account_status_notification_failed",
+                account_id=account_id,
+                status=status,
+                reason=reason,
+                failure="enqueue_unconfirmed",
+            )
+    except Exception as exc:
+        structured_log(
+            "warning",
+            "account_status_notification_failed",
+            account_id=account_id,
+            status=status,
+            reason=reason,
+            exception=exc,
+        )
     structured_log("warning", "account_status_changed", account_id=account_id, status=status, reason=reason)
