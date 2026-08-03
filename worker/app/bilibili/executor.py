@@ -49,11 +49,13 @@ class BilibiliApiExecutor:
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rand: Callable[[], float] = random.random,
+        before_action: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.client = client
         self.config = config or BiliEngineConfig()
         self._sleep = sleep
         self._rand = rand
+        self._before_action = before_action
 
     def _jittered(self, base: float) -> float:
         # [1-f, 1+f] * base, matching the reference's ±50% relay jitter but
@@ -65,11 +67,15 @@ class BilibiliApiExecutor:
         await self._sleep(self._jittered(self.config.action_wait))
 
     async def _do_action(self, name: str, call: Callable[[], Awaitable[CodeResult]]) -> CodeResult:
-        """Run one action, retrying only while its outcome is RETRY."""
+        """Run one action, re-checking the gate before every external attempt."""
+        if self._before_action is not None:
+            await self._before_action(name)
         result = await call()
         attempts = 1
         while result.outcome is Outcome.RETRY and attempts < self.config.action_max_attempts:
             await self._sleep(self._jittered(self.config.action_retry_base_wait * attempts))
+            if self._before_action is not None:
+                await self._before_action(name)
             result = await call()
             attempts += 1
         return result

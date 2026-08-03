@@ -19,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # worker/ -> impor
 import httpx
 
 from app.bilibili import wbi
-from app.bilibili.client import BilibiliApiClient, parse_cookie
+from app.bilibili.client import (
+    BilibiliApiActionOutcomeUnknown,
+    BilibiliApiClient,
+    parse_cookie,
+)
 from app.bilibili.config import BiliEngineConfig
 from app.bilibili.errors import Outcome, classify
 from app.bilibili.executor import BilibiliApiExecutor
@@ -212,6 +216,69 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(res.outcome, Outcome.CAPTCHA)
         self.assertIn("captcha/img.jpg", res.message)
 
+    async def test_get_retries_transport_failure(self):
+        attempts = 0
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise httpx.ConnectError("temporary read failure", request=request)
+            return _resp({"code": 0, "data": {"isLogin": True}}, request)
+
+        config = BiliEngineConfig(max_http_retries=2, http_retry_wait=0)
+        async with BilibiliApiClient(
+            COOKIE, config=config, transport=httpx.MockTransport(handle)
+        ) as client:
+            self.assertTrue(await client.check_login())
+        self.assertEqual(attempts, 3)
+
+    async def test_post_transport_failure_is_unknown_and_not_retried(self):
+        attempts = 0
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout("response lost", request=request)
+
+        config = BiliEngineConfig(max_http_retries=3, http_retry_wait=0)
+        async with BilibiliApiClient(
+            COOKIE, config=config, transport=httpx.MockTransport(handle)
+        ) as client:
+            with self.assertRaises(BilibiliApiActionOutcomeUnknown) as caught:
+                await client.like("dyn1")
+        self.assertEqual(caught.exception.action, "like")
+        self.assertEqual(attempts, 1)
+
+    async def test_post_5xx_is_unknown_and_not_retried(self):
+        attempts = 0
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, json={"code": -1}, request=request)
+
+        config = BiliEngineConfig(max_http_retries=3, http_retry_wait=0)
+        async with BilibiliApiClient(
+            COOKIE, config=config, transport=httpx.MockTransport(handle)
+        ) as client:
+            with self.assertRaises(BilibiliApiActionOutcomeUnknown):
+                await client.like("dyn1")
+        self.assertEqual(attempts, 1)
+
+    async def test_post_business_retry_result_is_still_classified(self):
+        attempts = 0
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return _resp({"code": 1000001}, request)
+
+        async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(handle)) as client:
+            result = await client.like("dyn1")
+        self.assertIs(result.outcome, Outcome.RETRY)
+        self.assertEqual(attempts, 1)
+
 
 class _FakeClient:
     """Records action calls and returns queued CodeResults."""
@@ -246,9 +313,15 @@ def _card(rid="rid1"):
 
 
 class ExecutorTests(unittest.IsolatedAsyncioTestCase):
-    def _exec(self, fake):
+    def _exec(self, fake, before_action=None):
         # no real waiting; deterministic jitter
-        return BilibiliApiExecutor(fake, BiliEngineConfig(), sleep=self._nosleep, rand=lambda: 0.5)
+        return BilibiliApiExecutor(
+            fake,
+            BiliEngineConfig(),
+            sleep=self._nosleep,
+            rand=lambda: 0.5,
+            before_action=before_action,
+        )
 
     async def _nosleep(self, _seconds):
         return None
@@ -271,6 +344,31 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         res = await self._exec(fake).participate(_card(), ["like"])
         self.assertTrue(res.success)
         self.assertEqual(fake.calls.count("like"), 2)
+
+    async def test_before_action_is_checked_before_every_retry_attempt(self):
+        fake = _FakeClient({"like": [classify("like", 1000001), classify("like", 0)]})
+        checked = []
+
+        async def before_action(action):
+            checked.append(action)
+
+        res = await self._exec(fake, before_action).participate(_card(), ["like"])
+        self.assertTrue(res.success)
+        self.assertEqual(checked, ["like", "like"])
+
+    async def test_gate_closing_after_first_action_blocks_second_action(self):
+        fake = _FakeClient({})
+        checked = []
+
+        async def before_action(action):
+            checked.append(action)
+            if len(checked) > 1:
+                raise RuntimeError("real_run_gate_blocked:real_run_disabled")
+
+        with self.assertRaisesRegex(RuntimeError, "real_run_disabled"):
+            await self._exec(fake, before_action).participate(_card(), ["follow", "like"])
+        self.assertEqual(checked, ["follow", "like"])
+        self.assertEqual(fake.calls, ["follow"])
 
     async def test_comment_skipped_without_rid(self):
         fake = _FakeClient({})

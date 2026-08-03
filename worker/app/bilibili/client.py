@@ -64,6 +64,20 @@ def _random_buvid3() -> str:
     return f"{secrets.token_hex(16).upper()}{secrets.randbelow(100000):05d}infoc"
 
 
+class BilibiliApiActionOutcomeUnknown(BiliApiError):
+    """A state-changing request may have reached Bilibili but was not confirmed.
+
+    Callers must not automatically replay the action.  A later durable journal
+    can route this state to reconciliation without pretending it is a normal
+    transport retry.
+    """
+
+    def __init__(self, action: str, reason: str) -> None:
+        self.action = action
+        self.reason = reason
+        super().__init__(f"bilibili_action_outcome_unknown:{action}:{reason}")
+
+
 class BilibiliApiClient:
     """A single-account Bilibili web-API client.
 
@@ -112,9 +126,24 @@ class BilibiliApiClient:
 
     # ----- low-level transport with retry -----
 
-    async def _request(self, method: str, url: str, **kw: Any) -> httpx.Response:
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        retry_safe: bool = True,
+        **kw: Any,
+    ) -> httpx.Response:
+        """Send a request, retrying only when replay is known to be safe.
+
+        Reads use the existing transport/5xx retry policy.  State-changing
+        requests pass ``retry_safe=False`` so a timeout or a 5xx response is
+        surfaced after exactly one attempt: the server may already have applied
+        the mutation even though the client did not receive a usable result.
+        """
         last: Exception | None = None
-        for attempt in range(self.config.max_http_retries + 1):
+        max_attempts = self.config.max_http_retries + 1 if retry_safe else 1
+        for attempt in range(max_attempts):
             try:
                 resp = await self._client.request(method, url, **kw)
                 if resp.status_code >= 500:
@@ -122,7 +151,9 @@ class BilibiliApiClient:
                 return resp
             except (httpx.TransportError, BiliApiError) as exc:
                 last = exc
-                if attempt >= self.config.max_http_retries:
+                if not retry_safe:
+                    raise
+                if attempt >= max_attempts - 1:
                     break
                 await asyncio.sleep(self.config.http_retry_wait)
         raise BiliApiError(f"request failed after retries: {url}") from last
@@ -141,17 +172,21 @@ class BilibiliApiClient:
     async def _post_action(self, action: str, url: str, data: dict) -> CodeResult:
         body = dict(data)
         body.setdefault("csrf", self.csrf)
-        resp = await self._request(
-            "POST",
-            url,
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
+        try:
+            resp = await self._request(
+                "POST",
+                url,
+                retry_safe=False,
+                data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        except (httpx.TransportError, BiliApiError) as exc:
+            raise BilibiliApiActionOutcomeUnknown(action, type(exc).__name__) from exc
         try:
             payload = resp.json()
+            code = int(payload.get("code", -1))
         except Exception as exc:  # noqa: BLE001
-            raise BiliApiError(f"non-JSON response from {url}: {resp.text[:200]}") from exc
-        code = int(payload.get("code", -1))
+            raise BilibiliApiActionOutcomeUnknown(action, "unclassifiable_response") from exc
         result = classify(action, code)
         # carry the captcha url through for the (future) OCR path
         if code == 12015:
