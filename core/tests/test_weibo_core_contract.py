@@ -25,6 +25,8 @@ from app.action_plan import (  # noqa: E402
     WEIBO_RIP_ACTIONS,
     ActionPlanV2Error,
     compute_action_plan_hash,
+    compute_config_hash,
+    compute_target_hash,
     default_execution_path_for_platform,
     validate_action_payload,
     validate_action_plan_v2,
@@ -33,6 +35,7 @@ from app.action_plan import (  # noqa: E402
 from app.adapter_config import platform_real_adapter_kind  # noqa: E402
 from app.api.accounts import (  # noqa: E402
     account_credential_kind,
+    attest_weibo_oauth_capabilities,
     list_accounts,
     queue_account_calibration,
 )
@@ -43,7 +46,11 @@ from app.api.lotteries import (  # noqa: E402
 )
 from app.api.metrics import weibo_oauth_capability_summary  # noqa: E402
 from app.config import settings  # noqa: E402
+from app.platform_modules.weibo import (  # noqa: E402
+    build_weibo_oauth_plan_binding,
+)
 from app.services.lottery_rules import parse_lottery_rule  # noqa: E402
+from app.services import real_run_readiness  # noqa: E402
 from app.services.real_run_readiness import (  # noqa: E402
     validate_weibo_oauth_capability_attestation,
     validate_weibo_oauth_contract,
@@ -128,10 +135,18 @@ def complete_weibo_plan(
     return plan
 
 
+TEST_CALIBRATION_ID = "00000000-0000-4000-8000-000000000001"
+OTHER_CALIBRATION_ID = "00000000-0000-4000-8000-000000000002"
+
+
+def calibration_id_for_account(account_id: int) -> str:
+    return f"00000000-0000-4000-8000-{int(account_id):012d}"
+
+
 def capability_result(
     *,
     now: datetime,
-    calibration_id: str = "calibration-1",
+    calibration_id: str = TEST_CALIBRATION_ID,
     account_id: int = 7,
     execution_revision: int = 3,
     app_review_status: str = "approved",
@@ -154,6 +169,9 @@ def capability_result(
             "method": "weibo_account_get_uid",
             "uid": "1234567890",
         },
+        "calibration_scope": "oauth_identity_and_capabilities",
+        "requires_manual_identity_review": False,
+        "account_status_target": "ready",
         "oauth_capabilities": {
             "contract_version": 1,
             "calibration_id": calibration_id,
@@ -188,6 +206,78 @@ class WeiboActionPlanTests(unittest.TestCase):
         self.assertEqual(
             WEIBO_RIP_ACTIONS,
             frozenset({"followed", "commented", "reposted"}),
+        )
+
+    def test_repair_binding_keeps_full_plan_identity_but_uses_subset_config(self):
+        plan = complete_weibo_plan()
+        lottery = {
+            "action_plan": plan,
+            "authoritative_rule_snapshot_id": plan["rule_snapshot_id"],
+            "rule_hash": plan["rule_hash"],
+            "action_plan_hash": plan["plan_hash"],
+            "canonical_url": (
+                "https://weibo.com/1234567890/AbCdEfGhI"
+            ),
+        }
+
+        no_rip = build_weibo_oauth_plan_binding(
+            lottery,
+            require_executable=True,
+            execution_revision=3,
+            execution_required_actions=("liked", "favorited"),
+        )
+        with_rip = build_weibo_oauth_plan_binding(
+            lottery,
+            require_executable=True,
+            execution_revision=3,
+            execution_required_actions=("commented",),
+            weibo_rip="8.8.8.8",
+        )
+
+        for binding in (no_rip, with_rip):
+            self.assertEqual(binding["action_plan_hash"], plan["plan_hash"])
+            self.assertEqual(
+                binding["required_actions"],
+                tuple(plan["required_actions"]),
+            )
+            self.assertEqual(binding["action_plan"], plan)
+        self.assertEqual(
+            set(no_rip["runtime_capability_requirements"]["actions"]),
+            {"liked", "favorited"},
+        )
+        self.assertEqual(
+            set(with_rip["runtime_capability_requirements"]["actions"]),
+            {"commented"},
+        )
+        self.assertEqual(
+            no_rip["config_hash"],
+            compute_config_hash(
+                {
+                    "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                    "execution_revision": 3,
+                    "runtime_capability_requirements": (
+                        weibo_runtime_capability_requirements(
+                            ("liked", "favorited")
+                        )
+                    ),
+                    "weibo_rip_hash": "",
+                }
+            ),
+        )
+        self.assertEqual(
+            with_rip["config_hash"],
+            compute_config_hash(
+                {
+                    "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                    "execution_revision": 3,
+                    "runtime_capability_requirements": (
+                        weibo_runtime_capability_requirements(
+                            ("commented",)
+                        )
+                    ),
+                    "weibo_rip_hash": weibo_rip_hmac("8.8.8.8"),
+                }
+            ),
         )
 
     def test_exact_friend_count_excludes_source_and_follow_handles(self):
@@ -471,7 +561,7 @@ class WeiboOAuthEvidenceTests(unittest.TestCase):
             "account_id": 7,
             "execution_revision": 3,
             "calibration_fresh": True,
-            "expected_calibration_id": "calibration-1",
+            "expected_calibration_id": TEST_CALIBRATION_ID,
             "expected_uid": "1234567890",
             "now": self.now,
         }
@@ -510,7 +600,7 @@ class WeiboOAuthEvidenceTests(unittest.TestCase):
         status = self.validate(
             result,
             execution_revision=4,
-            expected_calibration_id="other-calibration",
+            expected_calibration_id=OTHER_CALIBRATION_ID,
             expected_uid="999",
         )
 
@@ -539,6 +629,48 @@ class WeiboOAuthEvidenceTests(unittest.TestCase):
         )
         self.assertNotIn("must-not-survive", repr(status["evidence"]))
 
+    def test_outer_calibration_contract_matches_worker_gate(self):
+        for mutation, expected_blocker in (
+            (
+                lambda value: value.pop("account_status_target"),
+                "weibo_oauth_capability_contract_mismatch",
+            ),
+            (
+                lambda value: value.__setitem__(
+                    "requires_manual_identity_review",
+                    True,
+                ),
+                "weibo_oauth_identity_verification_required",
+            ),
+            (
+                lambda value: value.__setitem__(
+                    "calibration_scope",
+                    "identity_only",
+                ),
+                "weibo_oauth_identity_verification_required",
+            ),
+            (
+                lambda value: value.__setitem__(
+                    "refresh_token",
+                    "must-not-survive",
+                ),
+                "weibo_oauth_capability_contract_mismatch",
+            ),
+        ):
+            with self.subTest(expected_blocker=expected_blocker):
+                result = capability_result(now=self.now)
+                mutation(result)
+                status = self.validate(result)
+                self.assertFalse(status["ready"])
+                self.assertEqual(
+                    status["blockers"],
+                    [expected_blocker],
+                )
+                self.assertNotIn(
+                    "must-not-survive",
+                    repr(status["evidence"]),
+                )
+
     def test_partial_grant_does_not_mark_platform_fully_ready(self):
         result = capability_result(
             now=self.now,
@@ -552,7 +684,8 @@ class WeiboOAuthEvidenceTests(unittest.TestCase):
                     "result": result,
                     "calibration_fresh": True,
                 }
-            ]
+            ],
+            now=self.now,
         )
 
         self.assertEqual(summary["any_action_accounts"], 1)
@@ -663,7 +796,13 @@ class WeiboCredentialAndNetworkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "weibo_rip_hmac_input_invalid"):
             weibo_rip_hmac("127.0.0.1")
 
-    def test_rip_uses_overwritten_real_ip_and_ignores_spoofed_xff(self):
+    @patch.object(settings, "weibo_public_rip", "")
+    @patch.object(
+        settings,
+        "weibo_trusted_proxy_cidrs",
+        "172.18.0.0/16",
+    )
+    def test_rip_uses_trusted_proxy_real_ip_and_ignores_spoofed_xff(self):
         request = SimpleNamespace(
             headers={
                 "x-real-ip": "8.8.8.8",
@@ -674,9 +813,24 @@ class WeiboCredentialAndNetworkTests(unittest.TestCase):
 
         self.assertEqual(trusted_weibo_rip(request), "8.8.8.8")
 
-    def test_rip_fails_closed_without_public_trusted_ingress_value(self):
+    @patch.object(settings, "weibo_public_rip", "9.9.9.9")
+    @patch.object(settings, "weibo_trusted_proxy_cidrs", "")
+    def test_rip_uses_explicit_public_fallback_for_private_compose_peer(self):
         request = SimpleNamespace(
-            headers={"x-forwarded-for": "8.8.8.8"},
+            headers={
+                "x-real-ip": "8.8.8.8",
+                "x-forwarded-for": "1.2.3.4",
+            },
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        self.assertEqual(trusted_weibo_rip(request), "9.9.9.9")
+
+    @patch.object(settings, "weibo_public_rip", "")
+    @patch.object(settings, "weibo_trusted_proxy_cidrs", "")
+    def test_rip_rejects_spoofed_real_ip_from_untrusted_peer(self):
+        request = SimpleNamespace(
+            headers={"x-real-ip": "8.8.8.8"},
             client=SimpleNamespace(host="127.0.0.1"),
         )
 
@@ -763,6 +917,31 @@ class WeiboCredentialAndNetworkTests(unittest.TestCase):
             "browser_session",
         )
 
+    def test_legacy_unbound_oauth_is_not_classified_as_executable(self):
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        legacy_oauth = cookie_vault.encrypt(
+            json.dumps(
+                {
+                    "credential_kind": "weibo_oauth",
+                    "access_token": "safe-placeholder-token",
+                    "uid": "1234567890",
+                    "expires_at": future.isoformat().replace("+00:00", "Z"),
+                }
+            )
+        )
+        legacy_browser = cookie_vault.encrypt(
+            json.dumps([{"name": "SUB", "value": "legacy-session"}])
+        )
+
+        self.assertEqual(
+            "invalid",
+            account_credential_kind("weibo", legacy_oauth),
+        )
+        self.assertEqual(
+            "browser_session",
+            account_credential_kind("weibo", legacy_browser),
+        )
+
     def test_expired_oauth_keeps_kind_while_freshness_gate_rejects_it(self):
         expired = cookie_vault.encrypt(
             json.dumps(
@@ -810,7 +989,9 @@ class WeiboAccountSelectionTests(unittest.IsolatedAsyncioTestCase):
             "status": "ready",
             "encrypted_credential": credential,
             "execution_revision": 3,
-            "latest_calibration_id": f"calibration-{account_id}",
+            "latest_calibration_id": calibration_id_for_account(
+                account_id
+            ),
             "latest_calibration_status": "succeeded",
             "latest_calibration_result": result or {},
             "latest_calibration_fresh": True,
@@ -823,7 +1004,7 @@ class WeiboAccountSelectionTests(unittest.IsolatedAsyncioTestCase):
             self.oauth_envelope(),
             capability_result(
                 now=now,
-                calibration_id="calibration-2",
+                calibration_id=calibration_id_for_account(2),
                 account_id=2,
                 execution_revision=3,
             ),
@@ -943,7 +1124,7 @@ class WeiboAccountSelectionTests(unittest.IsolatedAsyncioTestCase):
             "status": "ready",
             "execution_revision": 3,
             "encrypted_credential": self.oauth_envelope(),
-            "calibration_id": "calibration-1",
+            "calibration_id": TEST_CALIBRATION_ID,
             "calibration_status": "succeeded",
             "calibration_result": capability_result(now=now),
             "calibration_fresh": True,
@@ -981,6 +1162,292 @@ class WeiboAccountSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             manual_validator.await_args.kwargs["manual_shadow_supported"]
         )
+
+    async def test_repair_gate_checks_capabilities_for_requested_subset_only(self):
+        now = datetime.now(timezone.utc)
+        for requested in (
+            ("liked", "favorited"),
+            ("commented",),
+        ):
+            with self.subTest(requested=requested):
+                account = {
+                    "id": 7,
+                    "status": "ready",
+                    "execution_revision": 3,
+                    "encrypted_credential": self.oauth_envelope(),
+                    "calibration_id": TEST_CALIBRATION_ID,
+                    "calibration_status": "succeeded",
+                    "calibration_result": capability_result(
+                        now=now,
+                        denied=tuple(
+                            action
+                            for action in WEIBO_ACTION_ORDER
+                            if action not in requested
+                        ),
+                    ),
+                    "calibration_fresh": True,
+                }
+                with patch(
+                    "app.services.real_run_readiness.validate_manual_only_contract",
+                    new=AsyncMock(
+                        return_value={
+                            "blockers": [],
+                            "action_plan_ready": True,
+                        }
+                    ),
+                ), patch(
+                    "app.services.real_run_readiness.database.fetch_one",
+                    new=AsyncMock(
+                        side_effect=[
+                            account,
+                            {"task_id": "dry-task-1"},
+                        ]
+                    ),
+                ), patch(
+                    "app.services.real_run_readiness.recent_account_risk",
+                    new=AsyncMock(
+                        return_value={"has_recent_risk": False}
+                    ),
+                ):
+                    result = await validate_weibo_oauth_contract(
+                        {
+                            "id": 81,
+                            "canonical_url": (
+                                "https://weibo.com/1234567890/AbCdEfGhI"
+                            ),
+                            "action_plan": complete_weibo_plan(),
+                        },
+                        account_id=7,
+                        execution_required_actions=requested,
+                    )
+
+                self.assertTrue(result["allowed"])
+                self.assertEqual(
+                    result["oauth_capability_denied_actions"],
+                    [],
+                )
+
+    async def test_oauth_gate_uses_account_scoped_batch_without_db_reads(self):
+        now = datetime.now(timezone.utc)
+        action_plan = complete_weibo_plan()
+        validated_plan = validate_action_plan_v2(
+            action_plan,
+            require_executable=True,
+        )
+        canonical_url = (
+            "https://weibo.com/1234567890/AbCdEfGhI"
+        )
+        config_hash = compute_config_hash(
+            {
+                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                "execution_revision": 3,
+                "runtime_capability_requirements": (
+                    validated_plan.runtime_capability_requirements
+                ),
+                "weibo_rip_hash": "",
+            }
+        )
+        batch = real_run_readiness.RealRunEvidenceBatch(
+            account_id=None,
+            account_ids=frozenset({7}),
+            account_scoped_readiness=True,
+            accounts={
+                7: {
+                    "id": 7,
+                    "platform": "weibo",
+                    "status": "ready",
+                    "execution_revision": 3,
+                    "encrypted_credential": self.oauth_envelope(),
+                    "calibration_id": TEST_CALIBRATION_ID,
+                    "calibration_status": "succeeded",
+                    "calibration_result": capability_result(now=now),
+                    "calibration_fresh": True,
+                }
+            },
+            account_risks={
+                7: real_run_readiness.account_risk_payload(None)
+            },
+            weibo_oauth_dry_runs={
+                (81, 7): [
+                    {
+                        "id": 1,
+                        "task_id": "dry-task-1",
+                        "lottery_id": 81,
+                        "account_id": 7,
+                        "rule_snapshot_id": (
+                            validated_plan.rule_snapshot_id
+                        ),
+                        "execution_path_id": (
+                            WEIBO_OAUTH_EXECUTION_PATH
+                        ),
+                        "target_hash": compute_target_hash(canonical_url),
+                        "rule_hash": validated_plan.rule_hash,
+                        "action_plan_hash": validated_plan.plan_hash,
+                        "config_hash": config_hash,
+                    }
+                ]
+            },
+        )
+
+        with patch(
+            "app.services.real_run_readiness.validate_manual_only_contract",
+            new=AsyncMock(
+                return_value={
+                    "blockers": [],
+                    "action_plan_ready": True,
+                    "selector_observation_complete": False,
+                }
+            ),
+        ), patch(
+            "app.services.real_run_readiness.database.fetch_one",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    "batched readiness performed a DB read"
+                )
+            ),
+        ), patch(
+            "app.services.real_run_readiness.database.fetch_all",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    "batched readiness performed a DB read"
+                )
+            ),
+        ), patch(
+            "app.services.real_run_readiness.cookie_vault.decrypt_strict",
+            wraps=real_run_readiness.cookie_vault.decrypt_strict,
+        ) as decrypt:
+            result = await validate_weibo_oauth_contract(
+                {
+                    "id": 81,
+                    "canonical_url": canonical_url,
+                    "action_plan": action_plan,
+                },
+                account_id=7,
+                evidence_batch=batch,
+            )
+            repeated_result = await validate_weibo_oauth_contract(
+                {
+                    "id": 81,
+                    "canonical_url": canonical_url,
+                    "action_plan": action_plan,
+                },
+                account_id=7,
+                evidence_batch=batch,
+            )
+
+        self.assertTrue(result["allowed"])
+        self.assertTrue(repeated_result["allowed"])
+        self.assertTrue(result["oauth_capability_ready"])
+        self.assertTrue(result["oauth_dry_run_ready"])
+        self.assertEqual(decrypt.call_count, 1)
+
+    async def test_oauth_gate_rejects_legacy_unbound_ciphertext(self):
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        legacy_oauth = cookie_vault.encrypt(
+            json.dumps(
+                {
+                    "credential_kind": "weibo_oauth",
+                    "access_token": "safe-placeholder-token",
+                    "uid": "1234567890",
+                    "expires_at": future.isoformat().replace("+00:00", "Z"),
+                }
+            )
+        )
+        account = {
+            "id": 7,
+            "status": "ready",
+            "execution_revision": 3,
+            "encrypted_credential": legacy_oauth,
+            "calibration_id": TEST_CALIBRATION_ID,
+            "calibration_status": "succeeded",
+            "calibration_result": capability_result(now=datetime.now(timezone.utc)),
+            "calibration_fresh": True,
+        }
+        with patch(
+            "app.services.real_run_readiness.validate_manual_only_contract",
+            new=AsyncMock(
+                return_value={"blockers": [], "action_plan_ready": True}
+            ),
+        ), patch(
+            "app.services.real_run_readiness.database.fetch_one",
+            new=AsyncMock(side_effect=[account, None]),
+        ), patch(
+            "app.services.real_run_readiness.recent_account_risk",
+            new=AsyncMock(return_value={"has_recent_risk": False}),
+        ):
+            result = await validate_weibo_oauth_contract(
+                {
+                    "id": 81,
+                    "canonical_url": "https://weibo.com/1234567890/AbCdEfGhI",
+                    "action_plan": complete_weibo_plan(),
+                },
+                account_id=7,
+            )
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("weibo_oauth_credential_invalid", result["blockers"])
+
+    async def test_oauth_attestation_rejects_legacy_unbound_ciphertext(self):
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        legacy_oauth = cookie_vault.encrypt(
+            json.dumps(
+                {
+                    "credential_kind": "weibo_oauth",
+                    "access_token": "safe-placeholder-token",
+                    "uid": "1234567890",
+                    "expires_at": future.isoformat().replace("+00:00", "Z"),
+                }
+            )
+        )
+
+        class Transaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        request_data = SimpleNamespace(
+            confirm=True,
+            app_review_status="approved",
+            client_type="weibo",
+            granted_actions={action: True for action in WEIBO_ACTION_ORDER},
+        )
+        execute = AsyncMock()
+        with patch(
+            "app.api.accounts.require_min_role",
+            return_value={"actor_id": "admin-1"},
+        ), patch("app.api.accounts.require_confirmation"), patch(
+            "app.api.accounts.database.transaction",
+            return_value=Transaction(),
+        ), patch(
+            "app.api.accounts.lock_account_for_execution_contract_mutation",
+            new=AsyncMock(
+                return_value={
+                    "status": "ready",
+                    "deleted_at": None,
+                    "platform": "weibo",
+                }
+            ),
+        ), patch(
+            "app.api.accounts.database.fetch_one",
+            new=AsyncMock(
+                return_value={"encrypted_credential": legacy_oauth}
+            ),
+        ), patch("app.api.accounts.database.execute", new=execute):
+            with self.assertRaises(HTTPException) as caught:
+                await attest_weibo_oauth_capabilities(
+                    7,
+                    request_data,
+                    SimpleNamespace(),
+                )
+
+        self.assertEqual(400, caught.exception.status_code)
+        self.assertEqual(
+            {"code": "weibo_oauth_credential_invalid"},
+            caught.exception.detail,
+        )
+        execute.assert_not_awaited()
 
 
 class WeiboAccountApiTests(unittest.IsolatedAsyncioTestCase):
@@ -1039,17 +1506,28 @@ class WeiboAccountApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_oauth_identity_calibration_kind_reaches_worker_queue(self):
         fetch = AsyncMock(return_value={"encrypted_credential": self.oauth_envelope()})
         execute = AsyncMock(return_value=1)
-        xadd = AsyncMock(return_value="1-0")
-        with patch("app.api.accounts.database.fetch_one", new=fetch), patch(
-            "app.api.accounts.database.execute", new=execute
-        ), patch(
-            "app.api.accounts.redis._conn",
-            new=SimpleNamespace(xadd=xadd),
+
+        class Transaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        fake_database = SimpleNamespace(
+            fetch_one=fetch,
+            execute=execute,
+            transaction=lambda: Transaction(),
+        )
+        enqueue = AsyncMock()
+        with patch("app.api.accounts.database", new=fake_database), patch(
+            "app.api.accounts.enqueue_account_calibration_outbox",
+            new=enqueue,
         ):
             queued = await queue_account_calibration(7, "weibo")
 
-        stream, fields = xadd.await_args.args
-        self.assertEqual(stream, "account_calibration_requests")
+        fields = enqueue.await_args.args[0]
+        self.assertEqual(fields["platform"], "weibo")
         self.assertEqual(fields["calibration_kind"], "weibo_oauth_identity")
         self.assertNotIn("access_token", repr(fields))
         self.assertEqual(queued["calibration_kind"], "weibo_oauth_identity")

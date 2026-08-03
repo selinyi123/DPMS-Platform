@@ -10,6 +10,7 @@ os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.api.lotteries import (  # noqa: E402
+    RealRunCompletionAuthority,
     protected_source_rule_text,
     update_lottery_action_plan,
 )
@@ -81,6 +82,68 @@ class ProtectedSourceRuleTextTests(unittest.TestCase):
 
 
 class ActionPlanUpdateTransactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_partial_real_effects_block_plan_edit_before_snapshot_write(self):
+        database = RecordingDatabase(
+            {
+                "id": 6,
+                "platform": "bilibili",
+                "rule_text": "点赞并评论",
+                "status": "pending",
+                "execution_lock": None,
+                "current_intent_id": (
+                    "00000000-0000-4000-8000-000000000001"
+                ),
+            }
+        )
+        data = LotteryActionPlanUpdate(
+            required_actions=["liked", "commented"],
+            reviewed=True,
+        )
+        ensure_snapshot = AsyncMock()
+        current_intent = object()
+
+        with (
+            patch("app.api.lotteries.database", database),
+            patch(
+                "app.api.lotteries.require_min_role",
+                return_value={"actor_id": "operator-1"},
+            ),
+            patch(
+                "app.api.lotteries.load_real_run_completion_authority",
+                new=AsyncMock(
+                    return_value=RealRunCompletionAuthority(
+                        completed_actions=("liked",),
+                    )
+                ),
+            ) as load_authority,
+            patch(
+                "app.api.lotteries.load_lottery_execution_intent",
+                new=AsyncMock(return_value=current_intent),
+            ),
+            patch(
+                "app.api.lotteries.ensure_rule_snapshot",
+                new=ensure_snapshot,
+            ),
+        ):
+            with self.assertRaises(HTTPException) as caught:
+                await update_lottery_action_plan(6, data, object())
+
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(
+            caught.exception.detail["code"],
+            "confirmed_real_actions_require_frozen_plan",
+        )
+        load_authority.assert_awaited_once_with(
+            6,
+            "bilibili",
+            for_update=True,
+            execution_intent=current_intent,
+        )
+        ensure_snapshot.assert_not_awaited()
+        self.assertFalse(
+            any(call[0] == "execute" for call in database.calls)
+        )
+
     async def test_locked_read_and_update_share_one_transaction(self):
         database = RecordingDatabase(
             {

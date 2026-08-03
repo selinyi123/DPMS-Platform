@@ -9,17 +9,22 @@ os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.action_plan import (  # noqa: E402
+    DOUYIN_DEVICE_EXECUTION_PATH,
     DOUYIN_MANUAL_EXECUTION_PATH,
     DOUYIN_NO_OFFICIAL_API_BLOCKER,
     compute_action_plan_hash,
     compute_rule_hash,
 )
+from app.api.accounts import queue_account_calibration  # noqa: E402
 from app.api.lotteries import update_lottery_action_plan  # noqa: E402
 from app.models.schemas import LotteryActionPlanUpdate  # noqa: E402
 from app.services import real_run_readiness  # noqa: E402
 from app.services.real_run_readiness import (  # noqa: E402
     qualified_douyin_manual_shadow_observation,
     validate_real_run_evidence,
+)
+from shared.douyin_device_contract import (  # noqa: E402
+    DOUYIN_DEVICE_CALIBRATION_CHECK_URL,
 )
 
 
@@ -153,7 +158,7 @@ class ReadinessDatabase:
 
 
 class DouyinActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
-    async def test_review_saves_variable_manual_plan_with_safe_default_path(self):
+    async def test_review_saves_variable_plan_with_device_default_path(self):
         database = ActionPlanDatabase()
         data = LotteryActionPlanUpdate(
             required_actions=["favorited", "commented", "followed", "liked"],
@@ -184,15 +189,91 @@ class DouyinActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
 
         plan = result["action_plan"]
         self.assertEqual(list(REQUIRED_ACTIONS), plan["required_actions"])
-        self.assertEqual(DOUYIN_MANUAL_EXECUTION_PATH, plan["execution_path_id"])
-        self.assertFalse(plan["executable"])
-        self.assertEqual(
-            [DOUYIN_NO_OFFICIAL_API_BLOCKER], plan["capability_blockers"]
-        )
+        self.assertEqual(DOUYIN_DEVICE_EXECUTION_PATH, plan["execution_path_id"])
+        self.assertTrue(plan["executable"])
+        self.assertEqual([], plan["capability_blockers"])
         self.assertEqual(["@抖音博主"], plan["content_requirements"]["follow_targets"])
         self.assertEqual(
             plan,
             json.loads(database.saved_values["action_plan"]),
+        )
+
+    async def test_manual_authoring_and_readiness_share_the_same_blocker(self):
+        database = ActionPlanDatabase()
+        data = LotteryActionPlanUpdate(
+            required_actions=list(REQUIRED_ACTIONS),
+            reviewed=True,
+            rule_complete_confirmed=True,
+            execution_path_id=DOUYIN_MANUAL_EXECUTION_PATH,
+            action_payloads=complete_douyin_plan()["action_payloads"],
+        )
+        with (
+            patch("app.api.lotteries.database", database),
+            patch(
+                "app.api.lotteries.require_min_role",
+                return_value={"actor_id": "operator-1"},
+            ),
+            patch("app.api.lotteries.audit_event", new=AsyncMock()),
+            patch("app.api.lotteries._record_post_commit_event", new=AsyncMock()),
+        ):
+            authored = await update_lottery_action_plan(51, data, object())
+
+        plan = authored["action_plan"]
+        self.assertFalse(plan["executable"])
+        self.assertEqual(
+            [DOUYIN_NO_OFFICIAL_API_BLOCKER], plan["capability_blockers"]
+        )
+        with patch.object(real_run_readiness, "database", ReadinessDatabase()):
+            readiness = await validate_real_run_evidence(lottery_row(plan))
+        self.assertTrue(readiness["action_plan_ready"])
+        self.assertIn(DOUYIN_NO_OFFICIAL_API_BLOCKER, readiness["blockers"])
+        self.assertNotIn(
+            "action_plan_capability_binding_mismatch", readiness["blockers"]
+        )
+
+
+class DouyinDeviceAccountQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def test_device_account_queues_read_only_device_calibration(self):
+        class QueueDatabase:
+            def __init__(self):
+                self.messages = []
+
+            def transaction(self):
+                return Transaction()
+
+            async def fetch_one(self, _query, _values=None):
+                return {"encrypted_credential": b"device-envelope"}
+
+            async def execute(self, query, values=None):
+                if "INSERT INTO account_calibrations" in query:
+                    self.messages.append(dict(values or {}))
+                return 1
+
+        database = QueueDatabase()
+        outbox = AsyncMock()
+        with (
+            patch("app.api.accounts.database", database),
+            patch(
+                "app.api.accounts.account_credential_kind",
+                return_value="device_agent",
+            ),
+            patch(
+                "app.api.accounts.enqueue_account_calibration_outbox",
+                outbox,
+            ),
+        ):
+            queued = await queue_account_calibration(7, "douyin")
+
+        self.assertEqual("device_agent", queued["calibration_kind"])
+        self.assertEqual(
+            DOUYIN_DEVICE_CALIBRATION_CHECK_URL, queued["check_url"]
+        )
+        self.assertEqual(
+            DOUYIN_DEVICE_CALIBRATION_CHECK_URL,
+            database.messages[0]["check_url"],
+        )
+        self.assertEqual(
+            "device_agent", outbox.await_args.args[0]["calibration_kind"]
         )
 
 
@@ -217,7 +298,8 @@ class DouyinReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["allowed"])
         self.assertFalse(result["action_plan_ready"])
         self.assertIn("lottery_action_plan_v2_required", result["blockers"])
-        self.assertIn(DOUYIN_NO_OFFICIAL_API_BLOCKER, result["blockers"])
+        self.assertIn("douyin_device_config_invalid", result["blockers"])
+        self.assertIn("execution_account_scope_required", result["blockers"])
 
 
 class DouyinManualObservationTests(unittest.TestCase):

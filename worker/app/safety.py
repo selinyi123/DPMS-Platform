@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 
-from app.db import database, redis
+from app.db import database, execute_affected_rows, redis
 from app.utils.log import structured_log
 
 
@@ -75,6 +75,18 @@ class AccountStatusPersistenceFailed(RuntimeError):
         )
 
 
+class AccountExecutionRevisionMismatch(RuntimeError):
+    """A stale operation tried to write safety state for replaced credentials."""
+
+    def __init__(self, account_id: int, expected_execution_revision: int):
+        self.account_id = account_id
+        self.expected_execution_revision = expected_execution_revision
+        super().__init__(
+            "account_execution_revision_mismatch:"
+            f"{account_id}:{expected_execution_revision}"
+        )
+
+
 async def ensure_account_can_run(account_id: int, platform: str | None = None) -> None:
     row = await database.fetch_one(
         "SELECT status, daily_task_count, encrypted_credential FROM accounts WHERE id = :id",
@@ -107,10 +119,21 @@ async def ensure_account_can_run(account_id: int, platform: str | None = None) -
         raise ValueError(f"Account {account_id} exceeded action window")
 
 
-async def detect_page_risk(page, account_id: int, platform: str | None = None) -> None:
+async def detect_page_risk(
+    page,
+    account_id: int,
+    platform: str | None = None,
+    *,
+    expected_execution_revision: int | None = None,
+) -> None:
     current_url = str(getattr(page, "url", "") or "").lower()
     if any(marker in current_url for marker in LOGIN_URL_MARKERS):
-        await set_account_status(account_id, "login_required", "redirected_to_login")
+        await set_account_status(
+            account_id,
+            "login_required",
+            "redirected_to_login",
+            expected_execution_revision=expected_execution_revision,
+        )
         raise ValueError(f"Login is required for account {account_id}")
     try:
         body = await page.locator("body").text_content(timeout=2000)
@@ -120,20 +143,51 @@ async def detect_page_risk(page, account_id: int, platform: str | None = None) -
     lower = body.lower()
     risk_texts = RISK_TEXTS + PLATFORM_RISK_TEXTS.get(platform or "", [])
     if any(text.lower() in lower for text in risk_texts):
-        await set_account_status(account_id, "cooling", "page_risk_signal")
+        await set_account_status(
+            account_id,
+            "cooling",
+            "page_risk_signal",
+            expected_execution_revision=expected_execution_revision,
+        )
         raise ValueError(f"Risk signal detected on page for account {account_id}")
 
 
-async def set_account_status(account_id: int, status: str, reason: str):
+async def set_account_status(
+    account_id: int,
+    status: str,
+    reason: str,
+    *,
+    expected_execution_revision: int | None = None,
+):
     try:
         # The account state and its durable audit evidence form one safety
         # settlement.  Committing only one of them either releases a risky
         # account or makes the state change unauditable.
         async with database.transaction():
-            await database.execute(
-                "UPDATE accounts SET status = :status, updated_at = NOW(), version = version + 1 WHERE id = :id",
-                {"id": account_id, "status": status},
-            )
+            if expected_execution_revision is None:
+                await database.execute(
+                    "UPDATE accounts SET status = :status, updated_at = NOW(), version = version + 1 WHERE id = :id",
+                    {"id": account_id, "status": status},
+                )
+            else:
+                affected = await execute_affected_rows(
+                    """UPDATE accounts
+                          SET status = :status, updated_at = NOW(),
+                              version = version + 1
+                        WHERE id = :id
+                          AND deleted_at IS NULL
+                          AND execution_revision = :execution_revision""",
+                    {
+                        "id": account_id,
+                        "status": status,
+                        "execution_revision": expected_execution_revision,
+                    },
+                    db=database,
+                )
+                if affected != 1:
+                    raise AccountExecutionRevisionMismatch(
+                        account_id, expected_execution_revision
+                    )
             await database.execute(
                 """INSERT INTO risk_events (account_id, event_type, detail)
                    VALUES (:account_id, :event_type, JSON_OBJECT('reason', :reason))""",
@@ -144,6 +198,8 @@ async def set_account_status(account_id: int, status: str, reason: str):
         # remains unsettled and Recovery applies the real-run quarantine path;
         # a cancellation during commit cannot truthfully be classified as a
         # confirmed rollback or a confirmed commit here.
+        raise
+    except AccountExecutionRevisionMismatch:
         raise
     except Exception as exc:
         raise AccountStatusPersistenceFailed(account_id, status, reason, exc) from exc

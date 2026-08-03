@@ -1,0 +1,31 @@
+# Fixed Redis Stream consumer-group topology. Fields are: stream<TAB>group.
+# This deployment manifest must stay byte-for-byte equivalent to
+# shared.redis_consumer_groups.REDIS_CONSUMER_GROUP_SPECS.
+lottery_tasks:bilibili	workers:bilibili
+lottery_tasks:weibo	workers:weibo
+lottery_tasks:xiaohongshu	workers:xiaohongshu
+lottery_tasks:douyin	workers:douyin
+lottery_repair_tasks:v1:bilibili	repair-workers:v1:bilibili
+lottery_repair_tasks:v1:weibo	repair-workers:v1:weibo
+lottery_repair_tasks:v1:xiaohongshu	repair-workers:v1:xiaohongshu
+lottery_repair_tasks:v1:douyin	repair-workers:v1:douyin
+lottery_tasks	workers
+adapter_probe_requests:bilibili	adapter-probers:bilibili
+adapter_probe_requests:weibo	adapter-probers:weibo
+adapter_probe_requests:xiaohongshu	adapter-probers:xiaohongshu
+adapter_probe_requests:douyin	adapter-probers:douyin
+adapter_probe_requests	adapter-probers
+adapter_probe_requests	adapter-probers:legacy-fanout
+account_calibration_requests:bilibili	account-calibrators:bilibili
+account_calibration_requests:weibo	account-calibrators:weibo
+account_calibration_requests:xiaohongshu	account-calibrators:xiaohongshu
+account_calibration_requests:douyin	account-calibrators:douyin
+account_calibration_requests	account-calibrators
+account_calibration_requests	account-calibrators:legacy-fanout
+discovery_scan_requests:v1:bilibili	discovery-platform-runners:v1:bilibili
+discovery_scan_requests:v1:weibo	discovery-platform-runners:v1:weibo
+discovery_scan_requests:v1:xiaohongshu	discovery-platform-runners:v1:xiaohongshu
+discovery_scan_requests:v1:douyin	discovery-platform-runners:v1:douyin
+xiaohongshu_target_pursuit_requests:v1	xiaohongshu-target-pursuers:v1
+notify_events	notify-dispatchers
+login_requests	login-workers

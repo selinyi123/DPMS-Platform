@@ -179,10 +179,44 @@ class BilibiliPreflightEvidenceTests(unittest.TestCase):
             DYNAMIC_ID,
             extract_bilibili_dynamic_id(f"https://www.bilibili.com/opus/{DYNAMIC_ID}"),
         )
-        with self.assertRaisesRegex(
-            BilibiliPreflightEvidenceError, "bilibili_dynamic_target_required"
+        self.assertEqual(
+            DYNAMIC_ID,
+            extract_bilibili_dynamic_id(
+                f"canonical://bilibili/dynamic/opus_{DYNAMIC_ID}"
+            ),
+        )
+        for target in (
+            "https://www.bilibili.com/video/BV1example",
+            "http://t.bilibili.com/123456789012",
+            "https://t.bilibili.com:444/123456789012",
+            "https://t.bilibili.com:443@evil.example/123456789012",
+            f"canonical://bilibili:123/dynamic/{DYNAMIC_ID}",
+            f"canonical://bilibili:not-a-port/dynamic/{DYNAMIC_ID}",
+            f"canonical://operator@bilibili/dynamic/{DYNAMIC_ID}",
+            "https://t.bilibili.com/" + "\uff11" * 12,
+            "https://t.bilibili.com/" + "1" * 21,
+            "\uff11" * 12,
+            "1" * 21,
         ):
-            extract_bilibili_dynamic_id("https://www.bilibili.com/video/BV1example")
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(
+                    BilibiliPreflightEvidenceError,
+                    "bilibili_dynamic_target_required",
+                ):
+                    extract_bilibili_dynamic_id(target)
+
+    def test_dynamic_id_extraction_fails_closed_for_malformed_canonical_authority(self):
+        for target in (
+            f"canonical://[bilibili/dynamic/{DYNAMIC_ID}",
+            f"canonical://bilibili／evil/dynamic/{DYNAMIC_ID}",
+            f"canonical://bilibili：443/dynamic/{DYNAMIC_ID}",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(
+                    BilibiliPreflightEvidenceError,
+                    "bilibili_dynamic_target_required",
+                ):
+                    extract_bilibili_dynamic_id(target)
 
 
 if __name__ == "__main__":

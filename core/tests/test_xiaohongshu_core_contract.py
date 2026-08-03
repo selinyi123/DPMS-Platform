@@ -11,10 +11,14 @@ os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.action_plan import (  # noqa: E402
     XIAOHONGSHU_ACTION_ORDER,
+    XIAOHONGSHU_BROWSER_EXECUTION_PATH,
     XIAOHONGSHU_MANUAL_EXECUTION_PATH,
     XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
     compute_action_plan_hash,
     compute_rule_hash,
+)
+from app.platform_modules.catalog import (  # noqa: E402
+    XIAOHONGSHU_MANUAL_EXECUTION_BLOCKER,
 )
 from app.api.lotteries import (  # noqa: E402
     dispatch_lottery,
@@ -69,7 +73,7 @@ def complete_xiaohongshu_plan(snapshot_id=501):
         "unresolved_requirements": [],
         "ambiguity_patterns": [],
         "payload_validation_errors": [],
-        "capability_blockers": [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
+        "capability_blockers": [XIAOHONGSHU_MANUAL_EXECUTION_BLOCKER],
     }
     plan["plan_hash"] = compute_action_plan_hash(plan)
     return plan
@@ -153,7 +157,7 @@ class XiaohongshuActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("bilibili_api_v2", data.execution_path_id)
         self.assertNotIn("execution_path_id", data.model_fields_set)
 
-    async def test_review_saves_exact_manual_four_action_checklist(self):
+    async def test_review_defaults_to_exact_executable_browser_plan(self):
         database = ActionPlanDatabase()
         data = LotteryActionPlanUpdate(
             required_actions=["commented", "favorited", "followed", "liked"],
@@ -181,7 +185,8 @@ class XiaohongshuActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
         plan = result["action_plan"]
         self.assertEqual(list(XIAOHONGSHU_ACTION_ORDER), plan["required_actions"])
         self.assertEqual(
-            XIAOHONGSHU_MANUAL_EXECUTION_PATH, plan["execution_path_id"]
+            XIAOHONGSHU_BROWSER_EXECUTION_PATH,
+            plan["execution_path_id"],
         )
         self.assertEqual(
             "已认真阅读，参与抽奖",
@@ -192,11 +197,46 @@ class XiaohongshuActionPlanApiTests(unittest.IsolatedAsyncioTestCase):
             plan["content_requirements"]["follow_targets"],
         )
         self.assertFalse(plan["review_required"])
+        self.assertTrue(plan["executable"])
+        self.assertEqual([], plan["capability_blockers"])
+
+    async def test_api_authored_manual_fallback_is_shadow_review_ready(self):
+        database = ActionPlanDatabase()
+        data = LotteryActionPlanUpdate(
+            required_actions=list(XIAOHONGSHU_ACTION_ORDER),
+            reviewed=True,
+            rule_complete_confirmed=True,
+            execution_path_id=XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+            action_payloads={
+                "followed": {"target_handle": "@creator"},
+                "liked": {},
+                "commented": {"text": "exact comment"},
+                "favorited": {},
+            },
+        )
+
+        with (
+            patch("app.api.lotteries.database", database),
+            patch(
+                "app.api.lotteries.require_min_role",
+                return_value={"actor_id": "operator-1"},
+            ),
+            patch("app.api.lotteries.audit_event", new=AsyncMock()),
+            patch("app.api.lotteries._record_post_commit_event", new=AsyncMock()),
+        ):
+            result = await update_lottery_action_plan(41, data, object())
+
+        plan = result["action_plan"]
         self.assertFalse(plan["executable"])
         self.assertEqual(
-            [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
+            [XIAOHONGSHU_MANUAL_EXECUTION_BLOCKER],
             plan["capability_blockers"],
         )
+        readiness_database = ReadinessDatabase()
+        with patch.object(real_run_readiness, "database", readiness_database):
+            readiness = await validate_real_run_evidence(lottery_row(plan))
+        self.assertTrue(readiness["action_plan_ready"])
+        self.assertEqual("manual_assisted", readiness["execution_mode"])
 
     async def test_comment_presence_without_exact_text_cannot_be_reviewed(self):
         database = ActionPlanDatabase()
@@ -284,7 +324,7 @@ class XiaohongshuReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["action_plan_ready"])
         self.assertFalse(result["allowed"])
-        self.assertIn(XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER, result["blockers"])
+        self.assertIn(XIAOHONGSHU_MANUAL_EXECUTION_BLOCKER, result["blockers"])
         self.assertEqual("manual_assisted", result["execution_mode"])
         self.assertTrue(result["manual_shadow_supported"])
         self.assertTrue(result["manual_confirmation_required"])
@@ -301,7 +341,10 @@ class XiaohongshuReadinessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["action_plan_ready"])
         self.assertIn("lottery_action_plan_v2_required", result["blockers"])
-        self.assertIn(XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER, result["blockers"])
+        self.assertIn(
+            "xiaohongshu_selector_config_incomplete",
+            result["blockers"],
+        )
 
     async def test_manual_plan_claiming_executable_fails_closed(self):
         plan = complete_xiaohongshu_plan()
@@ -318,12 +361,12 @@ class XiaohongshuReadinessTests(unittest.IsolatedAsyncioTestCase):
             result["blockers"],
         )
 
-    async def test_selector_config_never_becomes_a_real_adapter(self):
+    async def test_real_selector_config_cannot_promote_a_manual_plan(self):
         selector_config = {
             "xiaohongshu": {
                 "followed": {"click": ["f"], "done": ["fd"]},
                 "liked": {"click": ["l"], "done": ["ld"]},
-                "reposted": {"click": ["r"], "done": ["rd"]},
+                "favorited": {"click": ["r"], "done": ["rd"]},
                 "commented": {
                     "input": ["c"],
                     "submit": ["s"],
@@ -344,12 +387,12 @@ class XiaohongshuReadinessTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        self.assertFalse(result["adapter_enabled"])
-        self.assertEqual("manual_assisted", result["adapter_kind"])
+        self.assertTrue(result["adapter_enabled"])
+        self.assertEqual("selector", result["adapter_kind"])
         self.assertFalse(result["allowed"])
         self.assertEqual("manual_assisted", result["next_action"])
-        self.assertIn("real_adapter_not_enabled", result["blockers"])
-        self.assertIn(XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER, result["blockers"])
+        self.assertNotIn("real_adapter_not_enabled", result["blockers"])
+        self.assertIn(XIAOHONGSHU_MANUAL_EXECUTION_BLOCKER, result["blockers"])
 
 
 class XiaohongshuManualShadowObservationTests(unittest.TestCase):
@@ -470,7 +513,7 @@ class XiaohongshuDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(409, caught.exception.status_code)
         self.assertEqual(
-            [XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER],
+            ["xiaohongshu_manual_execution_selected"],
             caught.exception.detail["blockers"],
         )
         runtime_switch.assert_not_awaited()

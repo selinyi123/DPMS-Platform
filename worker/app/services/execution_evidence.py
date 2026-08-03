@@ -9,6 +9,7 @@ from typing import Any, Mapping, Protocol
 
 from app.action_plan import (
     BILIBILI_API_EXECUTION_PATH,
+    XIAOHONGSHU_BROWSER_EXECUTION_PATH,
     ActionPlanV2Error,
     compute_bilibili_api_config_hash,
     compute_rule_hash,
@@ -20,6 +21,24 @@ from app.bilibili.preflight import (
     validate_preflight_observation,
 )
 from app.bilibili.runtime import extract_bilibili_dynamic_id
+from shared.xiaohongshu_browser_contract import (
+    XIAOHONGSHU_BROWSER_PROBE_OBSERVATION_KIND,
+    XIAOHONGSHU_BROWSER_SHADOW_OBSERVATION_KIND,
+    XiaohongshuBrowserContractError,
+    compute_xiaohongshu_browser_config_hash,
+    compute_xiaohongshu_comment_text_hash,
+    validate_xiaohongshu_browser_observation,
+)
+from shared.douyin_device_contract import (
+    DOUYIN_DEVICE_EXECUTION_PATH,
+    DOUYIN_DEVICE_PROBE_OBSERVATION_KIND,
+    DOUYIN_DEVICE_SHADOW_OBSERVATION_KIND,
+    DouyinDeviceContractError,
+    compute_douyin_device_config_hash,
+    compute_douyin_exact_text_hash,
+    normalize_douyin_device_public_config,
+    validate_douyin_device_observation,
+)
 
 
 API_PROBE_KIND = API_PREFLIGHT_KIND
@@ -83,9 +102,19 @@ def _contract_from_row(row: Any) -> EvidenceContract:
         contract.action_plan_hash,
         contract.config_hash,
     )
+    valid_execution_path = (
+        contract.platform == "bilibili"
+        and contract.execution_path_id == BILIBILI_API_EXECUTION_PATH
+    ) or (
+        contract.platform == "xiaohongshu"
+        and contract.execution_path_id
+        == XIAOHONGSHU_BROWSER_EXECUTION_PATH
+    ) or (
+        contract.platform == "douyin"
+        and contract.execution_path_id == DOUYIN_DEVICE_EXECUTION_PATH
+    )
     if (
-        contract.platform != "bilibili"
-        or contract.execution_path_id != BILIBILI_API_EXECUTION_PATH
+        not valid_execution_path
         or any(
             len(value) != 64
             or any(character not in "0123456789abcdef" for character in value)
@@ -120,7 +149,31 @@ def _probe_proves_api_path(
     expected_actions: tuple[str, ...] | None = None,
     expected_execution_revision: int | None = None,
     expected_follow_handle: str | None = None,
+    expected_xiaohongshu: Mapping[str, Any] | None = None,
+    expected_douyin: Mapping[str, Any] | None = None,
 ) -> bool:
+    if contract is not None and contract.platform == "xiaohongshu":
+        return _xiaohongshu_source_proves_browser_path(
+            row,
+            contract,
+            observation_field="result",
+            observation_kind_field="observation_kind",
+            observation_hash_field="observation_hash",
+            expected_kind=XIAOHONGSHU_BROWSER_PROBE_OBSERVATION_KIND,
+            evidence_id_field="probe_id",
+            expected=expected_xiaohongshu,
+        )
+    if contract is not None and contract.platform == "douyin":
+        return _douyin_source_proves_device_path(
+            row,
+            contract,
+            observation_field="result",
+            observation_kind_field="observation_kind",
+            observation_hash_field="observation_hash",
+            expected_kind=DOUYIN_DEVICE_PROBE_OBSERVATION_KIND,
+            evidence_id_field="probe_id",
+            expected=expected_douyin,
+        )
     try:
         result = _json_object(_row_get(row, "result"))
         dynamic_id = (
@@ -172,7 +225,31 @@ def _shadow_proves_api_path(
     expected_actions: tuple[str, ...] | None = None,
     expected_execution_revision: int | None = None,
     expected_follow_handle: str | None = None,
+    expected_xiaohongshu: Mapping[str, Any] | None = None,
+    expected_douyin: Mapping[str, Any] | None = None,
 ) -> bool:
+    if contract is not None and contract.platform == "xiaohongshu":
+        return _xiaohongshu_source_proves_browser_path(
+            row,
+            contract,
+            observation_field="preflight_observation",
+            observation_kind_field="preflight_observation_kind",
+            observation_hash_field="preflight_observation_hash",
+            expected_kind=XIAOHONGSHU_BROWSER_SHADOW_OBSERVATION_KIND,
+            evidence_id_field="task_id",
+            expected=expected_xiaohongshu,
+        )
+    if contract is not None and contract.platform == "douyin":
+        return _douyin_source_proves_device_path(
+            row,
+            contract,
+            observation_field="preflight_observation",
+            observation_kind_field="preflight_observation_kind",
+            observation_hash_field="preflight_observation_hash",
+            expected_kind=DOUYIN_DEVICE_SHADOW_OBSERVATION_KIND,
+            evidence_id_field="task_id",
+            expected=expected_douyin,
+        )
     try:
         result = _json_object(_row_get(row, "preflight_observation"))
         dynamic_id = (
@@ -213,6 +290,129 @@ def _shadow_proves_api_path(
         == str(_row_get(row, "preflight_observation_hash") or "").strip()
         and str(_row_get(row, "preflight_observation_kind") or "").strip()
         == API_PROBE_KIND
+    )
+
+
+def _xiaohongshu_source_proves_browser_path(
+    row: Any,
+    contract: EvidenceContract,
+    *,
+    observation_field: str,
+    observation_kind_field: str,
+    observation_hash_field: str,
+    expected_kind: str,
+    evidence_id_field: str,
+    expected: Mapping[str, Any] | None,
+) -> bool:
+    """Validate one XHS source against either its row or locked authority."""
+
+    try:
+        observation = _json_object(_row_get(row, observation_field))
+        expected_values = dict(expected or {})
+        if not expected_values:
+            expected_values = {
+                "expected_lottery_id": contract.lottery_id,
+                "expected_account_id": contract.account_id,
+                "expected_execution_revision": observation.get(
+                    "execution_revision"
+                ),
+                "expected_target_hash": contract.target_hash,
+                "expected_rule_snapshot_id": contract.rule_snapshot_id,
+                "expected_rule_hash": contract.rule_hash,
+                "expected_action_plan_hash": contract.action_plan_hash,
+                "expected_config_hash": contract.config_hash,
+                "expected_actions": observation.get("required_actions"),
+                "expected_follow_target_handle": observation.get(
+                    "follow_target_handle", ""
+                ),
+                "expected_comment_text_hash": observation.get(
+                    "comment_text_hash", ""
+                ),
+            }
+        validated = validate_xiaohongshu_browser_observation(
+            observation,
+            expected_observation_kind=expected_kind,
+            expected_evidence_id=str(
+                _row_get(row, evidence_id_field) or ""
+            ).strip(),
+            **expected_values,
+        )
+    except (
+        XiaohongshuBrowserContractError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return False
+    return bool(
+        validated.observation_hash
+        == str(_row_get(row, observation_hash_field) or "").strip()
+        and str(_row_get(row, observation_kind_field) or "").strip()
+        == expected_kind
+    )
+
+
+def _douyin_source_proves_device_path(
+    row: Any,
+    contract: EvidenceContract,
+    *,
+    observation_field: str,
+    observation_kind_field: str,
+    observation_hash_field: str,
+    expected_kind: str,
+    evidence_id_field: str,
+    expected: Mapping[str, Any] | None,
+) -> bool:
+    try:
+        observation = _json_object(_row_get(row, observation_field))
+        expected_values = dict(expected or {})
+        if not expected_values:
+            expected_values = {
+                "expected_lottery_id": contract.lottery_id,
+                "expected_account_id": contract.account_id,
+                "expected_execution_revision": observation.get("execution_revision"),
+                "expected_target_hash": contract.target_hash,
+                "expected_rule_snapshot_id": contract.rule_snapshot_id,
+                "expected_rule_hash": contract.rule_hash,
+                "expected_action_plan_hash": contract.action_plan_hash,
+                "expected_config_hash": contract.config_hash,
+                "expected_actions": observation.get("required_actions"),
+                "expected_follow_target_handle_hash": observation.get(
+                    "follow_target_handle_hash", ""
+                ),
+                "expected_comment_text_hash": observation.get(
+                    "comment_text_hash", ""
+                ),
+                "expected_public_config": {
+                    key: observation.get(key)
+                    for key in (
+                        "agent_id",
+                        "manifest_sha256",
+                        "device_serial_sha256",
+                        "account_id_sha256",
+                    )
+                },
+            }
+        validated = validate_douyin_device_observation(
+            observation,
+            expected_observation_kind=expected_kind,
+            expected_evidence_id=str(_row_get(row, evidence_id_field) or "").strip(),
+            **expected_values,
+        )
+    except (
+        DouyinDeviceContractError,
+        TypeError,
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return False
+    return bool(
+        validated.observation_hash
+        == str(_row_get(row, observation_hash_field) or "").strip()
+        and str(_row_get(row, observation_kind_field) or "").strip()
+        == expected_kind
     )
 
 
@@ -330,12 +530,15 @@ async def _materialize(
                       rs.rule_text AS snapshot_rule_text,
                       rs.is_complete, rs.attested_by, rs.attested_at,
                       a.platform AS account_platform, a.status AS account_status,
-                      a.execution_revision
+                      a.execution_revision,
+                      selector_config.config_json AS selector_config_json
                FROM lotteries l
                JOIN lottery_rule_snapshots rs
                  ON rs.id = l.authoritative_rule_snapshot_id
                 AND rs.lottery_id = l.id
                JOIN accounts a ON a.id = :account_id
+               LEFT JOIN adapter_selector_configs selector_config
+                 ON selector_config.platform = l.platform
                WHERE l.id = :lottery_id
                FOR UPDATE""",
             {"lottery_id": contract.lottery_id, "account_id": contract.account_id},
@@ -347,19 +550,45 @@ async def _materialize(
                 _row_get(authority, "execution_revision")
             )
             canonical_url = str(_row_get(authority, "canonical_url") or "").strip()
-            dynamic_id = extract_bilibili_dynamic_id(
-                _row_get(authority, "raw_url"), canonical_url
-            )
+            authority_platform = str(
+                _row_get(authority, "platform") or ""
+            ).strip().lower()
+            selector_config = None
+            if authority_platform in {"xiaohongshu", "douyin"}:
+                selector_config = _json_object(
+                    _row_get(authority, "selector_config_json")
+                )
+                if authority_platform == "xiaohongshu":
+                    authority_execution_path = XIAOHONGSHU_BROWSER_EXECUTION_PATH
+                    authority_config_hash = compute_xiaohongshu_browser_config_hash(
+                        execution_revision,
+                        selector_config,
+                    )
+                else:
+                    authority_execution_path = DOUYIN_DEVICE_EXECUTION_PATH
+                    authority_config_hash = compute_douyin_device_config_hash(
+                        execution_revision,
+                        selector_config,
+                    )
+                dynamic_id = None
+            else:
+                dynamic_id = extract_bilibili_dynamic_id(
+                    _row_get(authority, "raw_url"), canonical_url
+                )
+                authority_execution_path = BILIBILI_API_EXECUTION_PATH
+                authority_config_hash = compute_bilibili_api_config_hash(
+                    execution_revision
+                )
             authority_contract = EvidenceContract(
                 lottery_id=_positive_int(_row_get(authority, "lottery_id")),
                 account_id=contract.account_id,
                 platform=str(_row_get(authority, "platform") or "").strip().lower(),
                 rule_snapshot_id=_positive_int(_row_get(authority, "rule_snapshot_id")),
-                execution_path_id=BILIBILI_API_EXECUTION_PATH,
+                execution_path_id=authority_execution_path,
                 target_hash=compute_target_hash(canonical_url),
                 rule_hash=str(_row_get(authority, "rule_hash") or "").strip(),
                 action_plan_hash=str(_row_get(authority, "action_plan_hash") or "").strip(),
-                config_hash=compute_bilibili_api_config_hash(execution_revision),
+                config_hash=authority_config_hash,
             )
             plan = validate_action_plan_v2(_row_get(authority, "action_plan"), reject_media=True)
             lottery_rule = _row_get(authority, "lottery_rule_text")
@@ -368,7 +597,15 @@ async def _materialize(
                 lottery_rule = lottery_rule.decode("utf-8", errors="strict")
             if isinstance(snapshot_rule, bytes):
                 snapshot_rule = snapshot_rule.decode("utf-8", errors="strict")
-        except (ActionPlanV2Error, TypeError, ValueError, UnicodeDecodeError):
+        except (
+            ActionPlanV2Error,
+            DouyinDeviceContractError,
+            XiaohongshuBrowserContractError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
             return None
         if (
             not _same_contract(contract, authority_contract)
@@ -389,16 +626,77 @@ async def _materialize(
             != "ready"
         ):
             return None
-        source_validation = {
-            "expected_dynamic_id": dynamic_id,
-            "expected_actions": plan.required_actions,
-            "expected_execution_revision": execution_revision,
-            "expected_follow_handle": (
+        if contract.platform == "xiaohongshu":
+            comment_text = (
+                plan.payload_for("commented").get("text", "")
+                if "commented" in plan.required_actions
+                else ""
+            )
+            source_validation = {
+                "expected_xiaohongshu": {
+                    "expected_lottery_id": contract.lottery_id,
+                    "expected_account_id": contract.account_id,
+                    "expected_execution_revision": execution_revision,
+                    "expected_target_hash": contract.target_hash,
+                    "expected_rule_snapshot_id": contract.rule_snapshot_id,
+                    "expected_rule_hash": contract.rule_hash,
+                    "expected_action_plan_hash": contract.action_plan_hash,
+                    "expected_config_hash": contract.config_hash,
+                    "expected_actions": plan.required_actions,
+                    "expected_follow_target_handle": (
+                        plan.follow_target_handle
+                        if "followed" in plan.required_actions
+                        else ""
+                    ),
+                    "expected_comment_text_hash": (
+                        compute_xiaohongshu_comment_text_hash(comment_text)
+                    ),
+                }
+            }
+        elif contract.platform == "douyin":
+            follow_text = (
                 plan.follow_target_handle
                 if "followed" in plan.required_actions
-                else None
-            ),
-        }
+                else ""
+            )
+            comment_text = (
+                plan.payload_for("commented").get("text", "")
+                if "commented" in plan.required_actions
+                else ""
+            )
+            source_validation = {
+                "expected_douyin": {
+                    "expected_lottery_id": contract.lottery_id,
+                    "expected_account_id": contract.account_id,
+                    "expected_execution_revision": execution_revision,
+                    "expected_target_hash": contract.target_hash,
+                    "expected_rule_snapshot_id": contract.rule_snapshot_id,
+                    "expected_rule_hash": contract.rule_hash,
+                    "expected_action_plan_hash": contract.action_plan_hash,
+                    "expected_config_hash": contract.config_hash,
+                    "expected_actions": plan.required_actions,
+                    "expected_follow_target_handle_hash": (
+                        compute_douyin_exact_text_hash(follow_text)
+                    ),
+                    "expected_comment_text_hash": (
+                        compute_douyin_exact_text_hash(comment_text)
+                    ),
+                    "expected_public_config": (
+                        normalize_douyin_device_public_config(selector_config)
+                    ),
+                }
+            }
+        else:
+            source_validation = {
+                "expected_dynamic_id": dynamic_id,
+                "expected_actions": plan.required_actions,
+                "expected_execution_revision": execution_revision,
+                "expected_follow_handle": (
+                    plan.follow_target_handle
+                    if "followed" in plan.required_actions
+                    else None
+                ),
+            }
 
         if probe_id is None:
             probe = await db.fetch_one(
@@ -598,9 +896,27 @@ async def _materialize(
         shadow_observation_kind = str(
             _row_get(shadow, "preflight_observation_kind") or ""
         ).strip()
+        expected_probe_kind = (
+            XIAOHONGSHU_BROWSER_PROBE_OBSERVATION_KIND
+            if contract.platform == "xiaohongshu"
+            else (
+                DOUYIN_DEVICE_PROBE_OBSERVATION_KIND
+                if contract.platform == "douyin"
+                else API_PROBE_KIND
+            )
+        )
+        expected_shadow_kind = (
+            XIAOHONGSHU_BROWSER_SHADOW_OBSERVATION_KIND
+            if contract.platform == "xiaohongshu"
+            else (
+                DOUYIN_DEVICE_SHADOW_OBSERVATION_KIND
+                if contract.platform == "douyin"
+                else API_PROBE_KIND
+            )
+        )
         if (
-            probe_observation_kind != API_PROBE_KIND
-            or shadow_observation_kind != API_PROBE_KIND
+            probe_observation_kind != expected_probe_kind
+            or shadow_observation_kind != expected_shadow_kind
             or not probe_observation_hash
             or not shadow_observation_hash
         ):
@@ -635,11 +951,13 @@ async def _materialize(
             },
         )
         persisted = await db.fetch_one(
-            """SELECT id, lottery_id, account_id, platform, rule_snapshot_id,
-                      execution_path_id, target_hash, rule_hash, action_plan_hash,
-                       config_hash, e.probe_observation_kind,
+            """SELECT e.id, e.lottery_id, e.account_id, e.platform,
+                      e.rule_snapshot_id, e.execution_path_id, e.target_hash,
+                      e.rule_hash, e.action_plan_hash, e.config_hash,
+                       e.probe_observation_kind,
                        e.probe_observation_hash, e.shadow_observation_kind,
-                       e.shadow_observation_hash, status, verified_at, expires_at,
+                       e.shadow_observation_hash, e.status, e.verified_at,
+                       e.expires_at,
                        CASE WHEN e.verified_at >= GREATEST(
                               probe.finished_at, shadow.finished_at)
                             AND e.verified_at <= NOW()

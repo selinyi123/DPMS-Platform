@@ -1,0 +1,13 @@
+route:
+  receiver: dpms-default
+  group_by: [alertname, platform]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: dpms-default
+    # Replace with an approved, authenticated receiver. Never commit a URL
+    # containing a webhook token.
+    webhook_configs:
+      - url_file: /run/secrets/dpms-alertmanager-webhook-url

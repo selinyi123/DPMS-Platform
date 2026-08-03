@@ -1,6 +1,8 @@
 import json
+import hashlib
+import re
 import uuid
-import warnings
+from pathlib import Path
 from typing import Any
 
 from app.db import database
@@ -8,29 +10,87 @@ from app.utils.log import structured_log
 
 
 TERMINAL_OUTBOX_EVENT_TYPES = {"TaskFinished", "TaskFailed", "AccountExecutionFinished"}
+MIGRATION_FILENAME_RE = re.compile(r"^(\d{4})_.+\.sql$")
+MIGRATION_DIR_CANDIDATES = (
+    # Runtime image: worker/Dockerfile copies the release manifest here.
+    Path(__file__).resolve().parents[2] / "migrations",
+    # Source checkout: keep unit tests and local execution bound to Core's manifest.
+    Path(__file__).resolve().parents[3] / "core" / "migrations",
+)
 
 
-async def ensure_event_schema() -> None:
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=r"Table '.*' already exists")
-        await database.execute(
-            """CREATE TABLE IF NOT EXISTS events (
-              id CHAR(36) PRIMARY KEY,
-              aggregate VARCHAR(64) NOT NULL,
-              aggregate_id VARCHAR(128) NOT NULL,
-              event_type VARCHAR(128) NOT NULL,
-              payload JSON NULL,
-              correlation_id VARCHAR(128) NULL,
-              causation_id VARCHAR(128) NULL,
-              actor_type VARCHAR(32) NOT NULL DEFAULT 'system',
-              actor_id VARCHAR(128) NULL,
-              source_service VARCHAR(64) NOT NULL DEFAULT 'worker',
-              occurred_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-              INDEX idx_events_aggregate (aggregate, aggregate_id, occurred_at),
-              INDEX idx_events_type_created (event_type, occurred_at),
-              INDEX idx_events_correlation (correlation_id, occurred_at)
-            ) ENGINE=InnoDB"""
+def expected_migration_checksums(
+    migrations_dir: Path | None = None,
+) -> dict[str, str]:
+    """Return the exact migration ledger shipped with this Worker release."""
+
+    if migrations_dir is None:
+        migrations_dir = next(
+            (candidate for candidate in MIGRATION_DIR_CANDIDATES if candidate.is_dir()),
+            None,
         )
+    if migrations_dir is None or not migrations_dir.is_dir():
+        raise RuntimeError("worker_schema_migration_manifest_missing")
+
+    expected: dict[str, str] = {}
+    for path in sorted(migrations_dir.iterdir()):
+        if not path.is_file():
+            continue
+        match = MIGRATION_FILENAME_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        version = match.group(1)
+        if version in expected:
+            raise RuntimeError("worker_schema_migration_manifest_duplicate_version")
+        expected[version] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not expected:
+        raise RuntimeError("worker_schema_migration_manifest_empty")
+    return expected
+
+
+async def verify_event_schema() -> None:
+    """Read-only Worker startup gate for the event-store projection."""
+
+    row = await database.fetch_one(
+        """SELECT COUNT(DISTINCT COLUMN_NAME) AS required_columns
+           FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'events'
+             AND COLUMN_NAME IN (
+               'id', 'aggregate', 'aggregate_id', 'event_type', 'payload',
+               'correlation_id', 'causation_id', 'actor_type', 'actor_id',
+               'source_service', 'occurred_at'
+             )"""
+    )
+    if row is None or int(row["required_columns"] or 0) != 11:
+        raise RuntimeError("worker_event_schema_not_current")
+
+    expected = expected_migration_checksums()
+    migration_rows = await database.fetch_all(
+        """SELECT version, checksum
+           FROM schema_migrations
+           ORDER BY version"""
+    )
+    applied = {
+        str(row["version"]): str(row["checksum"] or "").lower()
+        for row in migration_rows
+    }
+    if applied != expected:
+        missing = sorted(expected.keys() - applied.keys())
+        unexpected = sorted(applied.keys() - expected.keys())
+        mismatched = sorted(
+            version
+            for version in expected.keys() & applied.keys()
+            if expected[version] != applied[version]
+        )
+        structured_log(
+            "error",
+            "worker_schema_migration_ledger_mismatch",
+            missing_versions=missing,
+            unexpected_versions=unexpected,
+            checksum_mismatch_versions=mismatched,
+        )
+        raise RuntimeError("worker_schema_migration_ledger_not_current")
 
 
 async def record_event(

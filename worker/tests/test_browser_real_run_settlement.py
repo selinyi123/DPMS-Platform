@@ -33,7 +33,7 @@ class FakePool:
     def __init__(self, page):
         self.context = FakeContext(page)
 
-    async def get_account_context(self, *_args):
+    async def get_account_context(self, *_args, **_kwargs):
         return self.context
 
 

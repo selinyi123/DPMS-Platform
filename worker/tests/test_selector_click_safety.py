@@ -11,12 +11,22 @@ from app.adapters.selector_flow import (
 
 
 class FakeLocator:
-    def __init__(self, selector, calls, *, visible=True, visibility_error=False, click_error=False):
+    def __init__(
+        self,
+        selector,
+        calls,
+        *,
+        visible=True,
+        visibility_error=False,
+        click_error=False,
+        wait_error=False,
+    ):
         self.selector = selector
         self.calls = calls
         self.visible = visible
         self.visibility_error = visibility_error
         self.click_error = click_error
+        self.wait_error = wait_error
         self.first = self
 
     async def is_visible(self, timeout=None):
@@ -34,6 +44,11 @@ class FakeLocator:
         if self.click_error:
             raise RuntimeError("click completion unknown")
 
+    async def wait_for(self, state=None, timeout=None):
+        self.calls.append(("wait_for", self.selector, state))
+        if self.wait_error:
+            raise RuntimeError("done state not observed")
+
 
 class FakePage:
     def __init__(self, locators):
@@ -45,7 +60,7 @@ class FakePage:
 
 class DummySelectorAdapter(SelectorFlowAdapter):
     PLATFORM = "weibo"
-    ACTIONS = ("followed", "liked", "commented", "reposted")
+    ACTIONS = ("followed", "liked", "commented", "favorited", "reposted")
 
 
 class SelectorClickSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -171,6 +186,90 @@ class SelectorClickSafetyTests(unittest.IsolatedAsyncioTestCase):
             await adapter._like(page)
 
         self.assertEqual(calls, [])
+
+    async def test_favorite_uses_explicit_click_guard_and_done_readback(self):
+        calls = []
+        page = FakePage({
+            "favorite": FakeLocator("favorite", calls),
+            "favorited": FakeLocator("favorited", calls, visible=False),
+        })
+        adapter = DummySelectorAdapter(
+            selector_config={
+                "favorited": {
+                    "click": ["favorite"],
+                    "done": ["favorited"],
+                }
+            }
+        )
+
+        async def guard(event):
+            calls.append(("guard", event))
+
+        adapter.set_mutation_guard(guard)
+        with patch("app.adapters.selector_flow.BehaviorEngine.random_delay", return_value=None):
+            await adapter._favorite(page)
+
+        self.assertEqual(
+            calls,
+            [
+                ("visible", "favorited"),
+                ("visible", "favorite"),
+                ("handle", "favorite"),
+                ("guard", "favorited"),
+                ("click", "favorite"),
+                ("wait_for", "favorited", "visible"),
+            ],
+        )
+        self.assertTrue(adapter.mutation_started)
+
+    async def test_favorite_without_done_selector_is_blocked_before_click(self):
+        calls = []
+        page = FakePage({"favorite": FakeLocator("favorite", calls)})
+        adapter = DummySelectorAdapter(
+            selector_config={"favorited": {"click": ["favorite"]}}
+        )
+
+        with self.assertRaisesRegex(UnsupportedPlatformAction, "success selectors"):
+            await adapter._favorite(page)
+
+        self.assertEqual(calls, [])
+        self.assertFalse(adapter.mutation_started)
+
+    async def test_favorite_unverified_after_click_keeps_unknown_outcome_marker(self):
+        calls = []
+        page = FakePage({
+            "favorite": FakeLocator("favorite", calls),
+            "favorited": FakeLocator(
+                "favorited",
+                calls,
+                visible=False,
+                wait_error=True,
+            ),
+        })
+        adapter = DummySelectorAdapter(
+            selector_config={
+                "favorited": {
+                    "click": ["favorite"],
+                    "done": ["favorited"],
+                }
+            }
+        )
+
+        with patch("app.adapters.selector_flow.BehaviorEngine.random_delay", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "could not be verified"):
+                await adapter._favorite(page)
+
+        self.assertEqual(
+            calls,
+            [
+                ("visible", "favorited"),
+                ("visible", "favorite"),
+                ("handle", "favorite"),
+                ("click", "favorite"),
+                ("wait_for", "favorited", "visible"),
+            ],
+        )
+        self.assertTrue(adapter.mutation_started)
 
 
 if __name__ == "__main__":

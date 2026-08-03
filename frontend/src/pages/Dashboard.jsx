@@ -4,8 +4,26 @@ import { fetchJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
 import StatusBadge from '../components/StatusBadge';
 import { formatText } from '../i18n/format';
+import { knowledgeGapPresentation } from '../knowledgePresentation';
 import { lotteryActionsForPlatform } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
+
+const FINAL_AUTHORIZATION_CHECKS = new Set([
+  'real_run_global_switch',
+  'global_circuit_breaker_closed',
+  'autopilot_real_run_authorized',
+]);
+
+function consumerGroupAlertDetails(alerts) {
+  return alerts.map((alert, index) => [
+    alert.platform,
+    alert.stream,
+    ...(Array.isArray(alert.warning_codes) ? alert.warning_codes : []),
+    ...(Array.isArray(alert.retention_blocked_groups)
+      ? alert.retention_blocked_groups
+      : []),
+  ].filter(Boolean).join(':') || `alert-${index + 1}`).join(', ');
+}
 
 export default function Dashboard() {
   const { t, language } = useUi();
@@ -14,23 +32,37 @@ export default function Dashboard() {
   const [knowledge, setKnowledge] = useState(null);
 
   useEffect(() => {
-    const load = async () => {
+    let disposed = false;
+    const requests = [
+      { path: '/metrics/overview', apply: setMetrics, inFlight: false, controller: null },
+      { path: '/metrics/readiness', apply: setReadiness, inFlight: false, controller: null },
+      { path: '/knowledge/summary', apply: setKnowledge, inFlight: false, controller: null },
+    ];
+    const loadOne = async (request) => {
+      if (disposed || request.inFlight) return;
+      request.inFlight = true;
+      request.controller = new AbortController();
       try {
-        const [metricRows, readinessRows, knowledgeRows] = await Promise.all([
-          fetchJSON('/metrics/overview'),
-          fetchJSON('/metrics/readiness'),
-          fetchJSON('/knowledge/summary'),
-        ]);
-        setMetrics(metricRows);
-        setReadiness(readinessRows);
-        setKnowledge(knowledgeRows);
+        const rows = await fetchJSON(request.path, {
+          signal: request.controller.signal,
+        });
+        if (!disposed) request.apply(rows);
       } catch {
-        // Dashboard keeps its last known state if one polling cycle fails.
+        // Keep only this endpoint's last known state. A knowledge or metrics
+        // failure must not freeze the production gate and next actions.
+      } finally {
+        request.inFlight = false;
+        request.controller = null;
       }
     };
+    const load = () => requests.forEach(request => void loadOne(request));
     load();
-    const timer = setInterval(load, 5000);
-    return () => clearInterval(timer);
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      requests.forEach(request => request.controller?.abort());
+    };
   }, []);
 
   const cards = [
@@ -51,6 +83,26 @@ export default function Dashboard() {
     { label: t('dashboard.proxyExits'), value: readiness?.summary?.proxy_exits_total, unit: t('dashboard.units.configured'), color: '#0891b2' },
     { label: t('dashboard.risk24h'), value: readiness?.summary?.recent_risk_events_24h, unit: t('dashboard.units.events'), color: '#dc2626' },
   ];
+  const consumerGroupRetentionAlerts = Array.isArray(
+    metrics.redis_consumer_group_retention_alerts,
+  )
+    ? metrics.redis_consumer_group_retention_alerts
+    : [];
+  const blockingConsumerGroupAlerts = consumerGroupRetentionAlerts.filter(
+    alert => Boolean(alert?.retention_alert),
+  );
+  const staleConsumerMetadataAlerts = consumerGroupRetentionAlerts.filter(
+    alert => !alert?.retention_alert && Boolean(alert?.consumer_inventory_alert),
+  );
+  const productionChecks = Array.isArray(readiness?.production_checks)
+    ? readiness.production_checks
+    : [];
+  const technicalP0Checks = productionChecks.filter(check => (
+    check?.priority === 'P0' && !FINAL_AUTHORIZATION_CHECKS.has(check?.code)
+  ));
+  const technicalP0Ready = technicalP0Checks.length > 0
+    && technicalP0Checks.every(check => check?.passed === true);
+  const failedProductionChecks = productionChecks.filter(check => check?.passed !== true);
 
   const kt = (key) => knowledgeCopy[language]?.[key] || knowledgeCopy.en[key] || key;
   const knowledgeSummary = knowledge?.summary || {};
@@ -61,37 +113,61 @@ export default function Dashboard() {
   const localizeAction = (action) => {
     const platform = platformLabel(readiness?.platforms, action.target);
     const byCode = {
-      configure_notification: ['configureNotificationTitle', 'configureNotificationDetail'],
-      review_risk: ['reviewRiskTitle', 'reviewRiskDetail'],
-      add_proxy_exit: ['addProxyTitle', 'addProxyDetail'],
-      add_calibrated_account: ['addAccountTitle', 'addAccountDetail'],
-      complete_adapter_probe: ['completeProbeTitle', 'completeProbeDetail'],
-      enable_real_adapter: ['enableAdapterTitle', 'enableAdapterDetail'],
-      keep_dry_run: ['dryRunOnlyTitle', 'dryRunOnlyDetail'],
+      restore_worker_capacity: ['restoreWorkerTitle', 'restoreWorkerDetail', 'restoreWorkerExample'],
+      restore_platform_task_transport: ['restoreTransportTitle', 'restoreTransportDetail', 'restoreTransportExample'],
+      review_global_circuit_breaker: ['reviewBreakerTitle', 'reviewBreakerDetail', 'reviewBreakerExample'],
+      restore_autopilot_heartbeat: ['restoreAutopilotTitle', 'restoreAutopilotDetail', 'restoreAutopilotExample'],
+      configure_autopilot_dispatch: ['configureAutopilotTitle', 'configureAutopilotDetail', 'configureAutopilotExample'],
+      authorize_autopilot_real_run: ['authorizeAutopilotTitle', 'authorizeAutopilotDetail', 'authorizeAutopilotExample'],
+      approve_real_run_deployment: ['approveRealRunTitle', 'approveRealRunDetail', 'approveRealRunExample'],
+      restore_target_readiness_observation: ['restoreTargetObservationTitle', 'restoreTargetObservationDetail', 'restoreTargetObservationExample'],
+      add_autopilot_target: ['addAutopilotTargetTitle', 'addAutopilotTargetDetail', 'addAutopilotTargetExample'],
+      complete_target_action_plan: ['completeTargetPlanTitle', 'completeTargetPlanDetail', 'completeTargetPlanExample'],
+      complete_dispatch_platform_intersection: ['completePlatformIntersectionTitle', 'completePlatformIntersectionDetail', 'completePlatformIntersectionExample'],
+      complete_exact_real_candidate: ['completeExactCandidateTitle', 'completeExactCandidateDetail', 'completeExactCandidateExample'],
+      resolve_redis_consumer_group_retention: ['resolveRedisRetentionTitle', 'resolveRedisRetentionDetail', 'resolveRedisRetentionExample'],
+      retire_stale_redis_consumer_metadata: ['retireRedisConsumersTitle', 'retireRedisConsumersDetail', 'retireRedisConsumersExample'],
+      configure_notification: ['configureNotificationTitle', 'configureNotificationDetail', 'configureNotificationExample'],
+      restore_notification_delivery_observation: ['restoreNotificationObservationTitle', 'restoreNotificationObservationDetail', 'restoreNotificationObservationExample'],
+      verify_notification_delivery: ['verifyNotificationTitle', 'verifyNotificationDetail', 'verifyNotificationExample'],
+      review_risk: ['reviewRiskTitle', 'reviewRiskDetail', 'reviewRiskExample'],
+      add_proxy_exit: ['addProxyTitle', 'addProxyDetail', 'addProxyExample'],
+      add_calibrated_account: ['addAccountTitle', 'addAccountDetail', 'addAccountExample'],
+      configure_weibo_oauth: ['configureWeiboOAuthTitle', 'configureWeiboOAuthDetail', 'configureWeiboOAuthExample'],
+      complete_adapter_probe: ['completeProbeTitle', 'completeProbeDetail', 'completeProbeExample'],
+      enable_real_adapter: ['enableAdapterTitle', 'enableAdapterDetail', 'enableAdapterExample'],
+      keep_dry_run: ['dryRunOnlyTitle', 'dryRunOnlyDetail', 'dryRunOnlyExample'],
     };
     const byTitle = {
-      'Configure at least one notification channel': ['configureNotificationTitle', 'configureNotificationDetail'],
-      'Review recent account risk signals': ['reviewRiskTitle', 'reviewRiskDetail'],
-      'Add isolated proxy exits for production accounts': ['addProxyTitle', 'addProxyDetail'],
-      'Keep production dispatch in dry-run mode': ['dryRunOnlyTitle', 'dryRunOnlyDetail'],
+      'Configure at least one notification channel': ['configureNotificationTitle', 'configureNotificationDetail', 'configureNotificationExample'],
+      'Review recent account risk signals': ['reviewRiskTitle', 'reviewRiskDetail', 'reviewRiskExample'],
+      'Add isolated proxy exits for production accounts': ['addProxyTitle', 'addProxyDetail', 'addProxyExample'],
+      'Keep production dispatch in dry-run mode': ['dryRunOnlyTitle', 'dryRunOnlyDetail', 'dryRunOnlyExample'],
     };
 
     let keys = byCode[action.code] || byTitle[action.title];
     if (!keys && action.title?.startsWith('Add a calibrated safe account for ')) {
-      keys = ['addAccountTitle', 'addAccountDetail'];
+      keys = ['addAccountTitle', 'addAccountDetail', 'addAccountExample'];
     }
     if (!keys && action.title?.startsWith('Complete adapter probe for ')) {
-      keys = ['completeProbeTitle', 'completeProbeDetail'];
+      keys = ['completeProbeTitle', 'completeProbeDetail', 'completeProbeExample'];
     }
     if (!keys && action.title?.startsWith('Enable real action adapter for ')) {
-      keys = ['enableAdapterTitle', 'enableAdapterDetail'];
+      keys = ['enableAdapterTitle', 'enableAdapterDetail', 'enableAdapterExample'];
     }
-    if (!keys) return action;
+    if (!keys) keys = ['unknownTitle', 'unknownDetail', 'unknownExample'];
     return {
       ...action,
       title: formatText(t(`dashboard.actionsMap.${keys[0]}`), { platform }),
       detail: formatText(t(`dashboard.actionsMap.${keys[1]}`), { platform }),
+      example: formatText(t(`dashboard.actionsMap.${keys[2]}`), { platform }),
     };
+  };
+
+  const localizeActionTarget = (target) => {
+    const mapped = t(`dashboard.actionTargets.${target}`);
+    if (mapped !== `dashboard.actionTargets.${target}`) return mapped;
+    return platformLabel(readiness?.platforms, target);
   };
 
   const localizeBlocker = (blocker, code) => {
@@ -99,15 +175,20 @@ export default function Dashboard() {
     const mapped = t(`dashboard.blockersMap.${key}`);
     if (mapped !== `dashboard.blockersMap.${key}`) return mapped;
     const fallback = t(`dashboard.blockersMap.${blocker}`);
-    return fallback === `dashboard.blockersMap.${blocker}` ? blocker : fallback;
+    if (fallback !== `dashboard.blockersMap.${blocker}`) return fallback;
+    const realGateBlocker = t(`lotteries.realGateBlockers.${key}`);
+    if (realGateBlocker !== `lotteries.realGateBlockers.${key}`) return realGateBlocker;
+    return t('dashboard.unknownBlocker');
   };
 
   const localizeCheck = (check) => {
     const title = t(`dashboard.checksMap.${check.code}Title`);
     const detail = t(`dashboard.checksMap.${check.code}Detail`);
+    const example = t(`dashboard.checksMap.${check.code}Example`);
     return {
-      title: title === `dashboard.checksMap.${check.code}Title` ? check.title : title,
-      detail: detail === `dashboard.checksMap.${check.code}Detail` ? check.detail : detail,
+      title: title === `dashboard.checksMap.${check.code}Title` ? t('dashboard.checksMap.unknownTitle') : title,
+      detail: detail === `dashboard.checksMap.${check.code}Detail` ? t('dashboard.checksMap.unknownDetail') : detail,
+      example: example === `dashboard.checksMap.${check.code}Example` ? t('dashboard.checksMap.unknownExample') : example,
     };
   };
 
@@ -134,6 +215,34 @@ export default function Dashboard() {
         </div>
       </header>
 
+      {blockingConsumerGroupAlerts.length > 0 && (
+        <div className="alert-danger" role="alert">
+          <strong>
+            {t('dashboard.consumerGroupAlertTitle')} ({blockingConsumerGroupAlerts.length})
+          </strong>
+          <div className="small-text">
+            {t('dashboard.consumerGroupAlertHint')}
+          </div>
+          <div className="mono small-text">
+            {consumerGroupAlertDetails(blockingConsumerGroupAlerts)}
+          </div>
+        </div>
+      )}
+
+      {staleConsumerMetadataAlerts.length > 0 && (
+        <div className="alert-warn" role="status">
+          <strong>
+            {t('dashboard.consumerGroupMetadataAlertTitle')} ({staleConsumerMetadataAlerts.length})
+          </strong>
+          <div className="small-text">
+            {t('dashboard.consumerGroupMetadataAlertHint')}
+          </div>
+          <div className="mono small-text">
+            {consumerGroupAlertDetails(staleConsumerMetadataAlerts)}
+          </div>
+        </div>
+      )}
+
       <div className="metric-grid">
         {cards.map(card => <MetricsCard key={card.label} {...card} />)}
       </div>
@@ -142,27 +251,57 @@ export default function Dashboard() {
         {readinessCards.map(card => <MetricsCard key={card.label} {...card} />)}
       </div>
 
+      {readiness?.summary?.production_ready === false && failedProductionChecks.length > 0 && (
+        <div className="alert-warn" role="status">
+          <strong>
+            {formatText(t('dashboard.blockedSummaryTitle'), {
+              count: failedProductionChecks.length,
+            })}
+          </strong>
+          <div className="small-text">{t('dashboard.blockedSummaryHint')}</div>
+          <div className="blocker-list compact-blockers">
+            {failedProductionChecks.map(check => (
+              <span className="badge badge-muted" key={check.code}>
+                {check.priority} · {localizeCheck(check).title}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="panel">
         <div className="panel-title">{t('dashboard.productionGate')}</div>
+        <p className="muted-text tight-text">{t('dashboard.productionGatePriorityHint')}</p>
         <div className="production-check-grid">
-          {readiness?.production_checks?.map(check => {
+          {productionChecks.map(check => {
             const localized = localizeCheck(check);
+            const authorizationLock = !check.passed && FINAL_AUTHORIZATION_CHECKS.has(check.code);
             return (
               <div className="production-check-row" key={check.code}>
                 <div className="action-priority">
-                  <span className={`badge ${check.passed ? 'badge-ready' : check.priority === 'P0' ? 'badge-danger' : 'badge-warn'}`}>
-                    {check.passed ? t('dashboard.clear') : check.priority}
+                  <span className={`badge ${check.passed ? 'badge-ready' : authorizationLock ? (technicalP0Ready ? 'badge-danger' : 'badge-muted') : check.priority === 'P0' ? 'badge-danger' : 'badge-warn'}`}>
+                    {check.passed
+                      ? t('dashboard.clear')
+                      : authorizationLock
+                        ? t('dashboard.authorizationLockPriority')
+                      : check.priority === 'P1' && check.blocking === false
+                        ? formatText(t('dashboard.nonBlockingPriority'), { priority: check.priority })
+                        : check.priority}
                   </span>
-                  <span className="mono small-text muted-text">{check.code}</span>
                 </div>
                 <div className="action-copy">
                   <div className="action-title">{localized.title}</div>
                   <p className="muted-text">{localized.detail}</p>
+                  {!check.passed && (
+                    <p className="small-text muted-text">
+                      <strong>{t('dashboard.exampleLabel')}</strong> {localized.example}
+                    </p>
+                  )}
                 </div>
               </div>
             );
           })}
-          {!readiness?.production_checks?.length && <div className="empty-cell">{t('dashboard.loading')}</div>}
+          {!productionChecks.length && <div className="empty-cell">{t('dashboard.loading')}</div>}
         </div>
       </div>
 
@@ -175,13 +314,18 @@ export default function Dashboard() {
               <div className="action-plan-row" key={`${action.target}-${action.title}`}>
                 <div className="action-priority">
                   <span className={`badge ${action.priority === 'P0' ? 'badge-danger' : action.priority === 'P1' ? 'badge-warn' : 'badge-info'}`}>
-                    {action.priority}
+                    {action.priority === 'P1'
+                      ? formatText(t('dashboard.nonBlockingPriority'), { priority: action.priority })
+                      : action.priority}
                   </span>
-                  <span className="mono small-text muted-text">{action.target}</span>
+                  <span className="small-text muted-text">{localizeActionTarget(action.target)}</span>
                 </div>
                 <div className="action-copy">
                   <div className="action-title">{localized.title}</div>
                   <p className="muted-text">{localized.detail}</p>
+                  <p className="small-text muted-text">
+                    <strong>{t('dashboard.exampleLabel')}</strong> {localized.example}
+                  </p>
                 </div>
               </div>
             );
@@ -322,20 +466,23 @@ export default function Dashboard() {
         <div className="knowledge-gap-list">
           <div className="compact-title">{kt('learningGaps')}</div>
           <div className="action-plan-list">
-            {learningGaps.map(item => (
-              <div className="action-plan-row" key={item.code}>
-                <div className="action-priority">
-                  <span className={`badge ${item.priority === 'P0' ? 'badge-danger' : item.priority === 'P1' ? 'badge-warn' : 'badge-info'}`}>
-                    {item.priority}
-                  </span>
-                  <span className="mono small-text muted-text">{item.code}</span>
+            {learningGaps.map(item => {
+              const localized = knowledgeGapPresentation(item, t);
+              return (
+                <div className="action-plan-row" key={item.code}>
+                  <div className="action-priority">
+                    <span className={`badge ${item.priority === 'P0' ? 'badge-danger' : item.priority === 'P1' ? 'badge-warn' : 'badge-info'}`}>
+                      {item.priority}
+                    </span>
+                    <span className="small-text muted-text">{localized.label}</span>
+                  </div>
+                  <div className="action-copy">
+                    <div className="action-title">{localized.title}</div>
+                    <p className="muted-text">{localized.detail}</p>
+                  </div>
                 </div>
-                <div className="action-copy">
-                  <div className="action-title">{localKnowledgeGap(item, kt).title}</div>
-                  <p className="muted-text">{localKnowledgeGap(item, kt).detail}</p>
-                </div>
-              </div>
-            ))}
+              );
+            })}
             {!learningGaps.length && <div className="empty-cell">{kt('noGaps')}</div>}
           </div>
         </div>
@@ -418,17 +565,6 @@ function formatRate(value) {
 
 function maturityText(level, kt) {
   return kt(`maturity_${level || 'unknown'}`);
-}
-
-function localKnowledgeGap(item, kt) {
-  const titleKey = `${item.code}Title`;
-  const detailKey = `${item.code}Detail`;
-  const title = kt(titleKey);
-  const detail = kt(detailKey);
-  return {
-    title: title === titleKey ? item.title : title,
-    detail: detail === detailKey ? item.detail : detail,
-  };
 }
 
 const knowledgeCopy = {

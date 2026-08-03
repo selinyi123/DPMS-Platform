@@ -1,25 +1,260 @@
+x-worker-environment: &worker-environment
+  DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER:-dpms_runtime}:${MYSQL_RUNTIME_PASSWORD:-dpms-runtime-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
+  MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER:-dpms_runtime}
+  REDIS_URL: redis://redis:6379/0
+  REDIS_USERNAME: worker
+  REDIS_PASSWORD: ${REDIS_WORKER_PASSWORD:-dpms-worker-local-only-change-me-2026}
+  REDIS_ACL_PREFLIGHT_REQUIRED: "true"
+  REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-64}
+  REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-15}
+  REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-5}
+  REDIS_CONSUMER_GROUP_STALE_SECONDS: ${REDIS_CONSUMER_GROUP_STALE_SECONDS:-900}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+  LEGACY_CONTROL_STREAM_DRAIN_ENABLED: ${LEGACY_CONTROL_STREAM_DRAIN_ENABLED:-true}
+  DPMS_MYSQL_PLATFORM_DATABASE_MODE: ${DPMS_MYSQL_PLATFORM_DATABASE_MODE:-shared}
+  DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+  WORKER_MAX_BROWSERS: ${WORKER_MAX_BROWSERS:-1}
+  WORKER_PERSISTENT_CONTEXT_TTL_SECONDS: ${WORKER_PERSISTENT_CONTEXT_TTL_SECONDS:-3600}
+  WORKER_PERSISTENT_CONTEXT_IDLE_SECONDS: ${WORKER_PERSISTENT_CONTEXT_IDLE_SECONDS:-900}
+  WORKER_MAX_PERSISTENT_CONTEXTS: ${WORKER_MAX_PERSISTENT_CONTEXTS:-4}
+  WORKER_CONTEXT_REAPER_INTERVAL_SECONDS: ${WORKER_CONTEXT_REAPER_INTERVAL_SECONDS:-60}
+  WORKER_STARTUP_CONNECT_ATTEMPTS: ${WORKER_STARTUP_CONNECT_ATTEMPTS:-30}
+  WORKER_STARTUP_CONNECT_DELAY_SECONDS: ${WORKER_STARTUP_CONNECT_DELAY_SECONDS:-2}
+  WORKER_SHUTDOWN_TASK_TIMEOUT_SECONDS: ${WORKER_SHUTDOWN_TASK_TIMEOUT_SECONDS:-10}
+  WORKER_SHUTDOWN_STEP_TIMEOUT_SECONDS: ${WORKER_SHUTDOWN_STEP_TIMEOUT_SECONDS:-30}
+  ACCOUNT_PROFILE_CLEANUP_POLL_SECONDS: ${ACCOUNT_PROFILE_CLEANUP_POLL_SECONDS:-5}
+  ACCOUNT_PROFILE_CLEANUP_STALE_SECONDS: ${ACCOUNT_PROFILE_CLEANUP_STALE_SECONDS:-900}
+  ACCOUNT_PROFILE_CLEANUP_MAX_RETRY_SECONDS: ${ACCOUNT_PROFILE_CLEANUP_MAX_RETRY_SECONDS:-300}
+  DPMS_ADAPTER_SELECTORS: ${DPMS_ADAPTER_SELECTORS:-{}}
+  DPMS_ADAPTER_SELECTORS_B64: ${DPMS_ADAPTER_SELECTORS_B64:-}
+
+x-worker-service: &worker-service
+  build:
+    context: .
+    dockerfile: worker/Dockerfile
+  user: "1000:1000"
+  group_add:
+    - "2000"
+  read_only: true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+  init: true
+  networks:
+    - app-net
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "python -c \"import os, sys, time; p='/tmp/worker-health'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 90 else 1)\""]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+  deploy:
+    replicas: 1
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 2048M
+  restart: unless-stopped
+  shm_size: "1gb"
+  security_opt:
+    - no-new-privileges:true
+    - seccomp=./docker/seccomp/playwright-v1.44.0.json
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_CHROOT
+
+x-core-platform-environment: &core-platform-environment
+  DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER:-dpms_runtime}:${MYSQL_RUNTIME_PASSWORD:-dpms-runtime-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
+  MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER:-dpms_runtime}
+  REDIS_URL: redis://redis:6379/0
+  REDIS_USERNAME: core
+  REDIS_PASSWORD: ${REDIS_CORE_PASSWORD:-dpms-core-local-only-change-me-2026}
+  REDIS_ACL_PREFLIGHT_REQUIRED: "true"
+  REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-64}
+  REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-15}
+  REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-5}
+  REDIS_CONSUMER_GROUP_STALE_SECONDS: ${REDIS_CONSUMER_GROUP_STALE_SECONDS:-900}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+  EVIDENCE_ROOT: /evidence
+  REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+  WEIBO_PUBLIC_RIP: ${WEIBO_PUBLIC_RIP:-}
+  WEIBO_TRUSTED_PROXY_CIDRS: ${WEIBO_TRUSTED_PROXY_CIDRS:-}
+  LEGACY_TASK_STREAM_DRAIN_ENABLED: ${LEGACY_TASK_STREAM_DRAIN_ENABLED:-true}
+  LEGACY_CONTROL_STREAM_DRAIN_ENABLED: ${LEGACY_CONTROL_STREAM_DRAIN_ENABLED:-true}
+  DPMS_MYSQL_PLATFORM_DATABASE_MODE: ${DPMS_MYSQL_PLATFORM_DATABASE_MODE:-shared}
+  OUTBOX_ARCHIVE_ENABLED: ${DPMS_OUTBOX_ARCHIVE_ENABLED:-false}
+  OUTBOX_ARCHIVE_RETENTION_SECONDS: ${DPMS_OUTBOX_ARCHIVE_RETENTION_SECONDS:-2592000}
+  OUTBOX_ARCHIVE_BATCH: ${DPMS_OUTBOX_ARCHIVE_BATCH:-200}
+  OUTBOX_ARCHIVE_INTERVAL_SECONDS: ${DPMS_OUTBOX_ARCHIVE_INTERVAL_SECONDS:-3600}
+  PROMETHEUS_ENABLED: ${DPMS_PROMETHEUS_ENABLED:-false}
+  DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+  DPMS_ADAPTER_SELECTORS: ${DPMS_ADAPTER_SELECTORS:-{}}
+  DPMS_ADAPTER_SELECTORS_B64: ${DPMS_ADAPTER_SELECTORS_B64:-}
+  DPMS_VERSION: ${DPMS_VERSION:-}
+
+x-core-platform-service: &core-platform-service
+  build:
+    context: .
+    dockerfile: core/Dockerfile
+  command: ["python", "-m", "app.platform_runner"]
+  user: "65532:65532"
+  group_add:
+    - "2000"
+  read_only: true
+  tmpfs:
+    - /tmp:size=128m,mode=1777
+  networks:
+    - app-net
+  depends_on:
+    mysql:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "python -c \"import os, sys, time; p='/tmp/core-platform-runner-%s-health' % os.environ['DPMS_PLATFORM_SCOPE']; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 90 else 1)\""]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: 768M
+  restart: unless-stopped
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+x-storage-platform-init: &storage-platform-init
+  image: alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
+  command:
+    - sh
+    - -ec
+    - |
+      umask 027
+      platform="$${DPMS_PLATFORM_SCOPE}"
+      profile_root="/profiles/$$platform"
+      evidence_root="/evidence/$$platform"
+      profile_marker="$$profile_root/.dpms-storage-permissions-v1"
+      evidence_marker="$$evidence_root/.dpms-storage-permissions-v1"
+      mkdir -p \
+        "$$profile_root/account-calibrations" \
+        "$$evidence_root/task-failures" \
+        "$$evidence_root/shadow-runs" \
+        "$$evidence_root/adapter-probes"
+      if [ ! -f "$$profile_marker" ]; then
+        chown -R 1000:2000 "$$profile_root"
+        : > "$$profile_marker"
+        chown 1000:2000 "$$profile_marker"
+        chmod 0640 "$$profile_marker"
+      fi
+      if [ ! -f "$$evidence_marker" ]; then
+        chown -R 1000:2000 "$$evidence_root"
+        find "$$evidence_root" -type d -exec chmod 2750 {} \;
+        : > "$$evidence_marker"
+        chown 1000:2000 "$$evidence_marker"
+        chmod 0640 "$$evidence_marker"
+      fi
+      chown 1000:2000 \
+        "$$profile_root" \
+        "$$profile_root/account-calibrations" \
+        "$$evidence_root" \
+        "$$evidence_root/task-failures" \
+        "$$evidence_root/shadow-runs" \
+        "$$evidence_root/adapter-probes"
+      chmod 2750 "$$profile_root" "$$profile_root/account-calibrations"
+      chmod 2750 \
+        "$$evidence_root" \
+        "$$evidence_root/task-failures" \
+        "$$evidence_root/shadow-runs" \
+        "$$evidence_root/adapter-probes"
+  network_mode: none
+  read_only: true
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+  security_opt:
+    - no-new-privileges:true
+  restart: "no"
+
 services:
-  evidence-init:
-    image: alpine:3.20
+  profiles-login-init:
+    image: alpine:3.20@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
     command:
       - sh
       - -ec
       - |
-        umask 077
-        mkdir -p /evidence/task-failures /evidence/shadow-runs /evidence/adapter-probes
-        chmod 0700 /evidence /evidence/task-failures /evidence/shadow-runs /evidence/adapter-probes
+        umask 027
+        profile_root=/profiles/login-sessions
+        permission_marker="$$profile_root/.dpms-storage-permissions-v1"
+        mkdir -p "$$profile_root"
+        if [ ! -f "$$permission_marker" ]; then
+          chown -R 1000:2000 "$$profile_root"
+          : > "$$permission_marker"
+          chown 1000:2000 "$$permission_marker"
+          chmod 0640 "$$permission_marker"
+        fi
+        chown 1000:2000 "$$profile_root"
+        chmod 2750 "$$profile_root"
     volumes:
-      - evidence-data:/evidence
+      - ./browser-profiles/login-sessions:/profiles/login-sessions
     network_mode: none
     read_only: true
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     security_opt:
       - no-new-privileges:true
     restart: "no"
 
+  storage-bilibili-init:
+    <<: *storage-platform-init
+    environment:
+      DPMS_PLATFORM_SCOPE: bilibili
+    volumes:
+      - ./browser-profiles/bilibili:/profiles/bilibili
+      - evidence-bilibili:/evidence/bilibili
+
+  storage-weibo-init:
+    <<: *storage-platform-init
+    environment:
+      DPMS_PLATFORM_SCOPE: weibo
+    volumes:
+      - ./browser-profiles/weibo:/profiles/weibo
+      - evidence-weibo:/evidence/weibo
+
+  storage-xiaohongshu-init:
+    <<: *storage-platform-init
+    environment:
+      DPMS_PLATFORM_SCOPE: xiaohongshu
+    volumes:
+      - ./browser-profiles/xiaohongshu:/profiles/xiaohongshu
+      - evidence-xiaohongshu:/evidence/xiaohongshu
+
+  storage-douyin-init:
+    <<: *storage-platform-init
+    environment:
+      DPMS_PLATFORM_SCOPE: douyin
+    volumes:
+      - ./browser-profiles/douyin:/profiles/douyin
+      - evidence-douyin:/evidence/douyin
+
   nginx:
-    image: nginx:alpine
+    image: nginx:1.27-alpine@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
     ports:
       - "127.0.0.1:${DPMS_HTTP_PORT:-8080}:80"
     volumes:
@@ -45,19 +280,68 @@ services:
       context: .
       dockerfile: core/Dockerfile
     volumes:
-      - ./core/app:/app/app
-      - ./releases:/app/releases
-      - ./backups:/app/backups
-      - ./browser-profiles:/profiles
+      # Runtime code is baked into the image, so /app/app is intentionally not
+      # a managed update symlink. Update/rollback endpoints fail closed before
+      # writing; keep operator artifacts read-only in this deployment layout.
+      - ./releases:/app/releases:ro
+      - ./backups:/app/backups:ro
       - evidence-data:/evidence:ro
-      - ./logs:/app/logs
-    env_file:
-      - .env
+      - evidence-bilibili:/evidence/bilibili:ro
+      - evidence-weibo:/evidence/weibo:ro
+      - evidence-xiaohongshu:/evidence/xiaohongshu:ro
+      - evidence-douyin:/evidence/douyin:ro
+      - ./browser-profiles/login-sessions:/profiles/login-sessions:ro
+      - ./browser-profiles/account-calibrations:/profiles/account-calibrations:ro
+      - ./browser-profiles/bilibili:/profiles/bilibili:ro
+      - ./browser-profiles/weibo:/profiles/weibo:ro
+      - ./browser-profiles/xiaohongshu:/profiles/xiaohongshu:ro
+      - ./browser-profiles/douyin:/profiles/douyin:ro
+      - ./logs:/app/logs:ro
+    user: "65532:65532"
+    group_add:
+      - "2000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    init: true
     environment:
-      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-user}:${MYSQL_PASSWORD:-password}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER:-dpms_runtime}:${MYSQL_RUNTIME_PASSWORD:-dpms-runtime-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER:-dpms_runtime}
       REDIS_URL: redis://redis:6379/0
+      REDIS_USERNAME: core
+      REDIS_PASSWORD: ${REDIS_CORE_PASSWORD:-dpms-core-local-only-change-me-2026}
+      REDIS_ACL_PREFLIGHT_REQUIRED: "true"
+      REDIS_MAX_CONNECTIONS: ${REDIS_MAX_CONNECTIONS:-64}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-15}
+      REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-5}
+      REDIS_CONSUMER_GROUP_STALE_SECONDS: ${REDIS_CONSUMER_GROUP_STALE_SECONDS:-900}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      UPDATE_SECRET: ${UPDATE_SECRET:-changeme-local-update-secret}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-admin-token}
       EVIDENCE_ROOT: /evidence
       REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+      WEIBO_PUBLIC_RIP: ${WEIBO_PUBLIC_RIP:-}
+      WEIBO_TRUSTED_PROXY_CIDRS: ${WEIBO_TRUSTED_PROXY_CIDRS:-}
+      LEGACY_TASK_STREAM_DRAIN_ENABLED: ${LEGACY_TASK_STREAM_DRAIN_ENABLED:-true}
+      LEGACY_CONTROL_STREAM_DRAIN_ENABLED: ${LEGACY_CONTROL_STREAM_DRAIN_ENABLED:-true}
+      OUTBOX_ARCHIVE_ENABLED: ${DPMS_OUTBOX_ARCHIVE_ENABLED:-false}
+      OUTBOX_ARCHIVE_RETENTION_SECONDS: ${DPMS_OUTBOX_ARCHIVE_RETENTION_SECONDS:-2592000}
+      OUTBOX_ARCHIVE_BATCH: ${DPMS_OUTBOX_ARCHIVE_BATCH:-200}
+      OUTBOX_ARCHIVE_INTERVAL_SECONDS: ${DPMS_OUTBOX_ARCHIVE_INTERVAL_SECONDS:-3600}
+      PROMETHEUS_ENABLED: ${DPMS_PROMETHEUS_ENABLED:-false}
+      DPMS_MYSQL_PLATFORM_DATABASE_MODE: ${DPMS_MYSQL_PLATFORM_DATABASE_MODE:-shared}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      SERVERCHAN_KEY: ${SERVERCHAN_KEY:-}
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK:-}
+      GENERIC_WEBHOOK_URL: ${GENERIC_WEBHOOK_URL:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://127.0.0.1,http://localhost:3000,http://127.0.0.1:3000}
+      DPMS_ADAPTER_SELECTORS: ${DPMS_ADAPTER_SELECTORS:-{}}
+      DPMS_ADAPTER_SELECTORS_B64: ${DPMS_ADAPTER_SELECTORS_B64:-}
+      DPMS_VERSION: ${DPMS_VERSION:-}
+      DPMS_CORE_ROLE: control
+      DPMS_PLATFORM_SCOPE: all
     networks:
       - app-net
     depends_on:
@@ -65,8 +349,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      evidence-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 10s
@@ -79,69 +361,483 @@ services:
           cpus: "1.2"
           memory: 2560M
     restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
-  worker:
+  core-autopilot:
+    profiles: ["autopilot"]
     build:
       context: .
-      dockerfile: worker/Dockerfile
-    volumes:
-      - ./worker/app:/app/app
-      - ./browser-profiles:/profiles
-      - evidence-data:/evidence
-    env_file:
-      - .env
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.autopilot"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
     environment:
-      DATABASE_URL: mysql+aiomysql://${MYSQL_USER:-user}:${MYSQL_PASSWORD:-password}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
-      REDIS_URL: redis://redis:6379/0
-      EVIDENCE_ROOT: /evidence
+      DPMS_AUTOPILOT_CORE_API_URL: http://core-api:8000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-admin-token}
+      DPMS_AUTOPILOT_ENABLED: ${DPMS_AUTOPILOT_ENABLED:-false}
       REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+      DPMS_AUTOPILOT_REAL_RUN_ACK: ${DPMS_AUTOPILOT_REAL_RUN_ACK:-}
+      DPMS_AUTOPILOT_PLATFORMS: ${DPMS_AUTOPILOT_PLATFORMS:-}
+      DPMS_AUTOPILOT_ROUND_LIMIT: ${DPMS_AUTOPILOT_ROUND_LIMIT:-10}
+      DPMS_AUTOPILOT_SCAN_LIMIT: ${DPMS_AUTOPILOT_SCAN_LIMIT:-100}
+      DPMS_AUTOPILOT_FAILURE_LIMIT: ${DPMS_AUTOPILOT_FAILURE_LIMIT:-3}
+      DPMS_AUTOPILOT_POLL_SECONDS: ${DPMS_AUTOPILOT_POLL_SECONDS:-60}
+      DPMS_AUTOPILOT_REQUEST_TIMEOUT_SECONDS: ${DPMS_AUTOPILOT_REQUEST_TIMEOUT_SECONDS:-20}
     networks:
       - app-net
     depends_on:
       core-api:
         condition: service_healthy
-      evidence-init:
-        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os, sys, time; p='/tmp/worker-health'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 90 else 1)\""]
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os,sys,time; p='/tmp/autopilot-health'; ttl=max(90.0,float(os.environ.get('DPMS_AUTOPILOT_POLL_SECONDS','60'))*2+30); sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<ttl else 1)"
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 20s
+      retries: 3
+      start_period: 30s
     deploy:
-      replicas: 1
       resources:
         limits:
-          cpus: "1.0"
-          memory: 2048M
+          cpus: "0.25"
+          memory: 256M
     restart: unless-stopped
-    shm_size: "1gb"
-    # Chromium launches with --no-sandbox --disable-dev-shm-usage (see
-    # worker/app/browser_pool.py) and shm_size above, so the broad SYS_ADMIN
-    # capability is unnecessary. Dropping it and blocking privilege escalation
-    # tightens the worker's blast radius (Phase 4). Validate browser launch in a
-    # real container after this change.
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
 
+  core-xiaohongshu-pursuit:
+    profiles: ["autopilot"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.xiaohongshu_target_pursuit_daemon"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    init: true
+    environment:
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_CORE_API_URL: http://core-api:8000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me-admin-token}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_ENABLED: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_ENABLED:-false}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_PLATFORMS: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_PLATFORMS:-}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_CADENCE_SECONDS: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_CADENCE_SECONDS:-1800}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_POLL_SECONDS: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_POLL_SECONDS:-60}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_SOURCE_LIMIT: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_SOURCE_LIMIT:-100}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_SCAN_LIMIT: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_SCAN_LIMIT:-10}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_FAILURE_LIMIT: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_FAILURE_LIMIT:-3}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_MAX_CANDIDATES: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_MAX_CANDIDATES:-20}
+      DPMS_XIAOHONGSHU_TARGET_PURSUIT_REQUEST_TIMEOUT_SECONDS: ${DPMS_XIAOHONGSHU_TARGET_PURSUIT_REQUEST_TIMEOUT_SECONDS:-120}
+    networks:
+      - app-net
+    depends_on:
+      core-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os,sys,time; p='/tmp/xiaohongshu-target-pursuit-health'; ttl=max(90.0,float(os.environ.get('DPMS_XIAOHONGSHU_TARGET_PURSUIT_POLL_SECONDS','60'))*2+30); sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<ttl else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # Production Schema changes are an explicit release phase. This service is
+  # excluded from normal `up`; run it only after every old Core and Worker
+  # deployment is stopped, then start the new protocol only after this exits zero.
+  core-migrate:
+    profiles: ["migration"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.migrate"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: mysql+aiomysql://${MYSQL_MIGRATION_USER:-dpms_migrate}:${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE:-lottery}?charset=utf8mb4
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+    networks:
+      - app-net
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  # In isolated production mode each platform database receives the same
+  # ordered schema before its runner/Worker is started. These services are
+  # explicit release steps; they are never part of the default profile.
+  core-migrate-bilibili:
+    profiles: ["migration"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.migrate"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: mysql+aiomysql://${MYSQL_MIGRATION_USER:-dpms_migrate}:${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_BILIBILI:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+    networks: [app-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  core-migrate-weibo:
+    profiles: ["migration"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.migrate"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: mysql+aiomysql://${MYSQL_MIGRATION_USER:-dpms_migrate}:${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_WEIBO:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+    networks: [app-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  core-migrate-xiaohongshu:
+    profiles: ["migration"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.migrate"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: mysql+aiomysql://${MYSQL_MIGRATION_USER:-dpms_migrate}:${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_XIAOHONGSHU:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+    networks: [app-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  core-migrate-douyin:
+    profiles: ["migration"]
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    command: ["python", "-m", "app.migrate"]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      DATABASE_URL: mysql+aiomysql://${MYSQL_MIGRATION_USER:-dpms_migrate}:${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_DOUYIN:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REAL_RUN_ENABLED: ${REAL_RUN_ENABLED:-false}
+    networks: [app-net]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  core-bilibili-runner:
+    <<: *core-platform-service
+    volumes:
+      - evidence-bilibili:/evidence/bilibili:ro
+    environment:
+      <<: *core-platform-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_BILIBILI:-dpms_runtime_bilibili}:${MYSQL_RUNTIME_PASSWORD_BILIBILI:-dpms-runtime-bilibili-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_BILIBILI:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_BILIBILI:-dpms_runtime_bilibili}
+      REDIS_USERNAME: ${REDIS_CORE_BILIBILI_USERNAME:-core-bilibili}
+      REDIS_EXPECTED_USERNAME: ${REDIS_CORE_BILIBILI_USERNAME:-core-bilibili}
+      REDIS_PASSWORD: ${REDIS_CORE_BILIBILI_PASSWORD:-dpms-core-bilibili-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_BILIBILI:-}
+      ENCRYPTION_KEY_BILIBILI: ${ENCRYPTION_KEY_BILIBILI:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      DPMS_PLATFORM_SCOPE: bilibili
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-bilibili-init:
+        condition: service_completed_successfully
+
+  core-weibo-runner:
+    <<: *core-platform-service
+    volumes:
+      - evidence-weibo:/evidence/weibo:ro
+    environment:
+      <<: *core-platform-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_WEIBO:-dpms_runtime_weibo}:${MYSQL_RUNTIME_PASSWORD_WEIBO:-dpms-runtime-weibo-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_WEIBO:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_WEIBO:-dpms_runtime_weibo}
+      REDIS_USERNAME: ${REDIS_CORE_WEIBO_USERNAME:-core-weibo}
+      REDIS_EXPECTED_USERNAME: ${REDIS_CORE_WEIBO_USERNAME:-core-weibo}
+      REDIS_PASSWORD: ${REDIS_CORE_WEIBO_PASSWORD:-dpms-core-weibo-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_WEIBO:-}
+      ENCRYPTION_KEY_WEIBO: ${ENCRYPTION_KEY_WEIBO:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      DPMS_PLATFORM_SCOPE: weibo
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-weibo-init:
+        condition: service_completed_successfully
+
+  core-xiaohongshu-runner:
+    <<: *core-platform-service
+    volumes:
+      - evidence-xiaohongshu:/evidence/xiaohongshu:ro
+    environment:
+      <<: *core-platform-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_XIAOHONGSHU:-dpms_runtime_xiaohongshu}:${MYSQL_RUNTIME_PASSWORD_XIAOHONGSHU:-dpms-runtime-xiaohongshu-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_XIAOHONGSHU:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_XIAOHONGSHU:-dpms_runtime_xiaohongshu}
+      REDIS_USERNAME: ${REDIS_CORE_XIAOHONGSHU_USERNAME:-core-xiaohongshu}
+      REDIS_EXPECTED_USERNAME: ${REDIS_CORE_XIAOHONGSHU_USERNAME:-core-xiaohongshu}
+      REDIS_PASSWORD: ${REDIS_CORE_XIAOHONGSHU_PASSWORD:-dpms-core-xiaohongshu-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_XIAOHONGSHU:-}
+      ENCRYPTION_KEY_XIAOHONGSHU: ${ENCRYPTION_KEY_XIAOHONGSHU:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      DPMS_PLATFORM_SCOPE: xiaohongshu
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-xiaohongshu-init:
+        condition: service_completed_successfully
+
+  core-douyin-runner:
+    <<: *core-platform-service
+    volumes:
+      - evidence-douyin:/evidence/douyin:ro
+    environment:
+      <<: *core-platform-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_DOUYIN:-dpms_runtime_douyin}:${MYSQL_RUNTIME_PASSWORD_DOUYIN:-dpms-runtime-douyin-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_DOUYIN:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_DOUYIN:-dpms_runtime_douyin}
+      REDIS_USERNAME: ${REDIS_CORE_DOUYIN_USERNAME:-core-douyin}
+      REDIS_EXPECTED_USERNAME: ${REDIS_CORE_DOUYIN_USERNAME:-core-douyin}
+      REDIS_PASSWORD: ${REDIS_CORE_DOUYIN_PASSWORD:-dpms-core-douyin-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_DOUYIN:-}
+      ENCRYPTION_KEY_DOUYIN: ${ENCRYPTION_KEY_DOUYIN:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      DPMS_PLATFORM_SCOPE: douyin
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-douyin-init:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *worker-service
+    volumes:
+      - ./browser-profiles/login-sessions:/profiles/login-sessions
+    environment:
+      <<: *worker-environment
+      DPMS_WORKER_ROLE: control
+      DPMS_PLATFORM_SCOPE: all
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      profiles-login-init:
+        condition: service_completed_successfully
+
+  worker-bilibili:
+    <<: *worker-service
+    volumes:
+      - ./browser-profiles/bilibili:/profiles/bilibili
+      - evidence-bilibili:/evidence/bilibili
+    environment:
+      <<: *worker-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_BILIBILI:-dpms_runtime_bilibili}:${MYSQL_RUNTIME_PASSWORD_BILIBILI:-dpms-runtime-bilibili-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_BILIBILI:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_BILIBILI:-dpms_runtime_bilibili}
+      REDIS_USERNAME: ${REDIS_WORKER_BILIBILI_USERNAME:-worker-bilibili}
+      REDIS_EXPECTED_USERNAME: ${REDIS_WORKER_BILIBILI_USERNAME:-worker-bilibili}
+      REDIS_PASSWORD: ${REDIS_WORKER_BILIBILI_PASSWORD:-dpms-worker-bilibili-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_BILIBILI:-}
+      ENCRYPTION_KEY_BILIBILI: ${ENCRYPTION_KEY_BILIBILI:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      EVIDENCE_ROOT: /evidence/bilibili
+      DPMS_WORKER_ROLE: platform
+      DPMS_PLATFORM_SCOPE: bilibili
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-bilibili-init:
+        condition: service_completed_successfully
+
+  worker-weibo:
+    <<: *worker-service
+    volumes:
+      - ./browser-profiles/weibo:/profiles/weibo
+      - evidence-weibo:/evidence/weibo
+    environment:
+      <<: *worker-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_WEIBO:-dpms_runtime_weibo}:${MYSQL_RUNTIME_PASSWORD_WEIBO:-dpms-runtime-weibo-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_WEIBO:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_WEIBO:-dpms_runtime_weibo}
+      REDIS_USERNAME: ${REDIS_WORKER_WEIBO_USERNAME:-worker-weibo}
+      REDIS_EXPECTED_USERNAME: ${REDIS_WORKER_WEIBO_USERNAME:-worker-weibo}
+      REDIS_PASSWORD: ${REDIS_WORKER_WEIBO_PASSWORD:-dpms-worker-weibo-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_WEIBO:-}
+      ENCRYPTION_KEY_WEIBO: ${ENCRYPTION_KEY_WEIBO:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      EVIDENCE_ROOT: /evidence/weibo
+      DPMS_WORKER_ROLE: platform
+      DPMS_PLATFORM_SCOPE: weibo
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-weibo-init:
+        condition: service_completed_successfully
+
+  worker-xiaohongshu:
+    <<: *worker-service
+    volumes:
+      - ./browser-profiles/xiaohongshu:/profiles/xiaohongshu
+      - evidence-xiaohongshu:/evidence/xiaohongshu
+    environment:
+      <<: *worker-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_XIAOHONGSHU:-dpms_runtime_xiaohongshu}:${MYSQL_RUNTIME_PASSWORD_XIAOHONGSHU:-dpms-runtime-xiaohongshu-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_XIAOHONGSHU:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_XIAOHONGSHU:-dpms_runtime_xiaohongshu}
+      REDIS_USERNAME: ${REDIS_WORKER_XIAOHONGSHU_USERNAME:-worker-xiaohongshu}
+      REDIS_EXPECTED_USERNAME: ${REDIS_WORKER_XIAOHONGSHU_USERNAME:-worker-xiaohongshu}
+      REDIS_PASSWORD: ${REDIS_WORKER_XIAOHONGSHU_PASSWORD:-dpms-worker-xiaohongshu-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_XIAOHONGSHU:-}
+      ENCRYPTION_KEY_XIAOHONGSHU: ${ENCRYPTION_KEY_XIAOHONGSHU:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      EVIDENCE_ROOT: /evidence/xiaohongshu
+      DPMS_WORKER_ROLE: platform
+      DPMS_PLATFORM_SCOPE: xiaohongshu
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-xiaohongshu-init:
+        condition: service_completed_successfully
+
+  worker-douyin:
+    <<: *worker-service
+    volumes:
+      - ./browser-profiles/douyin:/profiles/douyin
+      - evidence-douyin:/evidence/douyin
+    environment:
+      <<: *worker-environment
+      DATABASE_URL: mysql+aiomysql://${MYSQL_RUNTIME_USER_DOUYIN:-dpms_runtime_douyin}:${MYSQL_RUNTIME_PASSWORD_DOUYIN:-dpms-runtime-douyin-local-only-change-me-2026}@mysql:3306/${MYSQL_DATABASE_DOUYIN:-${MYSQL_DATABASE:-lottery}}?charset=utf8mb4
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER_DOUYIN:-dpms_runtime_douyin}
+      REDIS_USERNAME: ${REDIS_WORKER_DOUYIN_USERNAME:-worker-douyin}
+      REDIS_EXPECTED_USERNAME: ${REDIS_WORKER_DOUYIN_USERNAME:-worker-douyin}
+      REDIS_PASSWORD: ${REDIS_WORKER_DOUYIN_PASSWORD:-dpms-worker-douyin-local-only-change-me-2026}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY_DOUYIN:-}
+      ENCRYPTION_KEY_DOUYIN: ${ENCRYPTION_KEY_DOUYIN:-}
+      PLATFORM_SECURITY_MODE: ${DPMS_PLATFORM_SECURITY_MODE:-compat}
+      EVIDENCE_ROOT: /evidence/douyin
+      DPMS_WORKER_ROLE: platform
+      DPMS_PLATFORM_SCOPE: douyin
+      DOUYIN_DEVICE_AGENT_URL: ${DOUYIN_DEVICE_AGENT_URL:-http://host.docker.internal:8765}
+      DOUYIN_DEVICE_AGENT_TOKEN: ${DOUYIN_DEVICE_AGENT_TOKEN:-}
+      DOUYIN_DEVICE_AGENT_TIMEOUT_SECONDS: ${DOUYIN_DEVICE_AGENT_TIMEOUT_SECONDS:-45}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      storage-douyin-init:
+        condition: service_completed_successfully
+
   mysql:
-    image: mysql:8.0
+    build:
+      context: .
+      dockerfile: docker/mysql/Dockerfile
     volumes:
       - mysql-data:/var/lib/mysql
-      - ./docker/mysql/001-bootstrap.sql:/docker-entrypoint-initdb.d/001-bootstrap.sql:ro
-    env_file:
-      - .env
     environment:
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-lottery}
-      MYSQL_USER: ${MYSQL_USER:-user}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-password}
+      MYSQL_RUNTIME_USER: ${MYSQL_RUNTIME_USER:-dpms_runtime}
+      MYSQL_RUNTIME_PASSWORD: ${MYSQL_RUNTIME_PASSWORD:-dpms-runtime-local-only-change-me-2026}
+      MYSQL_MIGRATION_USER: ${MYSQL_MIGRATION_USER:-dpms_migrate}
+      MYSQL_MIGRATION_PASSWORD: ${MYSQL_MIGRATION_PASSWORD:-dpms-migrate-local-only-change-me-2026}
+      MYSQL_RUNTIME_USER_BILIBILI: ${MYSQL_RUNTIME_USER_BILIBILI:-dpms_runtime_bilibili}
+      MYSQL_RUNTIME_PASSWORD_BILIBILI: ${MYSQL_RUNTIME_PASSWORD_BILIBILI:-dpms-runtime-bilibili-local-only-change-me-2026}
+      MYSQL_RUNTIME_USER_WEIBO: ${MYSQL_RUNTIME_USER_WEIBO:-dpms_runtime_weibo}
+      MYSQL_RUNTIME_PASSWORD_WEIBO: ${MYSQL_RUNTIME_PASSWORD_WEIBO:-dpms-runtime-weibo-local-only-change-me-2026}
+      MYSQL_RUNTIME_USER_XIAOHONGSHU: ${MYSQL_RUNTIME_USER_XIAOHONGSHU:-dpms_runtime_xiaohongshu}
+      MYSQL_RUNTIME_PASSWORD_XIAOHONGSHU: ${MYSQL_RUNTIME_PASSWORD_XIAOHONGSHU:-dpms-runtime-xiaohongshu-local-only-change-me-2026}
+      MYSQL_RUNTIME_USER_DOUYIN: ${MYSQL_RUNTIME_USER_DOUYIN:-dpms_runtime_douyin}
+      MYSQL_RUNTIME_PASSWORD_DOUYIN: ${MYSQL_RUNTIME_PASSWORD_DOUYIN:-dpms-runtime-douyin-local-only-change-me-2026}
+      # Shared mode falls back to MYSQL_DATABASE. Production isolated mode
+      # must override all four values with distinct database names.
+      MYSQL_DATABASE_BILIBILI: ${MYSQL_DATABASE_BILIBILI:-${MYSQL_DATABASE:-lottery}}
+      MYSQL_DATABASE_WEIBO: ${MYSQL_DATABASE_WEIBO:-${MYSQL_DATABASE:-lottery}}
+      MYSQL_DATABASE_XIAOHONGSHU: ${MYSQL_DATABASE_XIAOHONGSHU:-${MYSQL_DATABASE:-lottery}}
+      MYSQL_DATABASE_DOUYIN: ${MYSQL_DATABASE_DOUYIN:-${MYSQL_DATABASE:-lottery}}
+      DPMS_MYSQL_PLATFORM_DATABASE_MODE: ${DPMS_MYSQL_PLATFORM_DATABASE_MODE:-shared}
     networks:
       - app-net
     ports:
       - "127.0.0.1:3306:3306"
+    # Health must not depend on a runtime role that is intentionally absent on
+    # an existing volume until the explicit release-time provision step runs.
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_ROOT_PASSWORD}\" mysqladmin ping --protocol=socket -uroot --silent"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -155,14 +851,56 @@ services:
     command: --default-authentication-plugin=mysql_native_password --log-bin-trust-function-creators=1
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:9702d01c1f10c3ea9f48211b4362e44f154ff02d063e6f7268eba804059f53bf
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/dpms-redis-entrypoint.sh
+    environment:
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-dev}
+      REDIS_CORE_PASSWORD: ${REDIS_CORE_PASSWORD:-dpms-core-local-only-change-me-2026}
+      REDIS_WORKER_PASSWORD: ${REDIS_WORKER_PASSWORD:-dpms-worker-local-only-change-me-2026}
+      REDIS_CORE_BILIBILI_USERNAME: ${REDIS_CORE_BILIBILI_USERNAME:-core-bilibili}
+      REDIS_WORKER_BILIBILI_USERNAME: ${REDIS_WORKER_BILIBILI_USERNAME:-worker-bilibili}
+      REDIS_CORE_BILIBILI_PASSWORD: ${REDIS_CORE_BILIBILI_PASSWORD:-dpms-core-bilibili-local-only-change-me-2026}
+      REDIS_WORKER_BILIBILI_PASSWORD: ${REDIS_WORKER_BILIBILI_PASSWORD:-dpms-worker-bilibili-local-only-change-me-2026}
+      REDIS_CORE_WEIBO_USERNAME: ${REDIS_CORE_WEIBO_USERNAME:-core-weibo}
+      REDIS_WORKER_WEIBO_USERNAME: ${REDIS_WORKER_WEIBO_USERNAME:-worker-weibo}
+      REDIS_CORE_WEIBO_PASSWORD: ${REDIS_CORE_WEIBO_PASSWORD:-dpms-core-weibo-local-only-change-me-2026}
+      REDIS_WORKER_WEIBO_PASSWORD: ${REDIS_WORKER_WEIBO_PASSWORD:-dpms-worker-weibo-local-only-change-me-2026}
+      REDIS_CORE_XIAOHONGSHU_USERNAME: ${REDIS_CORE_XIAOHONGSHU_USERNAME:-core-xiaohongshu}
+      REDIS_WORKER_XIAOHONGSHU_USERNAME: ${REDIS_WORKER_XIAOHONGSHU_USERNAME:-worker-xiaohongshu}
+      REDIS_CORE_XIAOHONGSHU_PASSWORD: ${REDIS_CORE_XIAOHONGSHU_PASSWORD:-dpms-core-xiaohongshu-local-only-change-me-2026}
+      REDIS_WORKER_XIAOHONGSHU_PASSWORD: ${REDIS_WORKER_XIAOHONGSHU_PASSWORD:-dpms-worker-xiaohongshu-local-only-change-me-2026}
+      REDIS_CORE_DOUYIN_USERNAME: ${REDIS_CORE_DOUYIN_USERNAME:-core-douyin}
+      REDIS_WORKER_DOUYIN_USERNAME: ${REDIS_WORKER_DOUYIN_USERNAME:-worker-douyin}
+      REDIS_CORE_DOUYIN_PASSWORD: ${REDIS_CORE_DOUYIN_PASSWORD:-dpms-core-douyin-local-only-change-me-2026}
+      REDIS_WORKER_DOUYIN_PASSWORD: ${REDIS_WORKER_DOUYIN_PASSWORD:-dpms-worker-douyin-local-only-change-me-2026}
+      REDIS_HEALTH_PASSWORD: ${REDIS_HEALTH_PASSWORD:-dpms-health-local-only-change-me-2026}
+      REDIS_GROUP_ADMIN_PASSWORD: ${REDIS_GROUP_ADMIN_PASSWORD:-dpms-group-admin-local-only-change-me-2026}
+    volumes:
+      - redis-data:/data
+      - ./docker/redis/entrypoint.sh:/usr/local/bin/dpms-redis-entrypoint.sh:ro
+      - ./docker/redis/consumer-groups.tsv:/usr/local/share/dpms/consumer-groups.tsv:ro
     networks:
       - app-net
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - SETGID
+      - SETUID
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "test \"$$(REDISCLI_AUTH=\"$${REDIS_HEALTH_PASSWORD}\" redis-cli --no-auth-warning --raw --user health ACL WHOAMI 2>/dev/null)\" = health && REDISCLI_AUTH=\"$${REDIS_HEALTH_PASSWORD}\" redis-cli --no-auth-warning --raw --user health PING 2>/dev/null | grep -qx PONG"]
       interval: 10s
       timeout: 5s
       retries: 12
+      start_period: 10s
     deploy:
       resources:
         limits:
@@ -177,3 +915,8 @@ networks:
 volumes:
   mysql-data:
   evidence-data:
+  evidence-bilibili:
+  evidence-weibo:
+  evidence-xiaohongshu:
+  evidence-douyin:
+  redis-data:

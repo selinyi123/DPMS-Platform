@@ -169,19 +169,88 @@ class NavigationSafetyTests(unittest.IsolatedAsyncioTestCase):
         for platform, canonical_uri in (
             ("bilibili", "https://t.bilibili.com/123456789"),
             ("bilibili", "canonical://weibo/status/123456789"),
+            ("bilibili", "canonical://bilibili/dynamic/settings"),
+            ("bilibili", "canonical://bilibili/dynamic/" + "\uff11" * 9),
+            ("bilibili", "canonical://bilibili/dynamic/" + "1" * 21),
+            ("bilibili", "canonical://bilibili/video/not-a-video-id"),
+            ("bilibili", "canonical://bilibili/video/av" + "\uff11" * 9),
+            ("bilibili", "canonical://bilibili/article/123456"),
+            ("bilibili", "canonical://bilibili/article/cv"),
+            ("bilibili", "canonical://bilibili/article/CV123456"),
+            ("bilibili", "canonical://bilibili/article/cv123456suffix"),
+            ("bilibili", "canonical://bilibili/article/cv１２３４５６"),
             ("weibo", "canonical://weibo/video/123456789"),
             ("weibo", "canonical://weibo/status/invalid_slug"),
             ("weibo", "canonical://weibo/status/0"),
             ("weibo", "canonical://weibo/status/07987885345"),
             ("weibo", "canonical://weibo/status/9223372036854775808"),
             ("weibo", "canonical://weibo/status/７９８７８８５３４５"),
+            ("xiaohongshu", "canonical://xiaohongshu/note/abc123"),
+            ("xiaohongshu", "canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0d"),
+            ("xiaohongshu", "canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0dg"),
             ("douyin", "canonical://douyin/video/"),
+            ("douyin", "canonical://douyin/video/1"),
+            (
+                "douyin",
+                "canonical://douyin/video/123456789012345678901234567890123",
+            ),
+            ("douyin", "canonical://douyin/video/１２３４５６７８"),
             ("douyin", "canonical://douyin/note/abc"),
             ("douyin", "canonical://douyin/note/752000000000000000"),
+            ("douyin", "canonical://douyin/note/７５２００００００００００００００００"),
         ):
             with self.subTest(platform=platform, canonical_uri=canonical_uri):
                 with self.assertRaisesRegex(ValueError, "canonical_identity_invalid"):
                     validated_platform_canonical_uri(platform, canonical_uri)
+
+    def test_bilibili_final_article_url_requires_exact_cv_numeric_id(self):
+        canonical_uri = "canonical://bilibili/article/cv123456"
+        for final_url in (
+            "https://www.bilibili.com/read/123456",
+            "https://www.bilibili.com/read/cv",
+            "https://www.bilibili.com/read/CV123456",
+            "https://www.bilibili.com/read/cv123456suffix",
+            "https://www.bilibili.com/read/cv１２３４５６",
+        ):
+            with self.subTest(final_url=final_url):
+                with self.assertRaisesRegex(ValueError, "content_identity_mismatch"):
+                    validated_platform_content_url(
+                        "bilibili",
+                        final_url,
+                        canonical_uri,
+                    )
+
+    def test_bilibili_final_url_rejects_malformed_dynamic_and_video_ids(self):
+        cases = (
+            (
+                "https://t.bilibili.com/settings",
+                "canonical://bilibili/dynamic/123456789",
+            ),
+            (
+                "https://www.bilibili.com/opus/" + "\uff11" * 9,
+                "canonical://bilibili/dynamic/123456789",
+            ),
+            (
+                "https://www.bilibili.com/video/not-a-video-id",
+                "canonical://bilibili/video/BV1xx411c7mD",
+            ),
+        )
+        for final_url, canonical_uri in cases:
+            with self.subTest(final_url=final_url):
+                with self.assertRaisesRegex(ValueError, "content_identity_mismatch"):
+                    validated_platform_content_url(
+                        "bilibili",
+                        final_url,
+                        canonical_uri,
+                    )
+
+    def test_xiaohongshu_final_url_rejects_malformed_note_id(self):
+        with self.assertRaisesRegex(ValueError, "content_identity_mismatch"):
+            validated_platform_content_url(
+                "xiaohongshu",
+                "https://www.xiaohongshu.com/explore/abc123",
+                "canonical://xiaohongshu/note/64f1a2b3c4d5e6f7a8b9c0d1",
+            )
 
     async def test_main_frame_cross_host_redirect_is_aborted_before_continue(self):
         page = FakePage()

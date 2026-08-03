@@ -66,6 +66,14 @@ class EvidenceFileSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(path.read_bytes(), b"existing evidence")
 
+    @unittest.skipUnless(os.name == "posix", "file modes are POSIX-only")
+    def test_writer_publishes_group_read_only_artifact(self):
+        path = self.root / "task-1.png"
+
+        task_runner.write_evidence_file_exclusive(path, b"evidence")
+
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+
     @unittest.skipUnless(os.name == "posix", "directory fsync is POSIX-only")
     def test_writer_fsyncs_file_before_directory_entry(self):
         path = self.root / "task-1.png"

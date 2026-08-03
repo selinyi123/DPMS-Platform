@@ -7,6 +7,10 @@ import databases
 import redis.asyncio as aioredis
 
 from app.config import settings
+from shared.platform_scope import normalize_platform_scope
+from shared.redis_consumer_groups import (
+    verify_redis_consumer_group_topology,
+)
 from app.utils.log import structured_log
 
 
@@ -71,8 +75,8 @@ def _is_schema_write(query) -> bool:
 
 
 class GuardedDatabase:
-    def __init__(self, url: str):
-        self._inner = databases.Database(url)
+    def __init__(self, url: str, **options):
+        self._inner = databases.Database(url, **options)
 
     async def execute(self, query, values=None, *args, **kwargs):
         if production_mode() and not _schema_write_allowed.get() and _is_schema_write(query):
@@ -89,7 +93,13 @@ class GuardedDatabase:
         return getattr(self._inner, name)
 
 
-database = GuardedDatabase(settings.database_url)
+# All persisted timestamps and evidence cut-offs are interpreted as UTC.
+# Configure every pooled MySQL session rather than relying on the server's
+# mutable global/default time zone.
+database = GuardedDatabase(
+    settings.database_url,
+    init_command="SET time_zone = '+00:00'",
+)
 
 
 async def execute_affected_rows(query, values=None, *, db=None) -> int:
@@ -121,8 +131,18 @@ class RedisClient:
 
 
 
-    async def initialize(self):
+    async def initialize(
+        self,
+        *,
+        platforms=None,
+        include_shared: bool = True,
+    ):
 
+        auth_options = {}
+        if settings.redis_username:
+            auth_options["username"] = settings.redis_username
+        if settings.redis_password:
+            auth_options["password"] = settings.redis_password
         self._conn = aioredis.from_url(
 
             settings.redis_url,
@@ -131,19 +151,37 @@ class RedisClient:
 
             decode_responses=True,
 
-            max_connections=10
+            max_connections=settings.redis_max_connections,
+
+            socket_timeout=settings.redis_socket_timeout_seconds,
+
+            socket_connect_timeout=settings.redis_connect_timeout_seconds,
+
+            **auth_options,
 
         )
 
-        try:
-
-            await self._conn.xgroup_create("lottery_tasks", "workers", id="0", mkstream=True)
-
-        except aioredis.ResponseError as e:
-
-            if "BUSYGROUP" not in str(e):
-
-                raise
+        if platforms is None:
+            selected_platforms = frozenset(
+                normalize_platform_scope("all")
+            )
+        else:
+            platform_values = (
+                (platforms,)
+                if isinstance(platforms, str)
+                else tuple(platforms)
+            )
+            selected_platforms = (
+                frozenset(normalize_platform_scope(platform_values))
+                if platform_values
+                else frozenset()
+            )
+        await verify_redis_consumer_group_topology(
+            self._conn,
+            role="core",
+            platforms=selected_platforms,
+            include_shared=include_shared,
+        )
 
 
 

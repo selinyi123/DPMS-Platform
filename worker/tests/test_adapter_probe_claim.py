@@ -27,7 +27,14 @@ from app.action_plan import (  # noqa: E402
     compute_rule_hash,
     compute_target_hash,
 )
-from app.adapter_probe import claim_probe, probe_loop, summarize_probe_result  # noqa: E402
+from app.adapter_probe import (  # noqa: E402
+    build_recommended_config,
+    claim_probe,
+    probe_loop,
+    probe_phases_for_platform,
+    summarize_probe_result,
+)
+from app.platform_modules.registry import get_platform_module  # noqa: E402
 
 
 DYNAMIC_ID = "123456789012"
@@ -152,7 +159,7 @@ class ProbeLoopStartupTests(unittest.IsolatedAsyncioTestCase):
         shutdown_event.set()
         with patch("app.adapter_probe.redis", fake_redis):
             await probe_loop(object(), shutdown_event)
-        self.assertEqual(len(fake_redis.group_calls), 1)
+        self.assertEqual(len(fake_redis.group_calls), 0)
 
 
 class AdapterProbeClaimTests(unittest.IsolatedAsyncioTestCase):
@@ -332,7 +339,36 @@ class AdapterProbeSummaryTests(unittest.TestCase):
     def visible(selector: str) -> dict:
         return {"selector": selector, "visible": True, "count": 1, "error": None}
 
-    def test_selector_summary_remains_non_authoritative_compatibility_only(self):
+    def test_weibo_probe_uses_its_module_action_contract(self):
+        result = {
+            "followed": [self.visible("button.follow")],
+            "liked": [self.visible("button.like")],
+            "commented": [
+                self.visible("textarea.comment"),
+                self.visible("button.publish"),
+            ],
+            "favorited": [self.visible("button.favorite")],
+            "reposted": [self.visible("button.repost")],
+        }
+        summary = summarize_probe_result("weibo", result)
+        self.assertEqual(
+            probe_phases_for_platform("weibo"),
+            list(get_platform_module("weibo").action_order),
+        )
+        self.assertTrue(summary["selector_observation_complete"])
+        self.assertFalse(summary["ready_for_real_actions"])
+        self.assertFalse(summary["real_run_capable"])
+        self.assertTrue(summary["manual_confirmation_required"])
+        self.assertEqual(
+            summary["capability_block_reason"],
+            "weibo_selector_observation_only",
+        )
+        self.assertEqual(
+            build_recommended_config("weibo", result)["weibo"]["favorited"],
+            ["button.favorite"],
+        )
+
+    def test_weibo_probe_cannot_complete_without_favorite_observation(self):
         result = {
             "followed": [self.visible("button.follow")],
             "liked": [self.visible("button.like")],
@@ -342,15 +378,11 @@ class AdapterProbeSummaryTests(unittest.TestCase):
             ],
             "reposted": [self.visible("button.repost")],
         }
+
         summary = summarize_probe_result("weibo", result)
-        self.assertTrue(summary["selector_observation_complete"])
-        self.assertFalse(summary["ready_for_real_actions"])
-        self.assertFalse(summary["real_run_capable"])
-        self.assertTrue(summary["manual_confirmation_required"])
-        self.assertEqual(
-            summary["capability_block_reason"],
-            "weibo_selector_observation_only",
-        )
+
+        self.assertFalse(summary["selector_observation_complete"])
+        self.assertIn("favorited", summary["missing_phases"])
 
 
 if __name__ == "__main__":

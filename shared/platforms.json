@@ -24,12 +24,13 @@
       "account_check_url": "https://www.douyin.com/",
       "required_cookies": ["sessionid"],
       "cookie_domain": ".douyin.com",
-      "qr_login": true,
+      "qr_login": false,
+      "qr_login_blocker": "douyin_device_agent_required",
       "cookie_login": true
     },
     "xiaohongshu": {
       "label": "Xiaohongshu",
-      "login_url": "https://www.xiaohongshu.com/login",
+      "login_url": "https://www.xiaohongshu.com/explore",
       "account_check_url": "https://www.xiaohongshu.com/explore",
       "required_cookies": ["web_session"],
       "cookie_domain": ".xiaohongshu.com",

@@ -138,6 +138,11 @@ def _task():
         "account_lease_id": "lease-1",
         "account_lease_generation": "7",
         "action_plan": plan,
+        # This suite exercises the pre-intent compatibility envelope.  Legacy
+        # tasks are accepted only when Core's immutable shared-stream Outbox
+        # row and fan-out provenance are both present.
+        "legacy_source_stream": "lottery_tasks",
+        "legacy_source_message_id": "1700000000000-0",
     }
 
 
@@ -169,6 +174,7 @@ def _decision_row():
         "account_platform": "bilibili",
         "account_status": "ready",
         "account_execution_revision": REVISION,
+        "account_active_risk": 0,
         "bound_lottery_id": 73,
         "lottery_platform": "bilibili",
         "lottery_status": "claimed",
@@ -243,6 +249,18 @@ def _decision_row():
         "decision_subject_id": "73",
         "decision_outcome": "allow",
         "policy_active": 1,
+        "legacy_outbox_stream_key": "lottery_tasks",
+        "legacy_outbox_status": "sent",
+        "legacy_outbox_dedup_key": "task-1",
+        "legacy_outbox_payload": {
+            "task_id": "task-1",
+            "account_id": "41",
+            "lottery_id": "73",
+            "platform": "bilibili",
+            "mode": "real_run",
+            "action_plan": plan,
+            "action_plan_hash": plan["plan_hash"],
+        },
     }
 
 
@@ -256,6 +274,11 @@ class FakeGateDatabase:
         self.platform_breaker_status = "open"
 
     async def fetch_one(self, query, values=None):
+        if (
+            self.raise_on == "evidence_fetch_one"
+            and "execution_evidence_bindings" in query
+        ):
+            raise RuntimeError("platform evidence database unavailable")
         if self.raise_on == "fetch_one":
             raise RuntimeError("database unavailable")
         if "runtime_settings" in query:
@@ -313,6 +336,25 @@ class RealRunConsumeGateTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_blocked(db, "real_run_disabled")
         db.setting = None
         await self.assert_blocked(db, "runtime_setting_missing")
+
+    async def test_active_account_risk_is_rechecked_before_every_action(self):
+        db = FakeGateDatabase()
+        db.decision["account_active_risk"] = 1
+
+        await self.assert_blocked(db, "recent_account_risk_event")
+
+    def test_gate_query_uses_the_materialized_active_risk_state(self):
+        from app import real_run_gate
+
+        compact = " ".join(real_run_gate._TASK_DECISION_QUERY.split())
+        self.assertIn(
+            "FROM account_active_risk_states active_risk",
+            compact,
+        )
+        self.assertIn(
+            "active_risk.active_until > NOW()",
+            compact,
+        )
 
     async def test_process_switch_is_independent_and_fail_closed(self):
         for process_value in (None, "", "false", "0", "invalid"):
@@ -402,6 +444,11 @@ class RealRunConsumeGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_database_errors_are_collapsed_to_safe_gate_code(self):
         db = FakeGateDatabase()
         db.raise_on = "fetch_one"
+        await self.assert_blocked(db, "gate_database_error")
+
+    async def test_platform_evidence_loader_errors_fail_closed(self):
+        db = FakeGateDatabase()
+        db.raise_on = "evidence_fetch_one"
         await self.assert_blocked(db, "gate_database_error")
 
     async def test_unknown_outcome_opens_platform_breaker(self):

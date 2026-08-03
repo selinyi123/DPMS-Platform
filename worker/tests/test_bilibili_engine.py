@@ -179,7 +179,7 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
 
             if path.endswith("/x/web-interface/nav"):
                 return _resp(
-                    {"code": 0, "data": {"isLogin": True, "wbi_img": {
+                    {"code": 0, "data": {"isLogin": True, "mid": 12345, "wbi_img": {
                         "img_url": "https://i0.hdslb.com/bfs/wbi/" + "a" * 32 + ".png",
                         "sub_url": "https://i0.hdslb.com/bfs/wbi/" + "b" * 32 + ".png",
                     }}},
@@ -235,6 +235,22 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
         async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler())) as c:
             self.assertTrue(await c.check_login())
 
+    async def test_check_login_rejects_authenticated_uid_mismatch(self):
+        def handle(request: httpx.Request) -> httpx.Response:
+            return _resp(
+                {
+                    "code": 0,
+                    "data": {"isLogin": True, "mid": 54321},
+                },
+                request,
+            )
+
+        async with BilibiliApiClient(
+            COOKIE,
+            transport=httpx.MockTransport(handle),
+        ) as client:
+            self.assertFalse(await client.check_login())
+
     async def test_client_close_failure_does_not_replace_completed_body_outcome(self):
         class FailingCloseClient:
             async def aclose(self):
@@ -264,7 +280,10 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
             attempts += 1
             if attempts < 3:
                 raise httpx.ConnectError("temporary read failure", request=request)
-            return _resp({"code": 0, "data": {"isLogin": True}}, request)
+            return _resp(
+                {"code": 0, "data": {"isLogin": True, "mid": 12345}},
+                request,
+            )
 
         config = BiliEngineConfig(max_http_retries=2, http_retry_wait=0)
         async with BilibiliApiClient(

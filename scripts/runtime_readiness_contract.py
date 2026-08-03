@@ -23,15 +23,26 @@ REQUIRED_FILES = [
     "scripts/controlled_browser_lifecycle_smoke.py",
     "worker/app/task_runner.py",
     "worker/app/services/task_outbox.py",
+    "shared/task_streams.py",
 ]
 
 REQUIRED_MARKERS = {
     "worker/app/task_runner.py": [
-        'STREAM_KEY = "lottery_tasks"',
-        'GROUP_NAME = "workers"',
+        "STREAM_KEY = LEGACY_TASK_STREAM_KEY",
+        "GROUP_NAME = LEGACY_TASK_GROUP_NAME",
+        "task_stream_bindings",
+        "TASK_DISPATCH_MAX_INFLIGHT = 32",
+        "get_platform_module",
         "worker_id",
         "lease_expires_at",
         "failed_task_messages",
+    ],
+    "shared/task_streams.py": [
+        'LEGACY_TASK_STREAM_KEY = "lottery_tasks"',
+        'LEGACY_TASK_GROUP_NAME = "workers"',
+        "TASK_STREAM_KEYS",
+        "REPAIR_TASK_STREAM_KEYS",
+        "task_stream_bindings",
     ],
     "worker/app/services/task_outbox.py": [
         "task_outbox_events",

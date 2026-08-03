@@ -210,6 +210,18 @@ test('preserves implicit-default plus explicit-platform mixed rows', () => {
   assert.doesNotMatch(result.content, /secret|sessdata|xsec/i);
 });
 
+test('deduplicates implicit and explicit forms of the default platform target', () => {
+  const content = [
+    'https://t.bilibili.com/123?from=implicit',
+    'bilibili,https://t.bilibili.com/123?from=explicit',
+  ].join('\n');
+  const result = normalizeTargetImportForPlatform('bilibili', content, ALL_PLATFORMS);
+
+  assert.equal(result.content, 'https://t.bilibili.com/123');
+  assert.equal(result.targetCount, 1);
+  assert.equal(result.discardedRows, 1);
+});
+
 test('rejects secrets placed inside score or expiry metadata columns', () => {
   for (const content of [
     `https://www.xiaohongshu.com/explore/${NOTE_A},50,cookie=a1-secret`,
@@ -292,7 +304,7 @@ test('fails closed when structured XHS data is submitted under another platform'
   assert.throws(
     () => normalizeTargetImportForPlatform('bilibili', content),
     error => error instanceof XiaohongshuImportError
-      && error.code === 'target_import_xiaohongshu_requires_platform',
+      && error.code === 'target_import_structured_requires_platform',
   );
 });
 
@@ -345,37 +357,63 @@ test('rejects sensitive credential material hidden in URL paths', () => {
   }
 });
 
-test('rejects batches containing multiple XHS short links', () => {
-  assert.throws(
-    () => normalizeXiaohongshuTargetImport([
-      'https://xhslink.com/a/one',
-      'https://xhslink.com/a/two',
-    ].join('\n')),
-    error => error instanceof XiaohongshuImportError
-      && error.code === 'xiaohongshu_import_short_link_batch_unsupported',
-  );
+test('retains multiple XHS short links for Core rejection and audit', () => {
+  const result = normalizeXiaohongshuTargetImport([
+    'https://xhslink.com/a/one',
+    'https://xhslink.com/a/two',
+  ].join('\n'));
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.blockedShortLinkCount, 2);
+  assert.equal(result.shortLinkCount, 0);
+  assert.deepEqual(result.shortLinkErrorsByPlatform, {
+    xiaohongshu: 'xiaohongshu_import_short_link_batch_unsupported',
+  });
+  assert.equal(result.content, [
+    'https://xhslink.com/a/one',
+    'https://xhslink.com/a/two',
+  ].join('\n'));
 });
 
-test('requires every supported-platform short link to be imported alone', () => {
-  assert.throws(
-    () => normalizeXiaohongshuTargetImport([
-      'bilibili,https://b23.tv/one',
-      `xiaohongshu,https://www.xiaohongshu.com/explore/${NOTE_A}`,
-    ].join('\n'), ALL_PLATFORMS),
-    error => error instanceof XiaohongshuImportError
-      && error.code === 'xiaohongshu_import_short_link_batch_unsupported',
-  );
+test('allows one supported-platform short link alongside direct links', () => {
+  const result = normalizeXiaohongshuTargetImport([
+    'bilibili,https://b23.tv/one',
+    `xiaohongshu,https://www.xiaohongshu.com/explore/${NOTE_A}`,
+  ].join('\n'), ALL_PLATFORMS);
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.shortLinkCount, 1);
+  assert.equal(result.content, [
+    'bilibili,https://b23.tv/one',
+    `xiaohongshu,https://www.xiaohongshu.com/explore/${NOTE_A.toLowerCase()}`,
+  ].join('\n'));
 });
 
-test('normalizes trailing-dot hosts before enforcing short-link isolation', () => {
-  assert.throws(
-    () => normalizeTargetImportForPlatform('bilibili', [
-      'https://b23.tv./one',
-      'https://b23.tv./two',
-    ].join('\n'), ALL_PLATFORMS),
-    error => error instanceof XiaohongshuImportError
-      && error.code === 'xiaohongshu_import_short_link_batch_unsupported',
-  );
+test('allows one XHS short link alongside a direct XHS link', () => {
+  const result = normalizeXiaohongshuTargetImport(JSON.stringify([
+    'https://xhslink.com/a/one',
+    `https://www.xiaohongshu.com/explore/${NOTE_A}`,
+  ]));
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.shortLinkCount, 1);
+});
+
+test('detects trailing-dot hosts when reporting short-link isolation', () => {
+  const result = normalizeTargetImportForPlatform('bilibili', [
+    'https://b23.tv./one',
+    'https://b23.tv./two',
+  ].join('\n'), ALL_PLATFORMS);
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.blockedShortLinkCount, 2);
+  assert.deepEqual(result.shortLinkErrorsByPlatform, {
+    bilibili: 'xiaohongshu_import_short_link_batch_unsupported',
+  });
+  assert.equal(result.content, [
+    'https://b23.tv./one',
+    'https://b23.tv./two',
+  ].join('\n'));
 });
 
 test('does not count a DPMS header as a second short-link target', () => {

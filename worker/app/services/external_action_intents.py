@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from app.action_plan import canonical_json_bytes
+from shared.execution_contracts import (
+    LEGACY_FULL_EXECUTION_INTENT_KIND,
+    lease_operation_kind_for_execution_intent,
+)
 
 
-LEASE_OPERATION_KIND = "real_run"
 INTENT_PREPARED = "prepared"
 INTENT_STARTED = "started"
 INTENT_SUCCEEDED = "succeeded"
@@ -83,6 +86,7 @@ SELECT
   tr.account_lease_id,
   tr.account_lease_generation,
   tr.reconciliation_required,
+  execution_binding.binding_kind AS execution_intent_kind,
   aol.lease_id,
   aol.generation AS lease_generation,
   aol.operation_kind,
@@ -103,6 +107,8 @@ SELECT
       AND live.expires_at > NOW()
   ) AS active_account_lease_count
 FROM task_runs tr
+LEFT JOIN task_execution_intent_bindings execution_binding
+  ON execution_binding.task_id = tr.task_id
 LEFT JOIN account_operation_leases aol
   ON aol.account_id = tr.account_id
  AND aol.lease_id = tr.account_lease_id
@@ -155,6 +161,7 @@ def _validate_task_lease(
     account_id: int,
     lottery_id: int,
     worker_id: str,
+    execution_intent_kind: str,
 ) -> tuple[str, int]:
     if row is None:
         raise ExternalActionIntentBlocked("task_lease_missing")
@@ -172,6 +179,25 @@ def _validate_task_lease(
         _row_get(row, "account_lease_generation"),
         code="account_lease_generation_invalid",
     )
+    try:
+        expected_operation_kind = (
+            lease_operation_kind_for_execution_intent(
+                execution_intent_kind
+            )
+        )
+    except ValueError as exc:
+        raise ExternalActionIntentBlocked(
+            "task_lease_binding_invalid"
+        ) from exc
+    persisted_intent_kind = str(
+        _row_get(row, "execution_intent_kind") or ""
+    ).strip()
+    intent_binding_matches = (
+        not persisted_intent_kind
+        if execution_intent_kind
+        == LEGACY_FULL_EXECUTION_INTENT_KIND
+        else persisted_intent_kind == execution_intent_kind
+    )
     if (
         str(_row_get(row, "task_id") or "").strip() != task_id
         or row_account_id != account_id
@@ -181,8 +207,9 @@ def _validate_task_lease(
         or not lease_id
         or lease_id != task_lease_id
         or generation != task_generation
+        or not intent_binding_matches
         or str(_row_get(row, "operation_kind") or "").strip().lower()
-        != LEASE_OPERATION_KIND
+        != expected_operation_kind
         or str(_row_get(row, "owner_id") or "").strip() != task_id
         or str(_row_get(row, "lease_task_id") or "").strip() != task_id
         or int(_row_get(row, "lease_active", 0) or 0) != 1
@@ -254,6 +281,7 @@ async def prepare_and_start_action_intent(
     account_id: int,
     lottery_id: int,
     worker_id: str,
+    execution_intent_kind: str,
     action: str,
     payload: Mapping[str, Any],
 ) -> StartedActionIntent:
@@ -276,6 +304,7 @@ async def prepare_and_start_action_intent(
             account_id=account_id,
             lottery_id=lottery_id,
             worker_id=worker_id,
+            execution_intent_kind=execution_intent_kind,
         )
         row = await db.fetch_one(
             _INTENT_FOR_UPDATE, {"task_id": task_id, "action": action}
@@ -421,6 +450,7 @@ async def renew_account_operation_lease(
     account_id: int,
     lottery_id: int,
     worker_id: str,
+    execution_intent_kind: str,
 ) -> tuple[str, int]:
     """Renew only the exact active fencing generation owned by this task."""
 
@@ -432,19 +462,32 @@ async def renew_account_operation_lease(
             account_id=account_id,
             lottery_id=lottery_id,
             worker_id=worker_id,
+            execution_intent_kind=execution_intent_kind,
         )
+        try:
+            operation_kind = (
+                lease_operation_kind_for_execution_intent(
+                    execution_intent_kind
+                )
+            )
+        except ValueError as exc:
+            raise ExternalActionIntentBlocked(
+                "task_lease_binding_invalid"
+            ) from exc
         await db.execute(
             """UPDATE account_operation_leases
                SET expires_at = DATE_ADD(NOW(), INTERVAL 900 SECOND)
                WHERE account_id = :account_id AND lease_id = :lease_id
-                 AND generation = :generation AND task_id = :task_id
-                 AND owner_id = :task_id AND operation_kind = 'real_run'
-                 AND released_at IS NULL AND expires_at > NOW()""",
+                  AND generation = :generation AND task_id = :task_id
+                  AND owner_id = :task_id
+                  AND operation_kind = :operation_kind
+                  AND released_at IS NULL AND expires_at > NOW()""",
             {
                 "account_id": account_id,
                 "lease_id": lease_id,
                 "generation": generation,
                 "task_id": task_id,
+                "operation_kind": operation_kind,
             },
         )
         persisted = await db.fetch_one(

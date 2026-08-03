@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from app.config import settings
@@ -22,11 +23,13 @@ from app.utils.log import structured_log
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 VERSION_RE = re.compile(r"^(\d{4})_.+\.sql$")
 MIGRATION_LOCK_NAME = "dpms:schema_migrations"
+MIGRATION_PROCESS_LOCK_NAME = "dpms:schema_upgrade_process"
 MIGRATION_LOCK_TIMEOUT_SECONDS = 30
 MIN_INNODB_PAGE_SIZE = 16_384
 CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
 
 PRODUCTION_REQUIRED_TABLES = {
+    "account_calibrations",
     "account_operation_leases",
     "adapter_calibrations",
     "schema_migrations",
@@ -38,14 +41,86 @@ PRODUCTION_REQUIRED_TABLES = {
     "events",
     "execution_evidence_bindings",
     "external_action_intents",
+    "lottery_execution_intents",
+    "lottery_execution_intent_heads",
+    "task_execution_intent_bindings",
     "outbox_events",
     "task_outbox_events",
     "failed_task_messages",
+    "runtime_settings",
     "worker_heartbeats",
     "bilibili_action_ledger",
+    "account_active_risk_states",
+    "account_profile_cleanup_intents",
+    "account_profile_context_leases",
+    "login_profile_cleanup_intents",
+    "notification_channel_revisions",
+    "notification_delivery_attempts",
+    "outbox_archive_watermarks",
+    "outbox_event_archive",
+    "platform_runtime_security_domains",
+    "dpms_schema_baselines",
+    "notify_logs",
+    "tracked_sources",
+    "xiaohongshu_target_sources",
+    "xiaohongshu_target_candidates",
+    "xiaohongshu_target_candidate_source_hits",
 }
 
 PRODUCTION_REQUIRED_COLUMNS = {
+    "notification_channel_revisions": {
+        "channel",
+        "revision",
+        "updated_at",
+    },
+    "notification_delivery_attempts": {
+        "delivery_key",
+        "channel",
+        "status",
+        "attempts",
+        "created_at",
+        "updated_at",
+    },
+    "outbox_archive_watermarks": {
+        "stream_key",
+        "continuity_epoch",
+        "safe_outbox_id",
+        "updated_at",
+    },
+    "outbox_event_archive": {
+        "source_table",
+        "source_id",
+        "stream_key",
+        "payload",
+        "delivery_epoch",
+        "archived_at",
+    },
+    "platform_runtime_security_domains": {
+        "platform",
+        "status",
+        "database_user",
+        "database_name",
+        "core_redis_user",
+        "worker_redis_user",
+        "encryption_key_fingerprint",
+        "generation",
+        "created_at",
+        "updated_at",
+    },
+    "dpms_schema_baselines": {
+        "baseline_key",
+        "migration_version",
+        "mysql_major",
+        "contract_revision",
+        "applied_at",
+    },
+    "notify_logs": {
+        "id",
+        "channel",
+        "success",
+        "config_revision",
+        "created_at",
+    },
     "task_phases": {"phase"},
     "task_runs": {
         "task_id",
@@ -145,6 +220,60 @@ PRODUCTION_REQUIRED_COLUMNS = {
         "created_at",
         "updated_at",
     },
+    "lottery_execution_intents": {
+        "contract_version",
+        "intent_id",
+        "intent_hash",
+        "lottery_id",
+        "source_task_id",
+        "source_account_id",
+        "platform",
+        "raw_url",
+        "canonical_url",
+        "full_action_plan",
+        "full_action_plan_hash",
+        "full_required_actions",
+        "full_required_actions_hash",
+        "rule_snapshot_id",
+        "rule_hash",
+        "execution_path_id",
+        "target_hash",
+        "created_at",
+    },
+    "lottery_execution_intent_heads": {
+        "lottery_id",
+        "current_intent_id",
+        "generation",
+        "created_at",
+        "updated_at",
+    },
+    "task_execution_intent_bindings": {
+        "contract_version",
+        "task_id",
+        "intent_id",
+        "lottery_id",
+        "account_id",
+        "binding_kind",
+        "requested_actions",
+        "requested_actions_hash",
+        "bound_action_plan",
+        "bound_action_plan_hash",
+        "evidence_action_plan_hash",
+        "rule_snapshot_id",
+        "rule_hash",
+        "execution_evidence_id",
+        "execution_evidence_kind",
+        "exact_execution_evidence_id",
+        "oauth_calibration_id",
+        "execution_path_id",
+        "target_hash",
+        "config_hash",
+        "execution_revision",
+        "account_lease_id",
+        "account_lease_generation",
+        "binding_hash",
+        "created_at",
+    },
     "adapter_calibrations": {
         "probe_id",
         "platform",
@@ -161,11 +290,152 @@ PRODUCTION_REQUIRED_COLUMNS = {
         "account_lease_id",
         "account_lease_generation",
     },
+    "account_calibrations": {
+        "calibration_id",
+        "platform",
+        "account_id",
+        "status",
+        "result",
+        "created_at",
+    },
+    "events": {
+        "id",
+        "aggregate",
+        "aggregate_id",
+        "event_type",
+        "payload",
+        "correlation_id",
+        "causation_id",
+        "actor_type",
+        "actor_id",
+        "source_service",
+        "occurred_at",
+    },
     "schema_migrations": {"version", "checksum", "applied_at"},
     "accounts": {"id", "status", "execution_revision"},
-    "task_outbox_events": {"event_kind", "status", "dedup_key", "payload"},
+    "task_outbox_events": {
+        "event_kind",
+        "status",
+        "dedup_key",
+        "payload",
+        "archived_at",
+        "redis_delivery_epoch",
+    },
+    "outbox_events": {
+        "stream_key",
+        "status",
+        "dedup_key",
+        "archived_at",
+        "redis_delivery_epoch",
+    },
+    "runtime_settings": {"setting_key", "setting_value", "updated_at"},
     "failed_task_messages": {"stream_key", "message_id", "reason", "payload"},
     "bilibili_action_ledger": {"task_id", "account_id", "lottery_id", "action", "outcome", "ok"},
+    "account_active_risk_states": {
+        "account_id",
+        "risk_event_id",
+        "event_type",
+        "detail",
+        "event_created_at",
+        "active_until",
+        "updated_at",
+    },
+    "account_profile_cleanup_intents": {
+        "id",
+        "account_id",
+        "platform",
+        "status",
+        "attempts",
+        "claim_token",
+        "worker_id",
+        "claimed_at",
+        "next_attempt_at",
+        "completed_at",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    },
+    "account_profile_context_leases": {
+        "account_id",
+        "platform",
+        "lease_token",
+        "owner_id",
+        "acquired_at",
+        "renewed_at",
+        "lease_expires_at",
+        "created_at",
+        "updated_at",
+    },
+    "login_profile_cleanup_intents": {
+        "id",
+        "session_id",
+        "status",
+        "attempts",
+        "claim_token",
+        "worker_id",
+        "claimed_at",
+        "next_attempt_at",
+        "completed_at",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    },
+    "tracked_sources": {
+        "id",
+        "platform",
+        "source_type",
+        "source_value",
+    },
+    "xiaohongshu_target_sources": {
+        "id",
+        "source_type",
+        "source_value",
+        "active",
+        "last_scan_at",
+        "status",
+        "last_error_code",
+        "version",
+        "created_at",
+        "updated_at",
+    },
+    "xiaohongshu_target_candidates": {
+        "id",
+        "platform",
+        "raw_url",
+        "canonical_url",
+        "url_hash",
+        "title",
+        "evidence",
+        "rule",
+        "classification",
+        "published_at",
+        "value_score",
+        "expires_at",
+        "decision_status",
+        "decision_reason",
+        "accepted_lottery_id",
+        "version",
+        "first_seen_at",
+        "last_seen_at",
+        "decided_at",
+        "decision_actor_id",
+        "created_at",
+        "updated_at",
+    },
+    "xiaohongshu_target_candidate_source_hits": {
+        "id",
+        "candidate_id",
+        "source_id",
+        "tracked_source_id",
+        "source_type",
+        "source_value",
+        "evidence",
+        "hit_count",
+        "first_seen_at",
+        "last_seen_at",
+        "created_at",
+        "updated_at",
+    },
 }
 
 # These ordered signatures are part of the safety contract, not merely
@@ -173,6 +443,12 @@ PRODUCTION_REQUIRED_COLUMNS = {
 # order to agree; checking names alone would let a drifted schema start while
 # silently weakening exact evidence/lease binding.
 PRODUCTION_REQUIRED_UNIQUE_INDEXES = {
+    ("outbox_events", "uk_outbox_dedup"): (
+        "dedup_key",
+    ),
+    ("account_calibrations", "uk_account_calibration_id"): (
+        "calibration_id",
+    ),
     ("lottery_rule_snapshots", "uk_rule_snapshot_id_lottery"): (
         "id",
         "lottery_id",
@@ -241,9 +517,334 @@ PRODUCTION_REQUIRED_UNIQUE_INDEXES = {
         "task_id",
         "action",
     ),
+    (
+        "lottery_execution_intents",
+        "uk_lottery_execution_intent_identity",
+    ): ("intent_id", "lottery_id"),
+    (
+        "lottery_execution_intents",
+        "uk_lottery_execution_intent_source_binding",
+    ): ("source_task_id", "lottery_id", "source_account_id"),
+    (
+        "lottery_execution_intent_heads",
+        "uk_lottery_execution_intent_head_identity",
+    ): ("current_intent_id", "lottery_id"),
+    (
+        "task_execution_intent_bindings",
+        "uk_task_execution_intent_binding_identity",
+    ): ("task_id", "intent_id", "lottery_id", "account_id"),
+    (
+        "account_active_risk_states",
+        "uk_account_active_risk_event",
+    ): ("risk_event_id",),
+    (
+        "account_profile_cleanup_intents",
+        "uk_account_profile_cleanup_account",
+    ): ("account_id",),
+    (
+        "login_profile_cleanup_intents",
+        "uk_login_profile_cleanup_session",
+    ): ("session_id",),
+    (
+        "account_profile_context_leases",
+        "uk_account_profile_context_lease_token",
+    ): ("lease_token",),
+    (
+        "xiaohongshu_target_sources",
+        "uk_xhs_target_source_identity",
+    ): ("source_type", "source_value"),
+    (
+        "xiaohongshu_target_candidates",
+        "uk_xhs_target_candidate_url_hash",
+    ): ("url_hash",),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "uk_xhs_target_candidate_source_hit",
+    ): ("candidate_id", "source_id"),
+    (
+        "notification_delivery_attempts",
+        "uk_notification_delivery_message_channel",
+    ): ("stream_message_id", "channel"),
+    (
+        "platform_runtime_security_domains",
+        "uk_platform_security_database_user",
+    ): ("database_user",),
+    (
+        "platform_runtime_security_domains",
+        "uk_platform_security_core_redis_user",
+    ): ("core_redis_user",),
+    (
+        "platform_runtime_security_domains",
+        "uk_platform_security_worker_redis_user",
+    ): ("worker_redis_user",),
+}
+
+# These keys preserve one immutable root per intent and, critically, one
+# authorization binding per task.  A same-named pre-created table without its
+# PRIMARY KEY could otherwise pass the named-index checks while accepting
+# multiple conflicting repair bindings for one task.
+PRODUCTION_REQUIRED_PRIMARY_KEYS = {
+    "lottery_execution_intents": ("intent_id",),
+    "lottery_execution_intent_heads": ("lottery_id",),
+    "task_execution_intent_bindings": ("task_id",),
+    "account_active_risk_states": ("account_id",),
+    "account_profile_cleanup_intents": ("id",),
+    "account_profile_context_leases": ("account_id",),
+    "login_profile_cleanup_intents": ("id",),
+    "notification_channel_revisions": ("channel",),
+    "notification_delivery_attempts": ("delivery_key",),
+    "outbox_archive_watermarks": ("stream_key",),
+    "outbox_event_archive": ("source_table", "source_id"),
+    "platform_runtime_security_domains": ("platform",),
+    "dpms_schema_baselines": ("baseline_key",),
+    "notify_logs": ("id",),
+    "xiaohongshu_target_sources": ("id",),
+    "xiaohongshu_target_candidates": ("id",),
+    "xiaohongshu_target_candidate_source_hits": ("id",),
+}
+
+# 0019 replaces this one-root-per-lottery uniqueness fence with an explicit
+# current-head row.  Merely omitting it from the required set would let a
+# partially applied migration pass verification while silently rejecting every
+# future immutable generation.
+PRODUCTION_FORBIDDEN_INDEXES = {
+    (
+        "lottery_execution_intents",
+        "uk_lottery_execution_intent_lottery",
+    ),
+}
+
+# Non-unique indexes which are required for bounded operational work rather
+# than referential integrity. The four independent Outbox relays would
+# otherwise rescan another platform's entire pending prefix every five seconds.
+PRODUCTION_REQUIRED_INDEXES = {
+    ("notify_logs", "idx_notify_delivery_revision"): (
+        "channel",
+        "config_revision",
+        "success",
+        "created_at",
+        "id",
+    ),
+    ("accounts", "idx_account_strategy_candidate"): (
+        "platform",
+        "status",
+        "deleted_at",
+        "daily_task_count",
+        "id",
+    ),
+    ("risk_events", "idx_risk_account_created_id"): (
+        "account_id",
+        "created_at",
+        "id",
+    ),
+    ("risk_events", "idx_risk_created_account_id"): (
+        "created_at",
+        "account_id",
+        "id",
+    ),
+    ("lotteries", "idx_lottery_extracted_platform_id"): (
+        "extracted_at",
+        "platform",
+        "id",
+    ),
+    ("adapter_calibrations", "idx_adapter_probe_status"): (
+        "status",
+        "created_at",
+    ),
+    ("account_calibrations", "idx_account_calibration_status"): (
+        "status",
+        "created_at",
+    ),
+    (
+        "account_calibrations",
+        "idx_account_calibration_account_platform_id",
+    ): (
+        "account_id",
+        "platform",
+        "id",
+    ),
+    (
+        "account_calibrations",
+        "idx_account_calibration_platform_queued",
+    ): (
+        "platform",
+        "status",
+        "created_at",
+        "id",
+    ),
+    (
+        "account_calibrations",
+        "idx_account_calibration_platform_running",
+    ): (
+        "platform",
+        "status",
+        "started_at",
+        "created_at",
+        "id",
+    ),
+    ("task_runs", "idx_task_run_status"): (
+        "status",
+        "created_at",
+    ),
+    ("task_runs", "idx_task_run_account_created_id"): (
+        "account_id",
+        "created_at",
+        "id",
+    ),
+    ("task_runs", "idx_task_run_created_lottery_id"): (
+        "created_at",
+        "lottery_id",
+        "id",
+    ),
+    ("task_runs", "idx_task_run_stale_running"): (
+        "status",
+        "lease_expires_at",
+        "task_id",
+    ),
+    ("task_runs", "idx_task_run_lottery_stale"): (
+        "lottery_id",
+        "status",
+        "lease_expires_at",
+        "task_id",
+    ),
+    ("lotteries", "idx_lottery_platform_recovery"): (
+        "platform",
+        "status",
+        "id",
+    ),
+    ("outbox_events", "idx_outbox_stream_status_id"): (
+        "stream_key",
+        "status",
+        "id",
+    ),
+    (
+        "account_active_risk_states",
+        "idx_account_active_risk_until",
+    ): (
+        "active_until",
+        "account_id",
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "idx_account_profile_cleanup_pending",
+    ): (
+        "platform",
+        "status",
+        "next_attempt_at",
+        "id",
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "idx_account_profile_cleanup_running",
+    ): (
+        "platform",
+        "status",
+        "claimed_at",
+        "id",
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "idx_login_profile_cleanup_pending",
+    ): ("status", "next_attempt_at", "id"),
+    (
+        "login_profile_cleanup_intents",
+        "idx_login_profile_cleanup_running",
+    ): ("status", "claimed_at", "id"),
+    (
+        "account_profile_context_leases",
+        "idx_account_profile_context_lease_expiry",
+    ): ("platform", "lease_expires_at", "account_id"),
+    (
+        "xiaohongshu_target_sources",
+        "idx_xhs_target_source_scan_queue",
+    ): ("active", "status", "last_scan_at", "id"),
+    (
+        "xiaohongshu_target_candidates",
+        "idx_xhs_target_candidate_review_queue",
+    ): ("decision_status", "last_seen_at", "id"),
+    (
+        "xiaohongshu_target_candidates",
+        "idx_xhs_target_candidate_accepted_lottery",
+    ): ("accepted_lottery_id", "id"),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "idx_xhs_target_source_hit_queue",
+    ): ("source_id", "last_seen_at", "candidate_id"),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "idx_xhs_target_hit_tracked_source",
+    ): ("tracked_source_id", "id"),
+    (
+        "platform_runtime_security_domains",
+        "idx_platform_security_status",
+    ): ("status", "updated_at"),
+    (
+        "notification_delivery_attempts",
+        "idx_notification_delivery_status",
+    ): ("status", "updated_at"),
+    (
+        "notification_delivery_attempts",
+        "idx_notification_delivery_log",
+    ): ("notify_log_id", "channel"),
+    (
+        "outbox_event_archive",
+        "idx_outbox_archive_stream_time",
+    ): ("stream_key", "archived_at"),
+    (
+        "outbox_event_archive",
+        "idx_outbox_archive_dedup",
+    ): ("dedup_key",),
+    (
+        "outbox_events",
+        "idx_outbox_archive_ready",
+    ): ("stream_key", "status", "archived_at", "id"),
+    (
+        "task_outbox_events",
+        "idx_task_outbox_archive_ready",
+    ): ("stream_key", "status", "archived_at", "id"),
 }
 
 PRODUCTION_REQUIRED_FOREIGN_KEYS = {
+    (
+        "account_profile_context_leases",
+        "fk_account_profile_context_lease_account",
+    ): (
+        ("account_id",),
+        "accounts",
+        ("id",),
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "fk_login_profile_cleanup_session",
+    ): (
+        ("session_id",),
+        "login_sessions",
+        ("session_id",),
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "fk_account_profile_cleanup_account",
+    ): (
+        ("account_id",),
+        "accounts",
+        ("id",),
+    ),
+    (
+        "account_active_risk_states",
+        "fk_account_active_risk_account",
+    ): (
+        ("account_id",),
+        "accounts",
+        ("id",),
+    ),
+    (
+        "account_active_risk_states",
+        "fk_account_active_risk_event",
+    ): (
+        ("risk_event_id",),
+        "risk_events",
+        ("id",),
+    ),
     ("lottery_rule_snapshots", "fk_rule_snapshot_lottery"): (
         ("lottery_id",),
         "lotteries",
@@ -359,31 +960,6 @@ PRODUCTION_REQUIRED_FOREIGN_KEYS = {
             "preflight_observation_hash",
         ),
     ),
-    ("task_runs", "fk_task_run_execution_evidence"): (
-        (
-            "execution_evidence_id",
-            "lottery_id",
-            "account_id",
-            "rule_snapshot_id",
-            "execution_path_id",
-            "target_hash",
-            "rule_hash",
-            "action_plan_hash",
-            "config_hash",
-        ),
-        "execution_evidence_bindings",
-        (
-            "id",
-            "lottery_id",
-            "account_id",
-            "rule_snapshot_id",
-            "execution_path_id",
-            "target_hash",
-            "rule_hash",
-            "action_plan_hash",
-            "config_hash",
-        ),
-    ),
     ("external_action_intents", "fk_external_action_task_binding"): (
         ("task_id", "lottery_id", "account_id"),
         "task_runs",
@@ -404,10 +980,150 @@ PRODUCTION_REQUIRED_FOREIGN_KEYS = {
         "account_operation_leases",
         ("lease_id", "account_id", "generation"),
     ),
+    (
+        "lottery_execution_intents",
+        "fk_lottery_execution_intent_lottery",
+    ): (
+        ("lottery_id",),
+        "lotteries",
+        ("id",),
+    ),
+    (
+        "lottery_execution_intents",
+        "fk_lottery_execution_intent_source_task",
+    ): (
+        ("source_task_id", "lottery_id", "source_account_id"),
+        "task_runs",
+        ("task_id", "lottery_id", "account_id"),
+    ),
+    (
+        "lottery_execution_intents",
+        "fk_lottery_execution_intent_rule_snapshot",
+    ): (
+        ("rule_snapshot_id", "lottery_id"),
+        "lottery_rule_snapshots",
+        ("id", "lottery_id"),
+    ),
+    (
+        "lottery_execution_intent_heads",
+        "fk_lottery_execution_intent_head_root",
+    ): (
+        ("current_intent_id", "lottery_id"),
+        "lottery_execution_intents",
+        ("intent_id", "lottery_id"),
+    ),
+    (
+        "task_execution_intent_bindings",
+        "fk_task_execution_intent_task",
+    ): (
+        ("task_id", "lottery_id", "account_id"),
+        "task_runs",
+        ("task_id", "lottery_id", "account_id"),
+    ),
+    (
+        "task_execution_intent_bindings",
+        "fk_task_execution_intent_root",
+    ): (
+        ("intent_id", "lottery_id"),
+        "lottery_execution_intents",
+        ("intent_id", "lottery_id"),
+    ),
+    (
+        "task_execution_intent_bindings",
+        "fk_task_execution_intent_exact_evidence",
+    ): (
+        ("exact_execution_evidence_id",),
+        "execution_evidence_bindings",
+        ("id",),
+    ),
+    (
+        "task_execution_intent_bindings",
+        "fk_task_execution_intent_oauth_calibration",
+    ): (
+        ("oauth_calibration_id",),
+        "account_calibrations",
+        ("calibration_id",),
+    ),
+    (
+        "task_execution_intent_bindings",
+        "fk_task_execution_intent_lease",
+    ): (
+        ("account_lease_id", "account_id", "account_lease_generation"),
+        "account_operation_leases",
+        ("lease_id", "account_id", "generation"),
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "fk_xhs_target_candidate_lottery",
+    ): (
+        ("accepted_lottery_id",),
+        "lotteries",
+        ("id",),
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "fk_xhs_target_hit_candidate",
+    ): (
+        ("candidate_id",),
+        "xiaohongshu_target_candidates",
+        ("id",),
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "fk_xhs_target_hit_source",
+    ): (
+        ("source_id",),
+        "xiaohongshu_target_sources",
+        ("id",),
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "fk_xhs_target_hit_tracked_source",
+    ): (
+        ("tracked_source_id",),
+        "tracked_sources",
+        ("id",),
+    ),
 }
 
 PRODUCTION_REQUIRED_CHECK_CONSTRAINTS = {
     ("accounts", "chk_account_execution_revision"),
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_platform",
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_status",
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_attempts",
+    ),
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_lifecycle",
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_status",
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_attempts",
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_lifecycle",
+    ),
+    (
+        "account_profile_context_leases",
+        "chk_account_profile_context_lease_platform",
+    ),
+    (
+        "account_profile_context_leases",
+        "chk_account_profile_context_lease_lifecycle",
+    ),
     ("lottery_rule_snapshots", "chk_rule_snapshot_complete"),
     ("account_operation_leases", "chk_account_operation_lease_generation"),
     ("task_runs", "chk_task_run_reconciliation_required"),
@@ -420,6 +1136,82 @@ PRODUCTION_REQUIRED_CHECK_CONSTRAINTS = {
     ("external_action_intents", "chk_external_action_effect_certainty_v2"),
     ("external_action_intents", "chk_external_action_lifecycle_v2"),
     ("external_action_intents", "chk_external_action_lease_generation"),
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_contract",
+    ),
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_actions",
+    ),
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_hashes",
+    ),
+    (
+        "lottery_execution_intent_heads",
+        "chk_lottery_execution_intent_head_generation",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_contract",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_kind",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_evidence_kind",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_actions",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_hashes",
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_revision",
+    ),
+    ("xiaohongshu_target_sources", "chk_xhs_target_source_type"),
+    ("xiaohongshu_target_sources", "chk_xhs_target_source_active"),
+    ("xiaohongshu_target_sources", "chk_xhs_target_source_status"),
+    ("xiaohongshu_target_sources", "chk_xhs_target_source_version"),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_platform",
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_decision",
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_accept_binding",
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_version",
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_seen_order",
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_source_type",
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_count",
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_seen_order",
+    ),
 }
 
 # Column presence alone is not sufficient for values that fence real external
@@ -441,7 +1233,550 @@ PRODUCTION_REQUIRED_COLUMN_DEFINITIONS = {
         "NO",
         "not_started",
     ),
+    ("lottery_execution_intents", "contract_version"): (
+        "tinyint unsigned",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "intent_id"): ("char(36)", "NO", None),
+    ("lottery_execution_intents", "intent_hash"): ("char(64)", "NO", None),
+    ("lottery_execution_intents", "lottery_id"): ("bigint", "NO", None),
+    ("lottery_execution_intents", "source_task_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "source_account_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "platform"): ("varchar(32)", "NO", None),
+    ("lottery_execution_intents", "raw_url"): ("varchar(512)", "NO", None),
+    ("lottery_execution_intents", "canonical_url"): (
+        "varchar(512)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "full_action_plan"): ("json", "NO", None),
+    ("lottery_execution_intents", "full_action_plan_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "full_required_actions"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "full_required_actions_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "rule_snapshot_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "rule_hash"): ("char(64)", "NO", None),
+    ("lottery_execution_intents", "execution_path_id"): (
+        "varchar(128)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intents", "target_hash"): ("char(64)", "NO", None),
+    ("lottery_execution_intents", "created_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("lottery_execution_intent_heads", "lottery_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intent_heads", "current_intent_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intent_heads", "generation"): (
+        "bigint unsigned",
+        "NO",
+        None,
+    ),
+    ("lottery_execution_intent_heads", "created_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("lottery_execution_intent_heads", "updated_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("task_execution_intent_bindings", "task_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "intent_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "lottery_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "account_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "contract_version"): (
+        "tinyint unsigned",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "binding_kind"): (
+        "varchar(16)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "requested_actions"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "requested_actions_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "bound_action_plan"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "bound_action_plan_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "evidence_action_plan_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "rule_snapshot_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "rule_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "execution_evidence_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "execution_evidence_kind"): (
+        "varchar(32)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "exact_execution_evidence_id"): (
+        "char(36)",
+        "YES",
+        None,
+    ),
+    ("task_execution_intent_bindings", "oauth_calibration_id"): (
+        "char(36)",
+        "YES",
+        None,
+    ),
+    ("task_execution_intent_bindings", "execution_path_id"): (
+        "varchar(128)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "target_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "config_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "execution_revision"): (
+        "bigint unsigned",
+        "NO",
+        None,
+    ),
+    (
+        "task_execution_intent_bindings",
+        "account_lease_generation",
+    ): ("bigint unsigned", "NO", None),
+    ("task_execution_intent_bindings", "account_lease_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "binding_hash"): (
+        "char(64)",
+        "NO",
+        None,
+    ),
+    ("task_execution_intent_bindings", "created_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("outbox_events", "redis_delivery_epoch"): (
+        "varchar(128)",
+        "YES",
+        None,
+    ),
     ("schema_migrations", "checksum"): ("char(64)", "NO", None),
+    ("account_active_risk_states", "account_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("account_active_risk_states", "risk_event_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("account_active_risk_states", "event_type"): (
+        "varchar(64)",
+        "NO",
+        None,
+    ),
+    ("account_active_risk_states", "detail"): (
+        "json",
+        "YES",
+        None,
+    ),
+    ("account_active_risk_states", "event_created_at"): (
+        "timestamp",
+        "NO",
+        None,
+    ),
+    ("account_active_risk_states", "active_until"): (
+        "timestamp",
+        "NO",
+        None,
+    ),
+    ("account_active_risk_states", "updated_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("account_profile_cleanup_intents", "id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "account_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "platform"): (
+        "varchar(32)",
+        "NO",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "status"): (
+        "varchar(16)",
+        "NO",
+        "pending",
+    ),
+    ("account_profile_cleanup_intents", "attempts"): (
+        "int unsigned",
+        "NO",
+        "0",
+    ),
+    ("account_profile_cleanup_intents", "claim_token"): (
+        "char(36)",
+        "YES",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "worker_id"): (
+        "varchar(128)",
+        "YES",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "claimed_at"): (
+        "timestamp",
+        "YES",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "next_attempt_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("account_profile_cleanup_intents", "completed_at"): (
+        "timestamp",
+        "YES",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "last_error_code"): (
+        "varchar(128)",
+        "YES",
+        None,
+    ),
+    ("account_profile_cleanup_intents", "created_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("account_profile_cleanup_intents", "updated_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("login_profile_cleanup_intents", "id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "session_id"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "status"): (
+        "varchar(16)",
+        "NO",
+        "pending",
+    ),
+    ("login_profile_cleanup_intents", "attempts"): (
+        "int unsigned",
+        "NO",
+        "0",
+    ),
+    ("login_profile_cleanup_intents", "claim_token"): (
+        "char(36)",
+        "YES",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "worker_id"): (
+        "varchar(128)",
+        "YES",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "claimed_at"): (
+        "timestamp",
+        "YES",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "next_attempt_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("login_profile_cleanup_intents", "completed_at"): (
+        "timestamp",
+        "YES",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "last_error_code"): (
+        "varchar(128)",
+        "YES",
+        None,
+    ),
+    ("login_profile_cleanup_intents", "created_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("login_profile_cleanup_intents", "updated_at"): (
+        "timestamp",
+        "NO",
+        "CURRENT_TIMESTAMP",
+    ),
+    ("account_profile_context_leases", "account_id"): (
+        "bigint",
+        "NO",
+        None,
+    ),
+    ("account_profile_context_leases", "platform"): (
+        "varchar(32)",
+        "NO",
+        None,
+    ),
+    ("account_profile_context_leases", "lease_token"): (
+        "char(36)",
+        "NO",
+        None,
+    ),
+    ("account_profile_context_leases", "owner_id"): (
+        "varchar(128)",
+        "NO",
+        None,
+    ),
+    ("account_profile_context_leases", "acquired_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("account_profile_context_leases", "renewed_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("account_profile_context_leases", "lease_expires_at"): (
+        "timestamp(6)",
+        "NO",
+        None,
+    ),
+    ("account_profile_context_leases", "created_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("account_profile_context_leases", "updated_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("xiaohongshu_target_sources", "source_type"): (
+        "varchar(32)",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_sources", "source_value"): (
+        "varchar(256)",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_sources", "active"): (
+        "tinyint unsigned",
+        "NO",
+        "1",
+    ),
+    ("xiaohongshu_target_sources", "status"): (
+        "varchar(16)",
+        "NO",
+        "idle",
+    ),
+    ("xiaohongshu_target_sources", "version"): (
+        "bigint unsigned",
+        "NO",
+        "1",
+    ),
+    ("xiaohongshu_target_sources", "created_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("xiaohongshu_target_sources", "updated_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("xiaohongshu_target_candidates", "platform"): (
+        "varchar(32)",
+        "NO",
+        "xiaohongshu",
+    ),
+    ("xiaohongshu_target_candidates", "raw_url"): (
+        "varchar(512)",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "canonical_url"): (
+        "varchar(512)",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "evidence"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "rule"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "classification"): (
+        "json",
+        "NO",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "decision_status"): (
+        "varchar(16)",
+        "NO",
+        "pending",
+    ),
+    ("xiaohongshu_target_candidates", "accepted_lottery_id"): (
+        "bigint",
+        "YES",
+        None,
+    ),
+    ("xiaohongshu_target_candidates", "version"): (
+        "bigint unsigned",
+        "NO",
+        "1",
+    ),
+    ("xiaohongshu_target_candidates", "first_seen_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    ("xiaohongshu_target_candidates", "last_seen_at"): (
+        "timestamp(6)",
+        "NO",
+        "CURRENT_TIMESTAMP(6)",
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "candidate_id",
+    ): ("bigint", "NO", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "source_id",
+    ): ("bigint", "NO", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "tracked_source_id",
+    ): ("bigint", "YES", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "source_type",
+    ): ("varchar(32)", "NO", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "source_value",
+    ): ("varchar(256)", "NO", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "evidence",
+    ): ("json", "NO", None),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "hit_count",
+    ): ("bigint unsigned", "NO", "1"),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "first_seen_at",
+    ): ("timestamp(6)", "NO", "CURRENT_TIMESTAMP(6)"),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "last_seen_at",
+    ): ("timestamp(6)", "NO", "CURRENT_TIMESTAMP(6)"),
 }
 
 # MySQL may add whitespace, backticks, a surrounding pair of parentheses and
@@ -451,6 +1786,127 @@ PRODUCTION_REQUIRED_COLUMN_DEFINITIONS = {
 PRODUCTION_REQUIRED_EXACT_CHECK_CLAUSES = {
     ("accounts", "chk_account_execution_revision"):
         "execution_revision > 0",
+    (
+        "xiaohongshu_target_sources",
+        "chk_xhs_target_source_type",
+    ): (
+        "source_type IN "
+        "('keyword', 'author_profile', 'offline_search_result')"
+    ),
+    (
+        "xiaohongshu_target_sources",
+        "chk_xhs_target_source_active",
+    ): "active IN (0, 1)",
+    (
+        "xiaohongshu_target_sources",
+        "chk_xhs_target_source_status",
+    ): "status IN ('idle', 'scanning', 'succeeded', 'failed')",
+    (
+        "xiaohongshu_target_sources",
+        "chk_xhs_target_source_version",
+    ): "version > 0",
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_platform",
+    ): "platform = 'xiaohongshu'",
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_decision",
+    ): (
+        "decision_status IN "
+        "('pending', 'accepted', 'skipped', 'needs_review')"
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_accept_binding",
+    ): (
+        "((decision_status = 'accepted') "
+        "AND (accepted_lottery_id IS NOT NULL)) "
+        "OR ((decision_status <> 'accepted') "
+        "AND (accepted_lottery_id IS NULL))"
+    ),
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_version",
+    ): "version > 0",
+    (
+        "xiaohongshu_target_candidates",
+        "chk_xhs_target_candidate_seen_order",
+    ): "last_seen_at >= first_seen_at",
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_source_type",
+    ): (
+        "source_type IN "
+        "('keyword', 'author_profile', 'offline_search_result')"
+    ),
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_count",
+    ): "hit_count > 0",
+    (
+        "xiaohongshu_target_candidate_source_hits",
+        "chk_xhs_target_hit_seen_order",
+    ): "last_seen_at >= first_seen_at",
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_platform",
+    ): "platform IN ('bilibili', 'douyin', 'weibo', 'xiaohongshu')",
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_status",
+    ): "status IN ('pending', 'running', 'succeeded')",
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_attempts",
+    ): "attempts <= 2147483647",
+    (
+        "account_profile_cleanup_intents",
+        "chk_account_profile_cleanup_lifecycle",
+    ): (
+        "((status = 'pending') AND (claim_token IS NULL) "
+        "AND (worker_id IS NULL) AND (claimed_at IS NULL) "
+        "AND (completed_at IS NULL)) "
+        "OR ((status = 'running') AND (attempts > 0) "
+        "AND (claim_token IS NOT NULL) AND (worker_id IS NOT NULL) "
+        "AND (claimed_at IS NOT NULL) AND (completed_at IS NULL)) "
+        "OR ((status = 'succeeded') AND (attempts > 0) "
+        "AND (claim_token IS NULL) AND (worker_id IS NULL) "
+        "AND (claimed_at IS NULL) AND (completed_at IS NOT NULL))"
+    ),
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_status",
+    ): "status IN ('pending', 'running', 'succeeded')",
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_attempts",
+    ): "attempts <= 2147483647",
+    (
+        "login_profile_cleanup_intents",
+        "chk_login_profile_cleanup_lifecycle",
+    ): (
+        "((status = 'pending') AND (claim_token IS NULL) "
+        "AND (worker_id IS NULL) AND (claimed_at IS NULL) "
+        "AND (completed_at IS NULL)) "
+        "OR ((status = 'running') AND (attempts > 0) "
+        "AND (claim_token IS NOT NULL) AND (worker_id IS NOT NULL) "
+        "AND (claimed_at IS NOT NULL) AND (completed_at IS NULL)) "
+        "OR ((status = 'succeeded') AND (attempts > 0) "
+        "AND (claim_token IS NULL) AND (worker_id IS NULL) "
+        "AND (claimed_at IS NULL) AND (completed_at IS NOT NULL))"
+    ),
+    (
+        "account_profile_context_leases",
+        "chk_account_profile_context_lease_platform",
+    ): "platform IN ('bilibili', 'douyin', 'weibo', 'xiaohongshu')",
+    (
+        "account_profile_context_leases",
+        "chk_account_profile_context_lease_lifecycle",
+    ): (
+        "(renewed_at >= acquired_at) "
+        "AND (lease_expires_at > renewed_at)"
+    ),
     ("lottery_rule_snapshots", "chk_rule_snapshot_complete"): (
         "(is_complete IN (0, 1)) AND ((is_complete = 0) OR "
         "((attested_by IS NOT NULL) AND (attested_at IS NOT NULL)))"
@@ -516,7 +1972,8 @@ PRODUCTION_REQUIRED_EXACT_CHECK_CLAUSES = {
         "OR ((status = 'failed') AND (attempt_no > 0) "
         "AND (started_at IS NOT NULL) AND (completed_at IS NOT NULL) "
         "AND (outcome IS NOT NULL) AND (outcome IN "
-        "('retry', 'limit', 'skip', 'captcha', 'risk', 'auth'))) "
+        "('retry', 'limit', 'skip', 'captcha', 'risk', 'auth', "
+        "'rejected'))) "
         "OR ((status = 'unknown') AND (attempt_no > 0) "
         "AND (started_at IS NOT NULL) AND (completed_at IS NOT NULL) "
         "AND (outcome IS NOT NULL) AND (outcome = 'unknown') "
@@ -525,6 +1982,75 @@ PRODUCTION_REQUIRED_EXACT_CHECK_CLAUSES = {
     ),
     ("external_action_intents", "chk_external_action_lease_generation"):
         "lease_generation > 0",
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_contract",
+    ): "contract_version = 1",
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_actions",
+    ): (
+        "JSON_TYPE(full_required_actions) = 'ARRAY' "
+        "AND JSON_LENGTH(full_required_actions) > 0"
+    ),
+    (
+        "lottery_execution_intents",
+        "chk_lottery_execution_intent_hashes",
+    ): (
+        "REGEXP_LIKE(intent_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(full_action_plan_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(full_required_actions_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(rule_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(target_hash, '^[0-9a-f]{64}$', 'c')"
+    ),
+    (
+        "lottery_execution_intent_heads",
+        "chk_lottery_execution_intent_head_generation",
+    ): "generation > 0",
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_contract",
+    ): "contract_version = 1",
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_kind",
+    ): "binding_kind IN ('full', 'repair')",
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_evidence_kind",
+    ): (
+        "((execution_evidence_kind = 'exact_execution_evidence') "
+        "AND (exact_execution_evidence_id IS NOT NULL) "
+        "AND (exact_execution_evidence_id = execution_evidence_id) "
+        "AND (oauth_calibration_id IS NULL)) "
+        "OR ((execution_evidence_kind = 'oauth_account_calibration') "
+        "AND (oauth_calibration_id IS NOT NULL) "
+        "AND (oauth_calibration_id = execution_evidence_id) "
+        "AND (exact_execution_evidence_id IS NULL))"
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_actions",
+    ): (
+        "JSON_TYPE(requested_actions) = 'ARRAY' "
+        "AND JSON_LENGTH(requested_actions) > 0"
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_hashes",
+    ): (
+        "REGEXP_LIKE(requested_actions_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(bound_action_plan_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(evidence_action_plan_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(rule_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(target_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(config_hash, '^[0-9a-f]{64}$', 'c') "
+        "AND REGEXP_LIKE(binding_hash, '^[0-9a-f]{64}$', 'c')"
+    ),
+    (
+        "task_execution_intent_bindings",
+        "chk_task_execution_intent_revision",
+    ): "execution_revision > 0 AND account_lease_generation > 0",
 }
 
 # Hash of the quote-aware, presentation-normalised ACTION_STATEMENT created by
@@ -537,8 +2063,16 @@ PRODUCTION_REQUIRED_TRIGGER_DEFINITIONS = {
         "task_runs",
         "9fef0142af8c58e00e18960dc4cbc7b2d047f1e25847b981f1ff231199177d21",
     ),
+    "trg_risk_events_active_state": (
+        "AFTER",
+        "INSERT",
+        "risk_events",
+        "97c196e5431da56171fc5f227dc87ec745248f057861757da530e15033d38702",
+    ),
 }
 PRODUCTION_REQUIRED_TRIGGERS = set(PRODUCTION_REQUIRED_TRIGGER_DEFINITIONS)
+TRIGGER_METADATA_READER = "dpms_required_trigger_metadata"
+TRIGGER_METADATA_CONTRACT_VERSION = "dpms-trigger-metadata-v1"
 
 
 class FatalMigrationError(BaseException):
@@ -843,6 +2377,52 @@ def _handle_migration_error(exc: Exception) -> None:
     raise exc
 
 
+@asynccontextmanager
+async def schema_upgrade_process_lock():
+    """Serialize the complete bootstrap + versioned migration phase.
+
+    ``run_migrations`` has its own connection-scoped lock, but the historical
+    idempotent baseline bootstrap runs before it. The dedicated migration
+    command holds this outer lock so two operator invocations cannot race in
+    that previously unlocked DDL window.
+    """
+
+    async with database.connection() as connection:
+        lock_row = await connection.fetch_one(
+            "SELECT GET_LOCK(:lock_name, :timeout) AS acquired",
+            {
+                "lock_name": MIGRATION_PROCESS_LOCK_NAME,
+                "timeout": MIGRATION_LOCK_TIMEOUT_SECONDS,
+            },
+        )
+        if lock_row is None or int(lock_row["acquired"] or 0) != 1:
+            raise RuntimeError(
+                "Timed out acquiring the schema upgrade process lock"
+            )
+        try:
+            yield
+        finally:
+            try:
+                release_row = await connection.fetch_one(
+                    "SELECT RELEASE_LOCK(:lock_name) AS released",
+                    {"lock_name": MIGRATION_PROCESS_LOCK_NAME},
+                )
+                if (
+                    release_row is None
+                    or int(release_row["released"] or 0) != 1
+                ):
+                    structured_log(
+                        "warning",
+                        "migration_process_lock_not_released",
+                    )
+            except Exception as lock_exc:
+                structured_log(
+                    "warning",
+                    "migration_process_lock_release_failed",
+                    exception=lock_exc,
+                )
+
+
 async def run_migrations(dir_path: Path = MIGRATIONS_DIR) -> list[str]:
     """Apply pending migrations in order; return the versions applied this run.
 
@@ -997,6 +2577,59 @@ async def run_migrations(dir_path: Path = MIGRATIONS_DIR) -> list[str]:
         raise
 
 
+async def verify_migrations_current(
+    dir_path: Path = MIGRATIONS_DIR,
+) -> None:
+    """Verify migration history and live schema without mutating either.
+
+    Production application processes use this read-only gate. Applying DDL
+    from an API process makes it possible for a newly started Core to change
+    the protocol while an old Core is still serving traffic. The dedicated
+    migration command is the only production entry point that calls
+    ``run_migrations``.
+    """
+
+    migrations = discover_migrations(dir_path)
+    if not migrations:
+        raise RuntimeError("No migration files are available")
+
+    expected = {
+        version: migration_checksum(path)
+        for version, path in migrations
+    }
+    rows = await database.fetch_all(
+        "SELECT version, checksum FROM schema_migrations"
+    )
+    recorded: dict[str, str] = {}
+    problems: list[str] = []
+    for row in rows:
+        version = str(row["version"])
+        raw_checksum = row["checksum"]
+        if version in recorded:
+            problems.append(f"duplicate:{version}")
+            continue
+        if version not in expected:
+            problems.append(f"missing_file:{version}")
+            continue
+        checksum = "" if raw_checksum is None else str(raw_checksum)
+        recorded[version] = checksum
+        if not CHECKSUM_RE.fullmatch(checksum):
+            problems.append(f"invalid_checksum:{version}")
+        elif checksum != expected[version]:
+            problems.append(f"checksum_mismatch:{version}")
+
+    for version in expected:
+        if version not in recorded:
+            problems.append(f"pending:{version}")
+
+    if problems:
+        raise RuntimeError(
+            "Migration history is not current: "
+            + ",".join(sorted(problems))
+        )
+    await verify_production_schema()
+
+
 async def verify_production_schema() -> None:
     """Fail production startup if the DB is missing schema covered by migrations."""
     missing: list[str] = []
@@ -1051,7 +2684,7 @@ async def verify_production_schema() -> None:
 
     index_rows = await database.fetch_all(
         """SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE,
-                  SUB_PART
+                  SUB_PART, IS_VISIBLE
            FROM information_schema.STATISTICS
            WHERE TABLE_SCHEMA = DATABASE()
            ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"""
@@ -1059,6 +2692,7 @@ async def verify_production_schema() -> None:
     actual_indexes: dict[tuple[str, str], list[tuple[int, str]]] = {}
     index_non_unique: dict[tuple[str, str], set[int]] = {}
     index_prefix_lengths: dict[tuple[str, str], list[object]] = {}
+    index_visibility: dict[tuple[str, str], set[str]] = {}
     for row in index_rows:
         key = (row["TABLE_NAME"], row["INDEX_NAME"])
         actual_indexes.setdefault(key, []).append(
@@ -1066,6 +2700,35 @@ async def verify_production_schema() -> None:
         )
         index_non_unique.setdefault(key, set()).add(int(row["NON_UNIQUE"]))
         index_prefix_lengths.setdefault(key, []).append(row["SUB_PART"])
+        try:
+            visibility = row["IS_VISIBLE"]
+        except KeyError:
+            # Unit-test and legacy record fixtures created before visibility
+            # became part of the query represent ordinary visible indexes.
+            visibility = "YES"
+        index_visibility.setdefault(key, set()).add(
+            str(visibility or "").strip().upper()
+        )
+    for key in sorted(PRODUCTION_FORBIDDEN_INDEXES):
+        if key[0] in existing_tables and key in actual_indexes:
+            missing.append(f"forbidden_index:{key[0]}.{key[1]}")
+    for table, expected_columns in PRODUCTION_REQUIRED_PRIMARY_KEYS.items():
+        if table not in existing_tables:
+            continue
+        key = (table, "PRIMARY")
+        actual_columns = tuple(
+            column for _, column in sorted(actual_indexes.get(key, []))
+        )
+        if (
+            actual_columns != expected_columns
+            or index_non_unique.get(key) != {0}
+            or index_visibility.get(key) != {"YES"}
+            or any(
+                prefix_length is not None
+                for prefix_length in index_prefix_lengths.get(key, [])
+            )
+        ):
+            missing.append(f"primary_key:{table}")
     for key, expected_columns in PRODUCTION_REQUIRED_UNIQUE_INDEXES.items():
         if key[0] not in existing_tables:
             continue
@@ -1075,12 +2738,29 @@ async def verify_production_schema() -> None:
         if (
             actual_columns != expected_columns
             or index_non_unique.get(key) != {0}
+            or index_visibility.get(key) != {"YES"}
             or any(
                 prefix_length is not None
                 for prefix_length in index_prefix_lengths.get(key, [])
             )
         ):
             missing.append(f"unique_index:{key[0]}.{key[1]}")
+    for key, expected_columns in PRODUCTION_REQUIRED_INDEXES.items():
+        if key[0] not in existing_tables:
+            continue
+        actual_columns = tuple(
+            column for _, column in sorted(actual_indexes.get(key, []))
+        )
+        if (
+            actual_columns != expected_columns
+            or index_non_unique.get(key) != {1}
+            or index_visibility.get(key) != {"YES"}
+            or any(
+                prefix_length is not None
+                for prefix_length in index_prefix_lengths.get(key, [])
+            )
+        ):
+            missing.append(f"index:{key[0]}.{key[1]}")
 
     foreign_key_rows = await database.fetch_all(
         """SELECT kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME,
@@ -1175,12 +2855,22 @@ async def verify_production_schema() -> None:
         if actual_check_clauses.get(key) != normalise_check_clause(expected_clause):
             missing.append(f"check_clause:{key[0]}.{key[1]}")
 
-    trigger_rows = await database.fetch_all(
-        """SELECT TRIGGER_NAME, EVENT_MANIPULATION, EVENT_OBJECT_TABLE,
-                  ACTION_TIMING, ACTION_STATEMENT
-           FROM information_schema.TRIGGERS
-           WHERE TRIGGER_SCHEMA = DATABASE()"""
-    )
+    trigger_rows = []
+    if PRODUCTION_REQUIRED_TRIGGERS:
+        try:
+            trigger_rows = await database.fetch_all(
+                f"CALL {TRIGGER_METADATA_READER}()"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Production schema drift detected: trigger_metadata_reader"
+            ) from exc
+        if any(
+            str(row["CONTRACT_VERSION"] or "")
+            != TRIGGER_METADATA_CONTRACT_VERSION
+            for row in trigger_rows
+        ):
+            missing.append("trigger_metadata_reader_contract")
     existing_triggers = {row["TRIGGER_NAME"]: row for row in trigger_rows}
     for trigger in sorted(PRODUCTION_REQUIRED_TRIGGERS - set(existing_triggers)):
         missing.append(f"trigger:{trigger}")

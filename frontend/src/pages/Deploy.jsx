@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { apiPath, deleteJSON, fetchJSON, getConfirmedHeaders, postJSON, putJSON } from '../api';
 import { formatText } from '../i18n/format';
+import { realRunControlState } from '../realRunControl';
 import {
   isManualAssistedPlan,
   lotteryActionsForPlatform,
@@ -15,7 +16,7 @@ import { useUi } from '../uiContext';
 
 const REAL_RUN_EVIDENCE_TTL_MS = 65000;
 const REAL_RUN_EVIDENCE_REFRESH_MS = 60000;
-
+const RUNTIME_STATUS_REFRESH_MS = 15000;
 function manualOnlyHintKey(platform) {
   if (platform === 'douyin') return 'deploy.douyinManualOnlyHint';
   if (platform === 'weibo') return 'deploy.weiboManualOnlyHint';
@@ -34,6 +35,7 @@ export default function Deploy() {
   const [message, setMessage] = useState('');
   const [reloadArmed, setReloadArmed] = useState(false);
   const [uploadSignature, setUploadSignature] = useState('');
+  const [uploadSignatureUnlocked, setUploadSignatureUnlocked] = useState(false);
   const [channels, setChannels] = useState([]);
   const [notifyStatus, setNotifyStatus] = useState(null);
   const [notifyGuide, setNotifyGuide] = useState(null);
@@ -44,6 +46,7 @@ export default function Deploy() {
   const [taskRuns, setTaskRuns] = useState([]);
   const [adapterConfig, setAdapterConfig] = useState(null);
   const [runtimeSettings, setRuntimeSettings] = useState(null);
+  const [productionReadiness, setProductionReadiness] = useState(null);
   const [realRunEvidence, setRealRunEvidence] = useState([]);
   const [externalIntents, setExternalIntents] = useState([]);
   const [reconciliationItems, setReconciliationItems] = useState([]);
@@ -63,6 +66,7 @@ export default function Deploy() {
   const evidenceRefreshPendingRef = useRef(false);
   const evidenceExpiryTimerRef = useRef(null);
   const mountedRef = useRef(true);
+  const realRunControl = realRunControlState(runtimeSettings, productionReadiness);
 
   const reportLoadError = (err) => {
     if (!mountedRef.current) return;
@@ -87,7 +91,7 @@ export default function Deploy() {
       const [
         channelRows, statusRows, guideRows, logRows, adapterRows, probeRows,
         taskRows, runtimeRows, evidenceRows, platformRows, intentRows,
-        reconciliationRows,
+        reconciliationRows, readinessRows,
       ] = await Promise.all([
         fetchJSON('/notify/channels'),
         fetchJSON('/notify/status'),
@@ -103,6 +107,7 @@ export default function Deploy() {
         fetchJSON('/accounts/platforms'),
         fetchJSON('/metrics/external-action-intents?limit=50'),
         fetchJSON('/metrics/reconciliation?limit=50'),
+        fetchJSON('/metrics/readiness'),
       ]);
       // A slow earlier poll must never overwrite a newer completion/evidence
       // response. This also makes the active-light -> completed-heavy handoff
@@ -116,6 +121,7 @@ export default function Deploy() {
       setProbes(probeRows);
       setTaskRuns(taskRows);
       setRuntimeSettings(runtimeRows);
+      setProductionReadiness(readinessRows);
       setExternalIntents(intentRows.items || []);
       setReconciliationItems(reconciliationRows.items || []);
       if (evidenceRows) {
@@ -160,6 +166,36 @@ export default function Deploy() {
       window.clearTimeout(evidenceExpiryTimerRef.current);
     };
   }, [t, toast]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshRuntime = async () => {
+      try {
+        const [nextRuntime, nextReadiness] = await Promise.all([
+          fetchJSON('/metrics/runtime/settings'),
+          fetchJSON('/metrics/readiness'),
+        ]);
+        if (!cancelled && mountedRef.current) {
+          setRuntimeSettings(nextRuntime);
+          setProductionReadiness(nextReadiness);
+        }
+      } catch {
+        // The full page refresh reports actionable API errors. This lightweight
+        // status poll stays silent, but readiness must fail closed rather than
+        // leave an old green prerequisite snapshot actionable.
+        if (!cancelled && mountedRef.current) setProductionReadiness(null);
+      }
+    };
+    const runtimeTimer = window.setInterval(refreshRuntime, RUNTIME_STATUS_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(runtimeTimer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!realRunControl.canArm && realRunArmed) setRealRunArmed(false);
+  }, [realRunArmed, realRunControl.canArm]);
 
   const restart = async () => {
     const res = await fetch(apiPath('/metrics/worker/restart'), { method: 'POST', headers: getConfirmedHeaders() });
@@ -457,7 +493,11 @@ export default function Deploy() {
         window.scrollTo({ top: 0, behavior: 'smooth' });
         return;
       } else {
-        const text = evidence.allowed ? t('deploy.realRunReadyNotice') : t('deploy.workflowManualReview');
+        const text = evidence.allowed
+          ? t(runtimeSettings?.autopilot?.real_run_authorized
+            ? 'deploy.autopilotRealRunReadyNotice'
+            : 'deploy.realRunReadyNotice')
+          : t('deploy.workflowManualReview');
         setMessage(text);
         toast(text, evidence.allowed ? 'success' : 'warning');
         return;
@@ -481,16 +521,24 @@ export default function Deploy() {
   const selectedChannel = channels.find(channel => channel.id === notify.channel);
   const selectedChannelConfigured = Boolean(selectedChannel?.configured);
   const toggleRealRun = async (enabled) => {
+    if (enabled && !realRunControl.canEnable) {
+      const text = realRunControlMessage(realRunControl, t);
+      setRealRunArmed(false);
+      setMessage(text);
+      toast(text, 'warning');
+      return;
+    }
     try {
       await putJSON('/metrics/runtime/settings/real-run', { enabled }, { confirm: true });
       setRealRunArmed(false);
-      const text = enabled ? 'Real-run enabled' : 'Real-run disabled';
+      const text = t(enabled ? 'deploy.realRunEnabled' : 'deploy.realRunDisabled');
       setMessage(text);
       toast(text, enabled ? 'warning' : 'success');
       await loadNotify();
     } catch (err) {
-      setMessage(err.message);
-      toast(err.message, 'error');
+      const text = localizeRealRunUpdateError(err, t);
+      setMessage(text);
+      toast(text, 'error');
     }
   };
 
@@ -525,32 +573,82 @@ export default function Deploy() {
             <span className="badge badge-info">{version}</span>
           </div>
           <div className="version-row">
-            <span>Real-run</span>
-            <span className={`badge ${runtimeSettings?.real_run_enabled ? 'badge-danger' : 'badge-muted'}`}>
-              {runtimeSettings?.real_run_enabled ? 'Enabled' : 'Disabled'}
+            <span>{t('deploy.realRun')}</span>
+            <span className={`badge ${realRunControl.currentlyEnabled ? 'badge-danger' : 'badge-muted'}`}>
+              {t(realRunControl.currentlyEnabled ? 'deploy.enabled' : 'deploy.disabled')}
+            </span>
+          </div>
+          <div className="version-row">
+            <span>{t('deploy.deploymentRealRunCapability')}</span>
+            <span className={`badge ${realRunControl.deploymentCapability ? 'badge-ready' : 'badge-danger'}`}>
+              {t(realRunControl.deploymentCapability
+                ? 'deploy.capabilityAvailable'
+                : 'deploy.capabilityUnavailable')}
             </span>
           </div>
           <div className="version-row">
             <span>{t('deploy.globalBreaker')}</span>
-            <span className={`badge ${runtimeSettings?.global_circuit_breaker?.status === 'open' ? 'badge-danger' : 'badge-ready'}`}>
-              {runtimeSettings?.global_circuit_breaker?.status || 'closed'}
+            <span className={`badge ${globalBreakerBadge(runtimeSettings?.global_circuit_breaker)}`}>
+              {t(`deploy.breakerStatuses.${globalBreakerStatus(runtimeSettings?.global_circuit_breaker)}`)}
             </span>
           </div>
           {runtimeSettings?.global_circuit_breaker?.reason && (
-            <p className="muted-text tight-text">{runtimeSettings.global_circuit_breaker.reason}</p>
+            <p className="muted-text tight-text">
+              {localizeBreakerReason(runtimeSettings.global_circuit_breaker.reason, t)}
+            </p>
           )}
+          <div className="version-row">
+            <span>{t('deploy.autopilot')}</span>
+            <span className={`badge ${autopilotStatusBadge(runtimeSettings?.autopilot)}`}>
+              {t(`deploy.autopilotStatuses.${autopilotStatusKey(runtimeSettings?.autopilot)}`)}
+            </span>
+          </div>
+          {runtimeSettings?.autopilot?.reported && (
+            <div className="stack-list compact-list">
+              <div className="small-text muted-text">
+                {formatText(t('deploy.autopilotPlatforms'), {
+                  platforms: runtimeSettings.autopilot.platform_allowlist?.join(', ') || t('deploy.none'),
+                })}
+              </div>
+              <div className="small-text muted-text">
+                {formatText(t('deploy.autopilotLastRound'), {
+                  selected: runtimeSettings.autopilot.last_round?.selected ?? 0,
+                  dispatched: runtimeSettings.autopilot.last_round?.dispatched ?? 0,
+                  probes: runtimeSettings.autopilot.last_round?.probes_requested ?? 0,
+                  failures: runtimeSettings.autopilot.last_round?.failures ?? 0,
+                })}
+              </div>
+              <div className="small-text muted-text">
+                {formatText(t('deploy.autopilotHeartbeat'), {
+                  age: runtimeSettings.autopilot.heartbeat_age_seconds ?? '-',
+                  cadence: runtimeSettings.autopilot.poll_interval_seconds ?? '-',
+                })}
+              </div>
+            </div>
+          )}
+          <div className={`notice ${runtimeSettings?.autopilot?.real_run_authorized ? '' : 'notice-warning'}`}>
+            {autopilotNextAction(runtimeSettings, realRunEvidence, t)}
+          </div>
+          <div className={`notice ${realRunControl.canEnable ? '' : 'notice-warning'}`}>
+            {realRunControlMessage(realRunControl, t)}
+          </div>
           <label className="check-row">
-            <input type="checkbox" checked={realRunArmed} onChange={e => setRealRunArmed(e.target.checked)} />
-            <span>Confirm real-run switch change</span>
+            <input
+              type="checkbox"
+              checked={realRunArmed}
+              disabled={!realRunControl.canArm}
+              onChange={e => setRealRunArmed(e.target.checked)}
+            />
+            <span>{t('deploy.confirmRealRunChange')}</span>
           </label>
           <div className="toolbar">
             <button
-              className={runtimeSettings?.real_run_enabled ? 'btn-ghost' : 'btn-danger'}
+              className={realRunControl.currentlyEnabled ? 'btn-ghost' : 'btn-danger'}
               type="button"
-              disabled={!realRunArmed}
-              onClick={() => toggleRealRun(!runtimeSettings?.real_run_enabled)}
+              disabled={!realRunArmed || !realRunControl.canArm}
+              onClick={() => toggleRealRun(!realRunControl.currentlyEnabled)}
             >
-              {runtimeSettings?.real_run_enabled ? 'Disable real-run' : 'Enable real-run'}
+              {t(realRunControl.currentlyEnabled ? 'deploy.disableRealRun' : 'deploy.enableRealRun')}
             </button>
           </div>
           <div className="rollback-box">
@@ -583,7 +681,18 @@ export default function Deploy() {
           <form className="stack-form" onSubmit={e => e.preventDefault()}>
             <label>
               <span>{t('deploy.hmacSignature')}</span>
-              <input className="input" type="password" value={uploadSignature} onChange={e => setUploadSignature(e.target.value)} autoComplete="off" />
+              <input
+                className="input"
+                type="password"
+                name="dpms-update-package-signature"
+                value={uploadSignature}
+                onChange={e => setUploadSignature(e.target.value)}
+                onFocus={() => setUploadSignatureUnlocked(true)}
+                readOnly={!uploadSignatureUnlocked}
+                autoComplete="new-password"
+                data-1p-ignore="true"
+                data-lpignore="true"
+              />
             </label>
             <div className="toolbar">
               <label className="btn-primary file-button">
@@ -723,7 +832,7 @@ export default function Deploy() {
                 <div className="action-title">{t(`deploy.readinessSteps.${step.code}Title`)}</div>
                 <p className="muted-text tight-text">{formatText(t(`deploy.readinessSteps.${step.code}Detail`), { platform: readinessPlatformLabel })}</p>
               </div>
-              <div className="small-text mono">{step.meta}</div>
+              <div className="small-text mono">{localizeReadinessMeta(step.meta, t)}</div>
             </div>
           ))}
         </div>
@@ -864,12 +973,24 @@ export default function Deploy() {
                 <div className="mono">{channel.label}</div>
                 <div className="small-text muted-text">
                   {channel.configured ? t('deploy.configured') : t('deploy.missingSecrets')}
-                  {channel.last_log ? ` / ${t('deploy.last')}: ${channel.last_log.success ? t('deploy.sent') : t('deploy.failed')}` : ` / ${t('deploy.noLogs')}`}
+                  {channel.last_log
+                    ? ` / ${t('deploy.last')}: ${t(`deploy.${notificationLogStatus(channel.last_log)}`)}`
+                    : ` / ${t('deploy.noLogs')}`}
                 </div>
-                {channel.last_error && <div className="small-text notify-error">{channel.last_error}</div>}
+                {channel.last_error && (
+                  <div className="small-text notify-error">
+                    {localizeNotificationError(channel.last_error, t)}
+                  </div>
+                )}
               </div>
               <span className={`badge ${channel.healthy ? 'badge-ready' : channel.configured ? 'badge-warn' : 'badge-muted'}`}>
-                {channel.healthy ? t('deploy.healthy') : channel.configured ? t('deploy.needsCheck') : t('deploy.notSet')}
+                {channel.healthy
+                  ? t('deploy.healthy')
+                  : channel.verification_required
+                    ? t('deploy.verificationRequired')
+                    : channel.configured
+                      ? t('deploy.needsCheck')
+                      : t('deploy.notSet')}
               </span>
             </div>
           ))}
@@ -972,7 +1093,9 @@ export default function Deploy() {
           ))}
         </div>
         <div className="ops-checklist">
-          {notifyGuide?.apply_steps?.map(step => <div className="ops-check-item" key={step}>{step}</div>)}
+          {notifyGuide?.apply_steps?.map(step => (
+            <div className="ops-check-item" key={step}>{localizeNotifyApplyStep(step, t)}</div>
+          ))}
         </div>
         <p className="muted-text tight-text">
           {formatText(t('deploy.testEndpoint'), { endpoint: `POST ${apiPath('/notify/send')}` })}
@@ -1063,7 +1186,11 @@ export default function Deploy() {
                 <tr key={log.id}>
                   <td className="mono">N{log.id}</td>
                   <td>{log.channel}</td>
-                  <td><span className={`badge ${log.success ? 'badge-ready' : 'badge-danger'}`}>{log.success ? t('deploy.sent') : t('deploy.failed')}</span></td>
+                  <td>
+                    <span className={`badge ${notificationLogBadge(log)}`}>
+                      {t(`deploy.${notificationLogStatus(log)}`)}
+                    </span>
+                  </td>
                   <td className="truncate-cell" title={log.content}>{log.title}</td>
                   <td className="small-text">{log.created_at}</td>
                 </tr>
@@ -1133,6 +1260,52 @@ function probePhaseTotal(probe) {
   return Array.isArray(requiredPhases) && requiredPhases.length
     ? requiredPhases.length
     : lotteryActionsForPlatform(probe?.platform).length;
+}
+
+const NOTIFY_APPLY_STEP_KEYS = {
+  'Edit .env with one or more notification channel values.': 'configure',
+  'Run docker compose up -d --build so core-api receives the new environment.': 'rebuild',
+  'Open Operations & Notify and send a manual notification test.': 'sendTest',
+  'Confirm the latest notify_logs row is Sent before relying on production alerts.': 'verifyDelivery',
+};
+
+function localizeNotifyApplyStep(step, t) {
+  const key = NOTIFY_APPLY_STEP_KEYS[String(step || '').trim()];
+  return key ? t(`deploy.notifyApplySteps.${key}`) : t('deploy.notifyApplySteps.review');
+}
+
+const READINESS_META_KEYS = {
+  missing: 'missing',
+  dynamic: 'dynamic',
+  video: 'video',
+  note: 'note',
+  status: 'status',
+  'OAuth capabilities verified': 'oauthCapabilitiesVerified',
+  'OAuth capability proof required': 'oauthCapabilityProofRequired',
+  complete: 'complete',
+  'official OAuth adapter': 'officialOauthAdapter',
+  'OAuth adapter unavailable': 'oauthAdapterUnavailable',
+  'evidence binding required': 'evidenceBindingRequired',
+  configured: 'configured',
+  'observation complete': 'observationComplete',
+  'observation required': 'observationRequired',
+  '24h ok': 'recentShadowReady',
+  required: 'required',
+  unknown: 'unknown',
+  'manual only': 'manualOnly',
+  enabled: 'enabled',
+  disabled: 'disabled',
+};
+
+function localizeReadinessMeta(meta, t) {
+  const value = String(meta || 'unknown').trim();
+  const safeCount = value.match(/^(\d+) safe$/);
+  if (safeCount) {
+    return formatText(t('deploy.readinessMeta.safeAccounts'), { count: safeCount[1] });
+  }
+  if (/^\d+\/\d+$/.test(value)) return value;
+  const key = READINESS_META_KEYS[value];
+  return key ? t(`deploy.readinessMeta.${key}`) : t('deploy.readinessMeta.unknown');
 }
 
 function buildReadiness({ platform, evidence, platformEvidence, adapter, runtimeSettings, probeCandidate }) {
@@ -1224,6 +1397,204 @@ function hasSelectorDraft(value, platform) {
 function shortHash(value) {
   const text = String(value || '');
   return text ? `${text.slice(0, 12)}…` : '-';
+}
+
+function notificationLogStatus(log) {
+  if (['sent', 'failed', 'skipped'].includes(log?.delivery_status)) {
+    return log.delivery_status;
+  }
+  return log?.success ? 'sent' : 'failed';
+}
+
+function notificationLogBadge(log) {
+  const status = notificationLogStatus(log);
+  if (status === 'sent') return 'badge-ready';
+  if (status === 'skipped') return 'badge-muted';
+  return 'badge-danger';
+}
+
+function localizeNotificationError(value, t) {
+  const code = String(value || '').trim();
+  const statusMatch = code.match(/^notification_http_status:(\d{3})$/);
+  if (statusMatch) {
+    return formatText(t('deploy.notificationErrors.httpStatus'), { status: statusMatch[1] });
+  }
+  const known = {
+    notification_http_status_error: 'httpStatusUnknown',
+    notification_timeout: 'timeout',
+    notification_transport_error: 'transport',
+  };
+  return t(`deploy.notificationErrors.${known[code] || 'unknown'}`);
+}
+
+function localizedProductionCheck(check, t) {
+  const titleKey = `dashboard.checksMap.${check?.code}Title`;
+  const exampleKey = `dashboard.checksMap.${check?.code}Example`;
+  const title = t(titleKey);
+  const example = t(exampleKey);
+  return {
+    title: title === titleKey ? t('dashboard.checksMap.unknownTitle') : title,
+    example: example === exampleKey ? t('dashboard.checksMap.unknownExample') : example,
+  };
+}
+
+function realRunControlMessage(control, t) {
+  const firstBlocker = control.blockers[0];
+  const localized = firstBlocker ? localizedProductionCheck(firstBlocker, t) : null;
+  if (control.currentlyEnabled) {
+    if (!control.deploymentCapability) {
+      return t('deploy.realRunControl.enabledWithoutCapability');
+    }
+    if (!control.readinessAvailable) {
+      return t('deploy.realRunControl.enabledWithoutReadiness');
+    }
+    if (localized) {
+      return formatText(t('deploy.realRunControl.enabledWithBlocker'), {
+        count: control.blockers.length,
+        check: localized.title,
+        example: localized.example,
+      });
+    }
+    return t('deploy.realRunControl.enabled');
+  }
+  if (!control.deploymentCapability) {
+    return t(control.deploymentCapabilityReported
+      ? 'deploy.realRunControl.deploymentDisabled'
+      : 'deploy.realRunControl.deploymentUnknown');
+  }
+  if (!control.readinessAvailable) {
+    return t('deploy.realRunControl.readinessUnavailable');
+  }
+  if (localized) {
+    return formatText(t('deploy.realRunControl.prerequisitesBlocked'), {
+      count: control.blockers.length,
+      check: localized.title,
+      example: localized.example,
+    });
+  }
+  return t('deploy.realRunControl.readyForOwnerReview');
+}
+
+function localizedProductionBlockerCode(code, t) {
+  const checkKey = `dashboard.checksMap.${code}Title`;
+  const check = t(checkKey);
+  if (check !== checkKey) return check;
+  const gateKey = `lotteries.realGateBlockers.${code}`;
+  const gate = t(gateKey);
+  return gate === gateKey ? t('dashboard.checksMap.unknownTitle') : gate;
+}
+
+function localizeRealRunUpdateError(error, t) {
+  const serverCode = error?.serverCode || error?.details?.code;
+  if (
+    serverCode === 'real_run_deployment_capability_disabled'
+    || (error?.status === 409 && /REAL_RUN_ENABLED capability is disabled/i.test(error?.message || ''))
+  ) {
+    return t('deploy.realRunErrors.real_run_deployment_capability_disabled');
+  }
+  if (serverCode === 'real_run_prerequisites_not_ready') {
+    const blockerCodes = Array.isArray(error?.details?.blocker_codes)
+      ? error.details.blocker_codes
+      : [];
+    const blockers = [...new Set(
+      blockerCodes.slice(0, 5).map(code => localizedProductionBlockerCode(code, t)),
+    )];
+    return formatText(t('deploy.realRunErrors.real_run_prerequisites_not_ready'), {
+      blockers: blockers.join('、') || t('deploy.realRunErrors.unknownPrerequisites'),
+    });
+  }
+  if (error?.status === 409) return t('deploy.realRunErrors.runtimeConflict');
+  return error?.message || t('deploy.operationFailed');
+}
+
+function globalBreakerStatus(breaker) {
+  const status = String(breaker?.status || '').trim().toLowerCase();
+  return ['closed', 'open', 'half_open'].includes(status) ? status : 'unknown';
+}
+
+function globalBreakerBadge(breaker) {
+  const status = globalBreakerStatus(breaker);
+  if (status === 'closed') return 'badge-ready';
+  if (status === 'open') return 'badge-danger';
+  if (status === 'half_open') return 'badge-warn';
+  return 'badge-warn';
+}
+
+function autopilotStatusKey(autopilot) {
+  if (!autopilot?.available || !autopilot?.reported) return 'unreported';
+  if (!autopilot.fresh) return 'stale';
+  if (!autopilot.enabled || autopilot.status === 'disabled') return 'disabled';
+  if (autopilot.status === 'degraded' || (autopilot.last_round?.failures ?? 0) > 0) return 'degraded';
+  return 'running';
+}
+
+function autopilotStatusBadge(autopilot) {
+  const status = autopilotStatusKey(autopilot);
+  if (status === 'running') return 'badge-ready';
+  if (status === 'degraded' || status === 'stale') return 'badge-warn';
+  return 'badge-muted';
+}
+
+function autopilotNextAction(runtimeSettings, realRunEvidence, t) {
+  const autopilot = runtimeSettings?.autopilot;
+  const status = autopilotStatusKey(autopilot);
+  if (status === 'unreported') return t('deploy.autopilotNext.unreported');
+  if (status === 'stale') return t('deploy.autopilotNext.stale');
+  if (status === 'disabled') return t('deploy.autopilotNext.disabled');
+  if (!autopilot.dispatch_configured || !autopilot.platform_allowlist_valid) {
+    return t('deploy.autopilotNext.configure');
+  }
+  if ((autopilot.last_round?.failures ?? 0) > 0) return t('deploy.autopilotNext.failures');
+  const platformAllowlist = new Set(
+    (Array.isArray(autopilot.platform_allowlist) ? autopilot.platform_allowlist : [])
+      .map(platform => String(platform || '').trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const blockers = (realRunEvidence || [])
+    .filter(item => platformAllowlist.has(String(item?.platform || '').trim().toLowerCase()))
+    .filter(item => ['pending', 'claimed'].includes(String(item?.status || '').trim().toLowerCase()))
+    .flatMap(item => Array.isArray(item?.blockers) ? item.blockers : [])
+    .filter(Boolean)
+    .filter(item => ![
+      'global_real_run_disabled',
+      'global_circuit_breaker_open',
+      'global_circuit_breaker_not_closed',
+    ].includes(item));
+  const blocker = blockers.find(item => /action_plan|rule_snapshot/.test(item))
+    || blockers[0];
+  if ((autopilot.last_round?.selected ?? 0) === 0 && blocker) {
+    return formatText(t('deploy.autopilotNext.blockedTarget'), {
+      blocker: localizeRealRunBlocker(blocker, t),
+      example: autopilotBlockerExample(blocker, t),
+    });
+  }
+  if (globalBreakerStatus(runtimeSettings?.global_circuit_breaker) !== 'closed') {
+    return t('deploy.autopilotNext.breakerOpen');
+  }
+  if (!autopilot.real_run_authorized) return t('deploy.autopilotNext.validationOnly');
+  return t('deploy.autopilotNext.active');
+}
+
+function localizeRealRunBlocker(blocker, t) {
+  const mapped = t(`lotteries.realGateBlockers.${blocker}`);
+  return mapped === `lotteries.realGateBlockers.${blocker}`
+    ? t('deploy.autopilotNext.unknownBlocker')
+    : mapped;
+}
+
+function autopilotBlockerExample(blocker, t) {
+  const mapped = t(`deploy.autopilotBlockerExamples.${blocker}`);
+  return mapped === `deploy.autopilotBlockerExamples.${blocker}`
+    ? t('deploy.autopilotBlockerExamples.default')
+    : mapped;
+}
+
+function localizeBreakerReason(reason, t) {
+  const knownReasons = {
+    'local migration and test safety hold': 'localMigrationHold',
+  };
+  const key = knownReasons[String(reason || '').trim()] || 'recorded';
+  return t(`deploy.breakerReasons.${key}`);
 }
 
 function intentStatusClass(status) {

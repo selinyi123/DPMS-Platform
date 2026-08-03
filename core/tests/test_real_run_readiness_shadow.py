@@ -317,8 +317,11 @@ class FakeReadinessDatabase:
                 "probe_lease_released_at": self.db_now - timedelta(minutes=9),
                 "shadow_lease_released_at": self.db_now - timedelta(minutes=7),
             }
-        if "SELECT NOW() AS db_now" in query:
+        if "SELECT UTC_TIMESTAMP() AS db_now" in query:
             return {"db_now": self.db_now}
+        if "FROM account_active_risk_states active_risk" in query:
+            self._assert_equal((values or {}).get("account_id"), ACCOUNT_ID)
+            return None
         raise AssertionError(f"Unexpected query: {query}")
 
     async def fetch_all(self, query, values=None):
@@ -337,7 +340,7 @@ class FakeReadinessDatabase:
 
 
 class RiskDisplacementDatabase:
-    """Emulate the old SQL cap so the regression tests fail before the fix."""
+    """Emulate the one-row rolling active-risk state."""
 
     def __init__(self, now):
         self.now = now
@@ -365,16 +368,17 @@ class RiskDisplacementDatabase:
     async def fetch_all(self, query, values=None):
         if "FROM accounts" in query:
             return [{"id": 4, "platform": "bilibili"}]
-        if "FROM risk_events" in query:
+        if "FROM account_active_risk_states active_risk" in query:
             self.risk_queries.append(query)
-            if "LIMIT 50" in query or "risk_rank <= 50" in query:
-                return self.rows[:50]
-            return self.rows
+            return [self.rows[-1]]
         raise AssertionError(f"Unexpected query: {query}")
 
     async def fetch_one(self, query, values=None):
-        if "SELECT NOW() AS db_now" in query:
+        if "SELECT UTC_TIMESTAMP() AS db_now" in query:
             return {"db_now": self.now}
+        if "FROM account_active_risk_states active_risk" in query:
+            self.risk_queries.append(query)
+            return self.rows[-1]
         raise AssertionError(f"Unexpected query: {query}")
 
 
@@ -393,6 +397,25 @@ class AccountRiskDisplacementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(risk["latest_event"]["id"], 1)
         self.assertNotIn("LIMIT 50", fake.risk_queries[0])
 
+    async def test_single_account_risk_lock_is_one_materialized_row(self):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+        database = mock.Mock()
+        database.fetch_one = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(real_run_readiness, "database", database):
+            risk = await real_run_readiness.recent_account_risk(
+                4,
+                now=now,
+                for_update=True,
+            )
+
+        self.assertFalse(risk["has_recent_risk"])
+        query, values = database.fetch_one.await_args.args
+        self.assertIn("FROM account_active_risk_states", query)
+        self.assertIn("LIMIT 1", query)
+        self.assertTrue(query.rstrip().endswith("FOR UPDATE"))
+        self.assertEqual(values["account_id"], 4)
+
     async def test_batched_risk_cannot_be_displaced_by_fifty_expired_events(self):
         now = datetime(2026, 7, 14, 12, 0, 0)
         fake = RiskDisplacementDatabase(now)
@@ -410,6 +433,171 @@ class AccountRiskDisplacementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["runnable_accounts"], 0)
         self.assertEqual(summary["latest_recent_risk"]["latest_event"]["id"], 1)
         self.assertNotIn("risk_rank <= 50", fake.risk_queries[0])
+
+    async def test_risk_summary_account_overflow_is_bounded_and_fail_closed(
+        self,
+    ):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+        account_rows = [
+            {"id": index + 1, "platform": "bilibili"}
+            for index in range(
+                real_run_readiness
+                .REAL_RUN_RISK_SUMMARY_ACCOUNT_LIMIT_PER_PLATFORM
+                + 1
+            )
+        ]
+        database = mock.Mock()
+        database.fetch_one = mock.AsyncMock(return_value={"db_now": now})
+        database.fetch_all = mock.AsyncMock(return_value=account_rows)
+
+        with mock.patch.object(real_run_readiness, "database", database):
+            summary = (
+                await real_run_readiness.real_run_account_risk_summaries(
+                    ["bilibili"]
+                )
+            )["bilibili"]
+
+        self.assertEqual(summary["runnable_accounts"], 0)
+        self.assertTrue(summary["query_budget_exhausted"])
+        self.assertEqual(
+            summary["latest_recent_risk"]["latest_event"]["event_type"],
+            "risk_summary_account_budget_exhausted",
+        )
+        self.assertEqual(database.fetch_all.await_count, 1)
+        query, values = database.fetch_all.await_args.args
+        self.assertIn("LIMIT :risk_summary_account_limit", query)
+        self.assertEqual(
+            values["risk_summary_account_limit"],
+            real_run_readiness
+            .REAL_RUN_RISK_SUMMARY_ACCOUNT_LIMIT_PER_PLATFORM
+            + 1,
+        )
+
+    async def test_risk_summary_reads_one_materialized_row_per_account(
+        self,
+    ):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+        risk_row = {
+            "id": 1,
+            "account_id": 4,
+            "event_type": "login_required",
+            "detail": json.dumps({"reason": "login_required"}),
+            "created_at": now - timedelta(hours=20),
+        }
+
+        async def fetch_all(query, _values=None):
+            if "FROM accounts" in query:
+                return [{"id": 4, "platform": "bilibili"}]
+            if "FROM account_active_risk_states active_risk" in query:
+                return [risk_row]
+            raise AssertionError(f"unexpected query: {query}")
+
+        database = mock.Mock()
+        database.fetch_one = mock.AsyncMock(return_value={"db_now": now})
+        database.fetch_all = mock.AsyncMock(side_effect=fetch_all)
+
+        with mock.patch.object(real_run_readiness, "database", database):
+            summary = (
+                await real_run_readiness.real_run_account_risk_summaries(
+                    ["bilibili"]
+                )
+            )["bilibili"]
+
+        self.assertEqual(summary["ready_accounts"], 1)
+        self.assertEqual(summary["runnable_accounts"], 0)
+        self.assertEqual(
+            summary["latest_recent_risk"]["latest_event"]["event_type"],
+            "login_required",
+        )
+        risk_call = database.fetch_all.await_args_list[1]
+        query = risk_call.args[0]
+        self.assertIn("FROM account_active_risk_states", query)
+        self.assertNotIn("JSON_EXTRACT", query)
+        self.assertNotIn("ROW_NUMBER() OVER", query)
+
+    async def test_risk_summary_timeout_is_observable_and_fail_closed(self):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+
+        async def slow_fetch_all(_query, _values=None):
+            await asyncio.sleep(0.05)
+            return []
+
+        database = mock.Mock()
+        database.fetch_one = mock.AsyncMock(return_value={"db_now": now})
+        database.fetch_all = mock.AsyncMock(side_effect=slow_fetch_all)
+        with mock.patch.object(
+            real_run_readiness,
+            "database",
+            database,
+        ), mock.patch.object(
+            real_run_readiness,
+            "REAL_RUN_RISK_SUMMARY_TIMEOUT_SECONDS",
+            0.001,
+        ), mock.patch.object(
+            real_run_readiness,
+            "structured_log",
+        ) as structured_log:
+            summary = (
+                await real_run_readiness.real_run_account_risk_summaries(
+                    ["bilibili"]
+                )
+            )["bilibili"]
+
+        self.assertEqual(summary["runnable_accounts"], 0)
+        self.assertTrue(summary["query_budget_exhausted"])
+        self.assertEqual(
+            summary["latest_recent_risk"]["latest_event"]["event_type"],
+            "risk_summary_query_timeout",
+        )
+        self.assertTrue(
+            any(
+                call.args[1] == "real_run_risk_summary_query_timeout"
+                for call in structured_log.call_args_list
+            )
+        )
+
+    async def test_risk_summary_timeout_isolated_from_sibling_platform(self):
+        now = datetime(2026, 7, 14, 12, 0, 0)
+
+        async def fetch_all(query, values=None):
+            if "FROM accounts" in query:
+                platform = str(
+                    (values or {}).get("risk_summary_platform") or ""
+                )
+                if platform == "bilibili":
+                    await asyncio.sleep(0.05)
+                    return []
+                return [{"id": 5, "platform": "weibo"}]
+            if "FROM account_active_risk_states active_risk" in query:
+                return []
+            raise AssertionError(f"unexpected query: {query}")
+
+        database = mock.Mock()
+        database.fetch_one = mock.AsyncMock(return_value={"db_now": now})
+        database.fetch_all = mock.AsyncMock(side_effect=fetch_all)
+        with mock.patch.object(
+            real_run_readiness,
+            "database",
+            database,
+        ), mock.patch.object(
+            real_run_readiness,
+            "REAL_RUN_RISK_SUMMARY_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            summaries = (
+                await real_run_readiness.real_run_account_risk_summaries(
+                    ["bilibili", "weibo"]
+                )
+            )
+
+        self.assertEqual(summaries["bilibili"]["runnable_accounts"], 0)
+        self.assertEqual(
+            summaries["bilibili"]["latest_recent_risk"]["latest_event"][
+                "event_type"
+            ],
+            "risk_summary_query_timeout",
+        )
+        self.assertEqual(summaries["weibo"]["runnable_accounts"], 1)
 
 
 class QualifiedShadowObservationTests(unittest.TestCase):
@@ -689,6 +877,142 @@ class RealRunShadowEvidenceTests(unittest.TestCase):
         self.assertTrue(result["execution_evidence_bound"])
         self.assertEqual(EXECUTION_REVISION, result["execution_revision"])
         self.assertEqual([], result["blockers"])
+
+    def test_implicit_author_follow_target_is_bound_before_semantic_validation(self):
+        rule_text = (
+            "抽奖要求：关注 + 评论 + 转发，同时评论请记得 @TargetUser，"
+            "否则视为无效参与。"
+        )
+        parsed_rule = parse_rule_fixture(rule_text, "bilibili")
+        source_requirements = copy.deepcopy(parsed_rule["content_requirements"])
+        bound_requirements = copy.deepcopy(source_requirements)
+        bound_requirements["follow_targets"] = ["@TargetUser"]
+        saved_plan = complete_action_plan(
+            rule_text,
+            required_actions=parsed_rule["required_actions"],
+            content_requirements=bound_requirements,
+            unsupported_actions=parsed_rule["unsupported_actions"],
+        )
+        saved_plan["source_content_requirements"] = source_requirements
+        saved_plan["plan_hash"] = compute_action_plan_hash(saved_plan)
+        observation = complete_api_observation(
+            required_actions=parsed_rule["required_actions"],
+            follow_target="@TargetUser",
+        )
+
+        result = self.evaluate(
+            observation,
+            rule_text=rule_text,
+            action_plan=saved_plan,
+        )
+
+        self.assertTrue(result["action_plan_ready"])
+        self.assertNotIn("lottery_rule_requirements_unresolved", result["blockers"])
+        self.assertNotIn("action_plan_requirement_binding_mismatch", result["blockers"])
+
+    def test_batched_exact_evidence_matches_non_batched_authority(self):
+        saved_plan = complete_action_plan()
+        observation = self.observation()
+        probe_observation = complete_api_observation()
+        probe_hash = hash_preflight_observation(probe_observation)
+        shadow_hash = hash_preflight_observation(observation)
+        db_now = datetime(2026, 7, 14, 12, 0, 0)
+        evidence = {
+            "id": "execution-evidence-1",
+            "lottery_id": LOTTERY_ID,
+            "account_id": ACCOUNT_ID,
+            "rule_snapshot_id": RULE_SNAPSHOT_ID,
+            "execution_path_id": BILIBILI_API_EXECUTION_PATH,
+            "target_hash": compute_target_hash(CANONICAL_URL),
+            "rule_hash": saved_plan["rule_hash"],
+            "action_plan_hash": saved_plan["plan_hash"],
+            "config_hash": compute_bilibili_api_config_hash(
+                EXECUTION_REVISION
+            ),
+            "probe_id": "probe-1",
+            "shadow_task_id": "shadow-task",
+            "verified_at": db_now - timedelta(minutes=5),
+            "expires_at": db_now + timedelta(hours=23),
+            "evidence_probe_observation_kind": API_PREFLIGHT_KIND,
+            "evidence_probe_observation_hash": probe_hash,
+            "evidence_shadow_observation_kind": API_PREFLIGHT_KIND,
+            "evidence_shadow_observation_hash": shadow_hash,
+            "probe_observation": probe_observation,
+            "probe_observation_kind": API_PREFLIGHT_KIND,
+            "probe_observation_hash": probe_hash,
+            "probe_finished_at": db_now - timedelta(minutes=10),
+            "shadow_observation": observation,
+            "shadow_observation_kind": API_PREFLIGHT_KIND,
+            "shadow_observation_hash": shadow_hash,
+            "shadow_finished_at": db_now - timedelta(minutes=8),
+        }
+        batch = real_run_readiness.RealRunEvidenceBatch(
+            account_id=None,
+            account_ids=frozenset({ACCOUNT_ID}),
+            account_scoped_readiness=True,
+            accounts={
+                ACCOUNT_ID: {
+                    "id": ACCOUNT_ID,
+                    "platform": "bilibili",
+                    "status": "ready",
+                    "execution_revision": EXECUTION_REVISION,
+                    "credential_size": 64,
+                }
+            },
+            account_risks={
+                ACCOUNT_ID: real_run_readiness.account_risk_payload(None)
+            },
+            rule_snapshots={
+                (LOTTERY_ID, RULE_SNAPSHOT_ID): {
+                    "id": RULE_SNAPSHOT_ID,
+                    "lottery_id": LOTTERY_ID,
+                    "platform": "bilibili",
+                    "rule_hash": saved_plan["rule_hash"],
+                    "rule_text": DEFAULT_RULE_TEXT,
+                    "is_complete": 1,
+                    "attested_by": "operator-1",
+                    "attested_at": db_now - timedelta(hours=1),
+                }
+            },
+            bilibili_execution_evidence={
+                (LOTTERY_ID, ACCOUNT_ID): [evidence]
+            },
+        )
+        lottery = {
+            "id": LOTTERY_ID,
+            "platform": "bilibili",
+            "raw_url": CANONICAL_URL,
+            "canonical_url": CANONICAL_URL,
+            "rule_text": DEFAULT_RULE_TEXT,
+            "rule_hash": saved_plan["rule_hash"],
+            "authoritative_rule_snapshot_id": RULE_SNAPSHOT_ID,
+            "action_plan_hash": saved_plan["plan_hash"],
+            "action_plan": json.dumps(saved_plan, ensure_ascii=False),
+        }
+
+        class NoDatabase:
+            async def fetch_one(self, *_args, **_kwargs):
+                raise AssertionError("batched validation performed a DB read")
+
+            async def fetch_all(self, *_args, **_kwargs):
+                raise AssertionError("batched validation performed a DB read")
+
+        original_database = real_run_readiness.database
+        real_run_readiness.database = NoDatabase()
+        try:
+            result = asyncio.run(
+                real_run_readiness.validate_real_run_evidence(
+                    lottery,
+                    account_id=ACCOUNT_ID,
+                    evidence_batch=batch,
+                )
+            )
+        finally:
+            real_run_readiness.database = original_database
+
+        self.assertTrue(result["allowed"])
+        self.assertTrue(result["execution_evidence_bound"])
+        self.assertEqual(result["blockers"], [])
 
     def test_succeeded_task_without_observation_is_not_ready(self):
         result = self.evaluate(None)

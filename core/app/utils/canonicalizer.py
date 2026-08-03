@@ -1,12 +1,34 @@
 
 import hashlib
 import re
+from types import MappingProxyType
 
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from dataclasses import dataclass
 
-from app.utils.lottery_targets import is_weibo_status_id
+from app.platform_modules.catalog import (
+    BILIBILI_DYNAMIC_ID_PATTERN,
+    BILIBILI_VIDEO_ID_PATTERN,
+    DOUYIN_NOTE_ID_PATTERN,
+    DOUYIN_VIDEO_ID_PATTERN,
+    PLATFORM_MODULE_SPECS,
+    WEIBO_UID_PATTERN,
+    XIAOHONGSHU_NOTE_PATTERN,
+    is_weibo_status_id,
+)
+
+
+class CanonicalizationError(ValueError):
+    """A stable, non-secret target canonicalization failure."""
+
+    def __init__(self, code: str, *, retryable: bool = False):
+        super().__init__(code)
+        self.code = code
+        self.retryable = retryable
+
+
+REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 
@@ -33,12 +55,12 @@ class CanonicalURL:
         return hashlib.sha256(self.to_uri().encode()).hexdigest()
 
 
-PLATFORM_CANONICAL_HOSTS = {
-    "bilibili": {"b23.tv", "t.bilibili.com", "bilibili.com", "www.bilibili.com"},
-    "weibo": {"t.cn", "m.weibo.cn", "weibo.com", "www.weibo.com"},
-    "xiaohongshu": {"xhslink.com", "xiaohongshu.com", "www.xiaohongshu.com"},
-    "douyin": {"v.douyin.com", "douyin.com", "www.douyin.com", "www.iesdouyin.com"},
-}
+PLATFORM_CANONICAL_HOSTS = MappingProxyType(
+    {
+        platform: spec.canonical_hosts
+        for platform, spec in PLATFORM_MODULE_SPECS.items()
+    }
+)
 
 
 def validated_platform_https_url(platform: str, raw_url: str) -> str:
@@ -68,22 +90,56 @@ async def resolve_platform_short_link(raw_url: str, platform: str, short_host: s
             host = (parsed.hostname or "").rstrip(".").lower()
             if host != short_host:
                 return current
-            response = await client.head(current, follow_redirects=False)
-            location = response.headers.get("location")
-            if response.status_code in {405, 501}:
-                # Several platform shorteners do not implement HEAD. Preserve
-                # short-link compatibility with a non-following, streamed GET;
-                # the Range header also limits compliant servers to one byte.
-                async with client.stream(
-                    "GET",
-                    current,
-                    follow_redirects=False,
-                    headers={"Range": "bytes=0-0"},
-                ) as fallback:
-                    response = fallback
-                    location = response.headers.get("location")
-            if response.status_code not in {301, 302, 303, 307, 308} or not location:
-                return current
+            head_error = None
+            try:
+                response = await client.head(current, follow_redirects=False)
+                location = (
+                    response.headers.get("location")
+                    if response.status_code in REDIRECT_STATUS_CODES
+                    else None
+                )
+            except httpx.RequestError as exc:
+                head_error = exc
+                location = None
+
+            if not location:
+                # b23.tv can answer HEAD with 200 even though a regular GET
+                # redirects. Always make one bounded, non-following GET when
+                # HEAD did not produce a usable Location. The Range header
+                # keeps compliant responses to one byte.
+                try:
+                    async with client.stream(
+                        "GET",
+                        current,
+                        follow_redirects=False,
+                        headers={"Range": "bytes=0-0"},
+                    ) as fallback:
+                        fallback_location = (
+                            fallback.headers.get("location")
+                            if fallback.status_code in REDIRECT_STATUS_CODES
+                            else None
+                        )
+                except httpx.TimeoutException as exc:
+                    raise CanonicalizationError(
+                        "canonicalization_short_link_timeout",
+                        retryable=True,
+                    ) from exc
+                except httpx.RequestError as exc:
+                    raise CanonicalizationError(
+                        "canonicalization_short_link_unavailable",
+                        retryable=True,
+                    ) from exc
+                if fallback_location:
+                    location = fallback_location
+                elif head_error is not None:
+                    raise CanonicalizationError(
+                        "canonicalization_short_link_unavailable",
+                        retryable=True,
+                    ) from head_error
+                else:
+                    raise CanonicalizationError(
+                        "canonicalization_short_link_unresolved"
+                    )
             current = validated_platform_https_url(platform, urljoin(current, location))
     raise ValueError("canonicalization_redirect_limit_exceeded")
 
@@ -108,34 +164,36 @@ class BilibiliCanonicalizer:
 
         clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
-        if host in {"bilibili.com", "www.bilibili.com"} and '/video/' in clean_url:
+        if host in {"bilibili.com", "www.bilibili.com", "m.bilibili.com"} and '/video/' in clean_url:
 
             bv = clean_url.split('/video/')[1].split('/')[0].split('?')[0].split('#')[0]
 
-            if re.fullmatch(r"(?:BV[0-9A-Za-z]+|av\d+)", bv, re.IGNORECASE):
+            if BILIBILI_VIDEO_ID_PATTERN.fullmatch(bv):
                 return CanonicalURL("bilibili", "video", bv)
 
         path_parts = [part for part in parsed.path.split("/") if part]
-        if host == 't.bilibili.com' and len(path_parts) == 2 and path_parts[0] == 'opus' and path_parts[1].isdigit():
+        if host == 't.bilibili.com' and len(path_parts) == 2 and path_parts[0] == 'opus' and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(path_parts[1]):
 
             return CanonicalURL("bilibili", "dynamic", "opus_" + path_parts[1])
 
-        if host == 't.bilibili.com' and len(path_parts) == 1 and path_parts[0].isdigit():
+        if host == 't.bilibili.com' and len(path_parts) == 1 and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(path_parts[0]):
 
             return CanonicalURL("bilibili", "dynamic", path_parts[0])
 
-        if host in {"bilibili.com", "www.bilibili.com"} and '/opus/' in clean_url:
+        if host in {"bilibili.com", "www.bilibili.com", "m.bilibili.com"} and '/opus/' in clean_url:
 
             opus_id = clean_url.split('/opus/')[-1].split('?')[0].split('#')[0]
 
-            if opus_id.isdigit():
+            if BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(opus_id):
                 return CanonicalURL("bilibili", "dynamic", "opus_" + opus_id)
 
-        if host in {"bilibili.com", "www.bilibili.com"} and '/read/' in clean_url:
-
-            cvid = clean_url.split('/read/')[1].split('/')[0].split('?')[0].split('#')[0]
-
-            return CanonicalURL("bilibili", "article", cvid)
+        if (
+            host in {"bilibili.com", "www.bilibili.com", "m.bilibili.com"}
+            and len(path_parts) == 2
+            and path_parts[0] == "read"
+            and re.fullmatch(r"cv[0-9]+", path_parts[1])
+        ):
+            return CanonicalURL("bilibili", "article", path_parts[1])
 
         raise ValueError(f"Cannot canonicalize: {raw_url}")
 
@@ -164,7 +222,7 @@ class WeiboCanonicalizer:
                 return CanonicalURL("weibo", "status", path_parts[1])
             if (
                 len(path_parts) == 2
-                and path_parts[0].isdigit()
+                and WEIBO_UID_PATTERN.fullmatch(path_parts[0])
                 and is_weibo_status_id(path_parts[1])
             ):
                 return CanonicalURL("weibo", "status", path_parts[1])
@@ -180,9 +238,18 @@ class XiaohongshuCanonicalizer:
         path_parts = [part for part in parsed.path.split("/") if part]
 
         if host in {"xiaohongshu.com", "www.xiaohongshu.com"}:
-            if len(path_parts) == 2 and path_parts[0] == "explore":
+            if (
+                len(path_parts) == 2
+                and path_parts[0] == "explore"
+                and XIAOHONGSHU_NOTE_PATTERN.fullmatch(path_parts[1])
+            ):
                 return CanonicalURL("xiaohongshu", "note", path_parts[1].lower())
-            if len(path_parts) == 3 and path_parts[0] == "discovery" and path_parts[1] == "item":
+            if (
+                len(path_parts) == 3
+                and path_parts[0] == "discovery"
+                and path_parts[1] == "item"
+                and XIAOHONGSHU_NOTE_PATTERN.fullmatch(path_parts[2])
+            ):
                 return CanonicalURL("xiaohongshu", "note", path_parts[2].lower())
         raise ValueError(f"Cannot canonicalize: {raw_url}")
 
@@ -196,17 +263,26 @@ class DouyinCanonicalizer:
         path_parts = [part for part in parsed.path.split("/") if part]
 
         if host in {"douyin.com", "www.douyin.com"}:
-            if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
+            if (
+                len(path_parts) == 2
+                and path_parts[0] == "video"
+                and DOUYIN_VIDEO_ID_PATTERN.fullmatch(path_parts[1])
+            ):
                 return CanonicalURL("douyin", "video", path_parts[1])
             if (
                 host == "www.douyin.com"
                 and len(path_parts) == 2
                 and path_parts[0] == "note"
-                and re.fullmatch(r"\d{19}", path_parts[1])
+                and DOUYIN_NOTE_ID_PATTERN.fullmatch(path_parts[1])
             ):
                 return CanonicalURL("douyin", "note", path_parts[1])
         if host == "www.iesdouyin.com":
-            if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():
+            if (
+                len(path_parts) == 3
+                and path_parts[0] == "share"
+                and path_parts[1] == "video"
+                and DOUYIN_VIDEO_ID_PATTERN.fullmatch(path_parts[2])
+            ):
                 return CanonicalURL("douyin", "video", path_parts[2])
         raise ValueError(f"Cannot canonicalize: {raw_url}")
 
@@ -229,17 +305,21 @@ class GenericCanonicalizer:
         return f"canonical://{platform}/url/{hashlib.sha256(clean_url.encode()).hexdigest()}"
 
 
-PLATFORM_CANONICALIZERS = {
+PLATFORM_CANONICALIZERS = MappingProxyType({
     "bilibili": BilibiliCanonicalizer,
     "weibo": WeiboCanonicalizer,
     "xiaohongshu": XiaohongshuCanonicalizer,
     "douyin": DouyinCanonicalizer,
-}
+})
 
 
 async def canonicalize_platform_url(platform: str, raw_url: str) -> str:
     platform_key = str(platform or "").strip().lower()
-    canonicalizer = PLATFORM_CANONICALIZERS.get(platform_key)
-    if canonicalizer:
-        return (await canonicalizer.canonicalize(raw_url)).to_uri()
+    # Import locally so individual platform modules can expose this utility as
+    # their normalization implementation without a registry import cycle.
+    from app.platform_modules import get_platform_module
+
+    platform_module = get_platform_module(platform_key)
+    if platform_module is not None:
+        return await platform_module.canonicalize_target(raw_url)
     return await GenericCanonicalizer.canonicalize(platform, raw_url)

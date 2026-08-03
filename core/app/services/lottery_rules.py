@@ -110,6 +110,15 @@ XIAOHONGSHU_AMBIGUOUS_PATTERNS = (
     r"可选",
     r"任选",
 )
+XIAOHONGSHU_PARTICIPATION_EMOJI_PATTERN = re.compile(
+    r"参与方式\s*[：:]\s*(?P<actions>[^，,。；;！？!?\r\n]{1,48})",
+    re.IGNORECASE,
+)
+XIAOHONGSHU_CONTEXTUAL_EMOJI_ACTIONS = {
+    "liked": "👍",
+    "commented": "💬",
+    "favorited": "⭐",
+}
 
 DOUYIN_ACTION_PATTERNS = {
     "followed": (r"关注(?:我|本账号|本账户|up主|博主|主播)?",),
@@ -313,6 +322,11 @@ FOLLOW_TARGET_ACTION_SUFFIX_PATTERN = re.compile(
 )
 COMMENT_CONTEXT_PATTERN = re.compile(r"(?:评论|留言)(?:区)?", re.IGNORECASE)
 REPOST_CONTEXT_PATTERN = re.compile(r"(?:转发|分享)(?:动态)?", re.IGNORECASE)
+MENTION_PARTICIPATION_CUE_PATTERN = re.compile(
+    r"(?:必须|请|记得|带上?|添加|标注|同时)",
+    re.IGNORECASE,
+)
+MENTION_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[。；;！？!?\r\n]")
 
 
 def _empty_content_requirements() -> dict[str, Any]:
@@ -427,6 +441,49 @@ def _token_action_scope(normalized_rule: str, start: int, end: int) -> str:
     return "reposted" if last_repost > last_comment else "commented"
 
 
+def _participation_mention_action_scope(
+    normalized_rule: str,
+    start: int,
+) -> str | None:
+    """Bind only an @ target introduced by a local participation command.
+
+    Full post text frequently contains narrative author, co-brand, or shop
+    mentions.  Treating every such identity as comment payload silently makes
+    a lottery rule stricter than its source.  A concrete mention is therefore
+    actionable only when both an action word and an imperative cue occur before
+    it in the same sentence-sized clause.  Looking only backwards also avoids
+    capturing a narrative mention followed later by an unrelated instruction.
+    """
+
+    clause_start = 0
+    for boundary in MENTION_CLAUSE_BOUNDARY_PATTERN.finditer(
+        normalized_rule, 0, start
+    ):
+        clause_start = boundary.end()
+    before = normalized_rule[max(clause_start, start - 48) : start]
+    if not MENTION_PARTICIPATION_CUE_PATTERN.search(before):
+        return None
+
+    comment_hits = list(COMMENT_CONTEXT_PATTERN.finditer(before))
+    repost_hits = list(REPOST_CONTEXT_PATTERN.finditer(before))
+    if not comment_hits and not repost_hits:
+        # Compact rules often use “带话题 #...# 并@账号” before the later
+        # “转评赞” shorthand.  This is still a concrete participation payload,
+        # not a narrative mention, and the existing contract assigns it to the
+        # comment action.  Requiring the topic imperative keeps author/shop
+        # mentions in ordinary prose excluded.
+        if re.search(
+            r"(?:带上?|添加|使用)(?:指定)?话题[^。；;！？!?\r\n]{0,96}$",
+            before,
+            re.IGNORECASE,
+        ):
+            return "commented"
+        return None
+    last_comment = comment_hits[-1].end() if comment_hits else -1
+    last_repost = repost_hits[-1].end() if repost_hits else -1
+    return "reposted" if last_repost > last_comment else "commented"
+
+
 def extract_content_requirements(
     normalized_rule: str,
     unsupported_actions: list[str],
@@ -477,7 +534,11 @@ def extract_content_requirements(
             )
             if generic is not None:
                 continue
-            action = _token_action_scope(normalized_rule, match.start(), match.end())
+            action = _participation_mention_action_scope(
+                normalized_rule, match.start()
+            )
+            if action is None:
+                continue
             bucket = requirements[action]["mentions"]
             if token not in bucket:
                 bucket.append(token)
@@ -501,13 +562,28 @@ def parse_lottery_rule(text: str, platform: str = "bilibili") -> dict[str, Any]:
         PLATFORM_UNSUPPORTED_ACTION_PATTERNS["bilibili"],
     )
 
-    matched_rules = []
-    required_actions = []
+    matched_by_action: dict[str, list[str]] = {}
     for action, patterns in action_patterns.items():
         matched = [pattern for pattern in patterns if re.search(pattern, normalized, re.IGNORECASE)]
         if matched:
-            required_actions.append(action)
-            matched_rules.append({"action": action, "patterns": matched})
+            matched_by_action[action] = matched
+    if platform_key == "xiaohongshu":
+        for context in XIAOHONGSHU_PARTICIPATION_EMOJI_PATTERN.finditer(
+            normalized
+        ):
+            action_text = context.group("actions")
+            for action, emoji in XIAOHONGSHU_CONTEXTUAL_EMOJI_ACTIONS.items():
+                if emoji in action_text:
+                    matched_by_action.setdefault(action, []).append(
+                        f"contextual_emoji:{emoji}"
+                    )
+    required_actions = [
+        action for action in action_patterns if action in matched_by_action
+    ]
+    matched_rules = [
+        {"action": action, "patterns": matched_by_action[action]}
+        for action in required_actions
+    ]
 
     lottery_matches = [pattern for pattern in lottery_patterns if re.search(pattern, normalized, re.IGNORECASE)]
     ambiguity = [pattern for pattern in ambiguous_patterns if re.search(pattern, normalized, re.IGNORECASE)]

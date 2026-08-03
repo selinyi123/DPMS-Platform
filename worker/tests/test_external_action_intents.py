@@ -33,6 +33,7 @@ class FakeIntentDatabase:
             "account_lease_id": "lease-1",
             "account_lease_generation": 7,
             "reconciliation_required": 0,
+            "execution_intent_kind": "full",
             "lease_id": "lease-1",
             "lease_generation": 7,
             "operation_kind": "real_run",
@@ -44,6 +45,7 @@ class FakeIntentDatabase:
             "active_account_lease_count": 1,
         }
         self.intent = None
+        self.lease_updates = []
 
     def transaction(self):
         return AsyncTransaction()
@@ -114,18 +116,26 @@ class FakeIntentDatabase:
             self.task["reconciliation_required"] = 1
             return
         if "UPDATE account_operation_leases" in query:
+            self.lease_updates.append(values)
             return
         raise AssertionError(f"unexpected execute query: {query}")
 
 
 class ExternalActionIntentTests(unittest.IsolatedAsyncioTestCase):
-    async def start(self, db, payload=None):
+    async def start(
+        self,
+        db,
+        payload=None,
+        *,
+        execution_intent_kind="full",
+    ):
         return await prepare_and_start_action_intent(
             db=db,
             task_id="task-1",
             account_id=41,
             lottery_id=73,
             worker_id="worker-a",
+            execution_intent_kind=execution_intent_kind,
             action="comment",
             payload=payload or {"text": "#话题# 精确评论"},
         )
@@ -278,6 +288,7 @@ class ExternalActionIntentTests(unittest.IsolatedAsyncioTestCase):
             account_id=41,
             lottery_id=73,
             worker_id="worker-a",
+            execution_intent_kind="full",
         )
         self.assertEqual(lease, ("lease-1", 7))
 
@@ -289,7 +300,44 @@ class ExternalActionIntentTests(unittest.IsolatedAsyncioTestCase):
                 account_id=41,
                 lottery_id=73,
                 worker_id="worker-a",
+                execution_intent_kind="full",
             )
+
+    async def test_repair_intent_requires_and_renews_repair_lease(self):
+        db = FakeIntentDatabase()
+        db.task["execution_intent_kind"] = "repair"
+        db.task["operation_kind"] = "repair_run"
+
+        intent = await self.start(
+            db,
+            execution_intent_kind="repair",
+        )
+        lease = await renew_account_operation_lease(
+            db=db,
+            task_id="task-1",
+            account_id=41,
+            lottery_id=73,
+            worker_id="worker-a",
+            execution_intent_kind="repair",
+        )
+
+        self.assertEqual(intent.task_id, "task-1")
+        self.assertEqual(lease, ("lease-1", 7))
+        self.assertEqual(
+            db.lease_updates[-1]["operation_kind"],
+            "repair_run",
+        )
+
+        db.task["operation_kind"] = "real_run"
+        with self.assertRaises(ExternalActionIntentBlocked) as caught:
+            await self.start(
+                db,
+                execution_intent_kind="repair",
+            )
+        self.assertEqual(
+            caught.exception.code,
+            "task_lease_binding_invalid",
+        )
 
 
 if __name__ == "__main__":

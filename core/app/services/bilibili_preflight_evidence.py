@@ -25,6 +25,8 @@ from app.action_plan import (
 
 
 API_PREFLIGHT_KIND = "bilibili_api_readonly_v2"
+BILIBILI_DYNAMIC_ID_PATTERN = re.compile(r"[0-9]{1,20}", re.ASCII)
+BILIBILI_DIRECT_DYNAMIC_ID_PATTERN = re.compile(r"[0-9]{10,20}", re.ASCII)
 DPMS_TO_API_ACTION = {
     "followed": "follow",
     "liked": "like",
@@ -99,18 +101,55 @@ def hash_preflight_observation(observation: Mapping[str, Any]) -> str:
 def extract_bilibili_dynamic_id(*values: str | None) -> str:
     for value in values:
         raw = str(value or "").strip()
-        if re.fullmatch(r"\d{10,}", raw):
+        if BILIBILI_DIRECT_DYNAMIC_ID_PATTERN.fullmatch(raw):
             return raw
-        parsed = urlparse(raw)
-        host = (parsed.hostname or "").rstrip(".").lower()
+        try:
+            parsed = urlparse(raw)
+            port = parsed.port
+            hostname = parsed.hostname
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() == "canonical"
+            and hostname == "bilibili"
+            and parsed.username is None
+            and parsed.password is None
+            and port is None
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) == 2 and parts[0] == "dynamic":
+                resource_id = parts[1]
+                if resource_id.startswith("opus_"):
+                    resource_id = resource_id[len("opus_") :]
+                if BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(resource_id):
+                    return resource_id
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            continue
+        if port not in (None, 443):
+            continue
+        host = (hostname or "").rstrip(".").lower()
         parts = [part for part in parsed.path.split("/") if part]
         if host == "t.bilibili.com":
-            if len(parts) == 1 and parts[0].isdigit():
+            if len(parts) == 1 and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[0]):
                 return parts[0]
-            if len(parts) == 2 and parts[0] == "opus" and parts[1].isdigit():
+            if (
+                len(parts) == 2
+                and parts[0] == "opus"
+                and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[1])
+            ):
                 return parts[1]
         if host in {"bilibili.com", "www.bilibili.com"}:
-            if len(parts) == 2 and parts[0] == "opus" and parts[1].isdigit():
+            if (
+                len(parts) == 2
+                and parts[0] == "opus"
+                and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[1])
+            ):
                 return parts[1]
     raise BilibiliPreflightEvidenceError("bilibili_dynamic_target_required")
 

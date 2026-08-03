@@ -19,7 +19,7 @@ READY_GATE = dict(
     dry_success=1,
     shadow_success=1,
     adapter_ready=True,
-    probe_ready=True,
+    execution_readiness_ready=True,
     real_run_enabled=True,
     breaker_allowed=True,
     breaker_reason=None,
@@ -38,11 +38,11 @@ class ChooseStrategyModeTests(unittest.TestCase):
         self.assertEqual(mode, "blocked")
         self.assertIn("no_safe_account", reasons)
 
-    def test_open_circuit_breaker_blocks_with_reason(self):
+    def test_open_circuit_breaker_falls_back_to_shadow_with_reason(self):
         mode, reasons, blockers = choose_strategy_mode(
             **{**READY_GATE, "breaker_allowed": False, "breaker_reason": "too many failures"}
         )
-        self.assertEqual(mode, "blocked")
+        self.assertEqual(mode, "shadow_run")
         self.assertIn("circuit_breaker_open", reasons)
         self.assertEqual(blockers, ["too many failures"])
 
@@ -52,15 +52,63 @@ class ChooseStrategyModeTests(unittest.TestCase):
         )
         self.assertEqual(blockers, ["circuit breaker open"])
 
+    def test_open_circuit_breaker_still_allows_dry_validation(self):
+        mode, reasons, blockers = choose_strategy_mode(
+            **{
+                **READY_GATE,
+                "dry_success": 0,
+                "execution_readiness_ready": False,
+                "breaker_allowed": False,
+                "breaker_reason": "production hold",
+            }
+        )
+        self.assertEqual(mode, "dry_run")
+        self.assertIn("dry_validation_needed", reasons)
+        self.assertEqual(blockers, [])
+
     def test_requires_dry_validation_first(self):
-        mode, reasons, _ = choose_strategy_mode(**{**READY_GATE, "dry_success": 0})
+        mode, reasons, _ = choose_strategy_mode(
+            **{
+                **READY_GATE,
+                "dry_success": 0,
+                "execution_readiness_ready": False,
+            }
+        )
         self.assertEqual(mode, "dry_run")
         self.assertIn("dry_validation_needed", reasons)
 
     def test_requires_shadow_validation_before_real(self):
-        mode, reasons, _ = choose_strategy_mode(**{**READY_GATE, "shadow_success": 0})
+        mode, reasons, _ = choose_strategy_mode(
+            **{
+                **READY_GATE,
+                "shadow_success": 0,
+                "execution_readiness_ready": False,
+            }
+        )
         self.assertEqual(mode, "shadow_run")
         self.assertIn("shadow_validation_needed", reasons)
+
+    def test_account_scoped_readiness_supersedes_aggregate_counters(self):
+        mode, reasons, blockers = choose_strategy_mode(
+            **{
+                **READY_GATE,
+                "dry_success": 0,
+                "shadow_success": 0,
+            }
+        )
+        self.assertEqual(mode, "real_run")
+        self.assertEqual(reasons, ["real_gate_ready"])
+        self.assertEqual(blockers, [])
+
+    def test_legacy_probe_ready_keyword_is_non_authoritative(self):
+        legacy_gate = dict(READY_GATE)
+        legacy_gate.pop("execution_readiness_ready")
+        mode, reasons, _ = choose_strategy_mode(
+            **legacy_gate,
+            probe_ready=True,
+        )
+        self.assertEqual(mode, "shadow_run")
+        self.assertIn("execution_readiness_not_ready", reasons)
 
     def test_manual_assisted_skips_unavailable_dry_run(self):
         mode, reasons, blockers = choose_strategy_mode(
@@ -88,11 +136,16 @@ class ChooseStrategyModeTests(unittest.TestCase):
 
     def test_partial_gate_falls_back_to_shadow_with_reasons(self):
         mode, reasons, _ = choose_strategy_mode(
-            **{**READY_GATE, "adapter_ready": False, "probe_ready": False, "real_run_enabled": False}
+            **{
+                **READY_GATE,
+                "adapter_ready": False,
+                "execution_readiness_ready": False,
+                "real_run_enabled": False,
+            }
         )
         self.assertEqual(mode, "shadow_run")
         self.assertIn("adapter_not_ready", reasons)
-        self.assertIn("probe_not_ready", reasons)
+        self.assertIn("execution_readiness_not_ready", reasons)
         self.assertIn("real_run_disabled", reasons)
 
     def test_real_run_disabled_never_yields_real_run(self):

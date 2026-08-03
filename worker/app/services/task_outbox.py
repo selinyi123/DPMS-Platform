@@ -4,6 +4,10 @@ import uuid
 from typing import Any
 
 from app.db import database, execute_affected_rows, redis
+from app.runtime_lane_health import (
+    record_runtime_lane_failure,
+    record_runtime_lane_success,
+)
 from app.utils.log import structured_log
 
 
@@ -11,6 +15,7 @@ TASK_OUTBOX_MAX_ATTEMPTS = 5
 TASK_OUTBOX_BATCH = 50
 TASK_OUTBOX_POLL_SECONDS = 5
 TASK_OUTBOX_SENDING_RECLAIM_SECONDS = 60
+NOTIFY_STREAM_KEY = "notify_events"
 
 
 def _json(value: dict[str, Any]) -> str:
@@ -29,6 +34,7 @@ async def enqueue_event_outbox(
     actor_id: Any | None = None,
     source_service: str = "worker",
     dedup_key: str | None = None,
+    db=None,
 ) -> None:
     """Persist an event-store write request inside the caller's DB transaction."""
     event_id = str(uuid.uuid4())
@@ -52,11 +58,14 @@ async def enqueue_event_outbox(
         stream_key=None,
         payload=outbox_payload,
         dedup_key=dedup_key or f"event:{aggregate}:{aggregate_id}:{event_type}:{correlation_id}:{event_id}",
+        db=db,
     )
 
 
 async def enqueue_notify_outbox(*, stream_key: str, message: dict[str, Any], dedup_key: str) -> None:
     """Persist a Redis stream notification write request inside the caller's transaction."""
+    if str(stream_key or "").strip() != NOTIFY_STREAM_KEY:
+        raise ValueError("task_outbox_notify_stream_invalid")
     await _enqueue(
         event_kind="notify_stream",
         aggregate="notification",
@@ -77,8 +86,10 @@ async def _enqueue(
     stream_key: str | None,
     payload: dict[str, Any],
     dedup_key: str,
+    db=None,
 ) -> None:
-    await database.execute(
+    target = db or database
+    await target.execute(
         """INSERT INTO task_outbox_events
            (event_kind, aggregate, aggregate_id, event_type, stream_key, payload, dedup_key, status)
            VALUES (:event_kind, :aggregate, :aggregate_id, :event_type, :stream_key, :payload, :dedup_key, 'pending')
@@ -108,16 +119,27 @@ async def reclaim_stale_task_outbox() -> int:
     return int(result or 0)
 
 
-async def flush_pending_task_outbox(limit: int = TASK_OUTBOX_BATCH) -> dict[str, int]:
+async def flush_pending_task_outbox(
+    limit: int = TASK_OUTBOX_BATCH,
+    *,
+    include_delivery_failures: bool = False,
+) -> dict[str, int]:
     rows = await database.fetch_all(
         "SELECT id FROM task_outbox_events WHERE status = 'pending' ORDER BY id LIMIT :limit",
         {"limit": limit},
     )
     sent = 0
+    delivery_failures = 0
     for row in rows:
-        if await _relay_by_id(row["id"]):
+        outcome = await _relay_by_id_outcome(row["id"])
+        if outcome == "sent":
             sent += 1
-    return {"scanned": len(rows), "sent": sent}
+        elif outcome == "failed":
+            delivery_failures += 1
+    result = {"scanned": len(rows), "sent": sent}
+    if include_delivery_failures:
+        result["delivery_failures"] = delivery_failures
+    return result
 
 
 async def _claim_row(row_id) -> dict | None:
@@ -139,10 +161,14 @@ async def _claim_row(row_id) -> dict | None:
 
 
 async def _relay_by_id(row_id) -> bool:
+    return await _relay_by_id_outcome(row_id) == "sent"
+
+
+async def _relay_by_id_outcome(row_id) -> str:
     row = await _claim_row(row_id)
     if row is None:
-        return False
-    return await _deliver_claimed(row)
+        return "unclaimed"
+    return "sent" if await _deliver_claimed(row) else "failed"
 
 
 async def _deliver_claimed(row: dict) -> bool:
@@ -200,10 +226,17 @@ async def _deliver_event(payload: dict[str, Any]) -> None:
 
 
 async def _deliver_notify(stream_key: str | None, payload: dict[str, Any]) -> None:
-    if not stream_key:
-        raise RuntimeError("notify stream key is required")
+    # ``task_outbox_events`` is durable database state and may outlive the
+    # producer version that wrote it.  Never let a corrupted or legacy row
+    # turn the Worker relay into a generic Redis XADD primitive.
+    if str(stream_key or "").strip() != NOTIFY_STREAM_KEY:
+        raise RuntimeError("task_outbox_notify_stream_invalid")
     message = {k: "" if v is None else str(v) for k, v in payload.items()}
-    msg_id = await redis.xadd(stream_key, message, _from_task_outbox=True)
+    msg_id = await redis.xadd(
+        NOTIFY_STREAM_KEY,
+        message,
+        _from_task_outbox=True,
+    )
     if not msg_id:
         raise RuntimeError("notify xadd returned no id")
 
@@ -212,7 +245,13 @@ async def start_task_outbox_dispatcher(shutdown_event: asyncio.Event | None = No
     while shutdown_event is None or not shutdown_event.is_set():
         try:
             await reclaim_stale_task_outbox()
-            await flush_pending_task_outbox()
+            result = await flush_pending_task_outbox(
+                include_delivery_failures=True
+            )
+            if int(result.get("delivery_failures") or 0) > 0:
+                raise RuntimeError("task_outbox_delivery_incomplete")
+            record_runtime_lane_success("outbox")
         except Exception as exc:
+            record_runtime_lane_failure("outbox", None, exc)
             structured_log("error", "task_outbox_dispatcher_error", exception=exc)
         await asyncio.sleep(TASK_OUTBOX_POLL_SECONDS)

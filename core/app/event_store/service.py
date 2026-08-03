@@ -10,6 +10,19 @@ from app.utils.log import structured_log
 EVENT_WRITE_ATTEMPTS = 3
 
 
+def _safe_exception_code(exc: BaseException | None) -> str | None:
+    if exc is None:
+        return None
+    candidate = str(getattr(exc, "code", "") or "").strip()
+    if (
+        candidate
+        and len(candidate) <= 128
+        and candidate.replace("_", "").replace("-", "").isalnum()
+    ):
+        return candidate
+    return f"event_store_{type(exc).__name__}"[:128]
+
+
 async def record_event(
     *,
     aggregate: str,
@@ -27,9 +40,10 @@ async def record_event(
 
     P2-3: a write failure is no longer silently swallowed. The insert is retried
     a few times to ride out a transient blip, and for ``critical=True`` events
-    (real-run dispatch, policy activation, …) a persistent failure is logged at
-    ERROR *with the full payload* and durably captured in ``failed_events`` for
-    later replay, so a high-risk action's audit trail is never lost without trace.
+    (real-run dispatch, policy activation, …) a persistent failure is logged
+    without payload contents and durably captured in access-controlled
+    ``failed_events`` for later replay, so the audit trail is not lost or copied
+    into stdout/pubsub logs.
     """
     event_id = str(uuid.uuid4())
     values = {
@@ -67,7 +81,7 @@ async def record_event(
             aggregate=aggregate,
             aggregate_id=aggregate_id,
             event_type=event_type,
-            payload=values["payload"],
+            payload_bytes=len(values["payload"].encode("utf-8")),
             exception=last_exc,
         )
         await _dead_letter(values, last_exc)
@@ -104,7 +118,7 @@ async def _dead_letter(values: dict[str, Any], exc: Exception | None) -> None:
                 "actor_type": values["actor_type"],
                 "actor_id": values["actor_id"],
                 "source_service": values["source_service"],
-                "error": str(exc)[:480] if exc else None,
+                "error": _safe_exception_code(exc),
             },
         )
     except Exception as inner:

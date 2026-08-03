@@ -107,14 +107,14 @@ class ActionPlanContractTests(unittest.TestCase):
             validate_action_plan_v2(plan, require_executable=False)
         self.assertEqual(caught.exception.code, expected)
 
-    def test_manual_plan_preserves_favorite_and_repost_independently(self):
+    def test_manual_plan_uses_the_supported_device_action_order(self):
         plan = validate_action_plan_v2(
             douyin_plan(),
             require_executable=False,
         )
         self.assertEqual(plan.required_actions, DOUYIN_ACTION_ORDER)
         self.assertEqual(plan.payload_for("favorited"), {})
-        self.assertEqual(plan.payload_for("reposted")["text"], "转发参与抽奖")
+        self.assertEqual(plan.payload_for("reposted"), {})
 
     def test_reviewed_action_subset_remains_variable(self):
         plan = validate_action_plan_v2(
@@ -126,14 +126,12 @@ class ActionPlanContractTests(unittest.TestCase):
             ("liked", "commented", "favorited"),
         )
 
-    def test_plain_repost_without_source_text_is_preserved(self):
+    def test_repost_is_rejected_by_the_device_action_contract(self):
         plan = douyin_plan(actions=("reposted",))
         plan["action_payloads"]["reposted"] = {}
         plan["plan_hash"] = compute_action_plan_hash(plan)
 
-        validated = validate_action_plan_v2(plan, require_executable=False)
-
-        self.assertEqual({}, validated.payload_for("reposted"))
+        self.assert_plan_code("action_plan_required_actions_invalid", plan)
 
     def test_executable_claim_and_wrong_path_are_rejected(self):
         self.assert_plan_code(
@@ -201,17 +199,14 @@ class AdapterCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(summary["manual_confirmation_required"])
         self.assertEqual(
             summary["capability_block_reason"],
-            "douyin_no_official_interaction_api",
+            "douyin_device_agent_calibration_required",
         )
         recommended = build_recommended_config("douyin", result)["douyin"]
         self.assertEqual(
             recommended["favorited"],
-            {"done": ["button.favorited"]},
+            ["button.favorited"],
         )
-        self.assertEqual(
-            recommended["reposted"],
-            {"done": ["div.reposted"]},
-        )
+        self.assertNotIn("reposted", recommended)
 
 
 class GateOrderingDatabase:
@@ -261,7 +256,7 @@ class RealRunGateTests(unittest.IsolatedAsyncioTestCase):
 
         db = GateOrderingDatabase("true")
         with patch.dict(os.environ, {"REAL_RUN_ENABLED": "true"}, clear=False):
-            await self.assert_blocked("douyin_no_official_interaction_api", db)
+            await self.assert_blocked("douyin_video_or_note_target_required", db)
         self.assertEqual(db.fetch_one_calls, 1)
 
 

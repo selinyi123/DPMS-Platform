@@ -39,7 +39,13 @@ class FakePool:
     def __init__(self, page):
         self.context = FakeContext(page)
 
-    async def get_account_context(self, account_id, profile_dir, proxy=None):
+    async def get_account_context(
+        self,
+        account_id,
+        profile_dir,
+        proxy=None,
+        **_kwargs,
+    ):
         return self.context
 
 

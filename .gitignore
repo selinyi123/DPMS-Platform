@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+!.env.redis-admin.example
+!.env.mysql-admin.example
 *.pem
 *.key
 *.p12

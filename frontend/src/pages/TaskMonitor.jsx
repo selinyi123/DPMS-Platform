@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-import { authenticatedApiPath } from '../api';
+import { subscribeAuthenticatedEventStream } from '../api';
 import { useUi } from '../uiContext';
 
 export default function TaskMonitor() {
@@ -11,31 +11,40 @@ export default function TaskMonitor() {
   const lastErrorRef = useRef('');
 
   useEffect(() => {
-    const source = new EventSource(authenticatedApiPath('/metrics/stream'));
-    source.onopen = () => {
-      setConnection('connected');
-      lastErrorRef.current = '';
-    };
-    source.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        setLogs(prev => [...prev.slice(-200), data]);
-      } catch {
-        if (lastErrorRef.current !== 'bad_sse_payload') {
-          notify(t('tasks.badPayload'), 'error');
-          lastErrorRef.current = 'bad_sse_payload';
+    const source = subscribeAuthenticatedEventStream('/metrics/stream', {
+      onOpen: () => {
+        setConnection('connected');
+        lastErrorRef.current = '';
+      },
+      onMessage: (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          setLogs(prev => [...prev.slice(-200), data]);
+        } catch {
+          if (lastErrorRef.current !== 'bad_sse_payload') {
+            notify(t('tasks.badPayload'), 'error');
+            lastErrorRef.current = 'bad_sse_payload';
+          }
+          setLogs(prev => [...prev.slice(-200), {
+            level: 'error',
+            event: 'bad_sse_payload',
+            ts: Date.now(),
+          }]);
         }
-        setLogs(prev => [...prev.slice(-200), { level: 'error', event: 'bad_sse_payload', ts: Date.now() }]);
-      }
-    };
-    source.onerror = () => {
-      setConnection('disconnected');
-      if (lastErrorRef.current !== 'sse_disconnected') {
-        notify(t('tasks.streamDisconnected'), 'error');
-        lastErrorRef.current = 'sse_disconnected';
-      }
-      setLogs(prev => [...prev.slice(-200), { level: 'error', event: 'sse_disconnected', ts: Date.now() }]);
-    };
+      },
+      onError: () => {
+        setConnection('disconnected');
+        if (lastErrorRef.current !== 'sse_disconnected') {
+          notify(t('tasks.streamDisconnected'), 'error');
+          lastErrorRef.current = 'sse_disconnected';
+        }
+        setLogs(prev => [...prev.slice(-200), {
+          level: 'error',
+          event: 'sse_disconnected',
+          ts: Date.now(),
+        }]);
+      },
+    });
     return () => source.close();
   }, [notify, t]);
 

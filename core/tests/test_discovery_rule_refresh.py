@@ -242,6 +242,68 @@ class DiscoveryRuleRefreshPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(values["rule_text"])
         self.assertIsNone(values["action_plan"])
 
+    async def test_immutable_intent_defers_automatic_rule_and_plan_refresh(self):
+        fake_database = _FakeDatabase(
+            {
+                "id": 44,
+                "rule_text": "旧规则",
+                "action_plan": json.dumps(
+                    {
+                        "required_actions": ["liked", "commented"],
+                        "review_required": False,
+                    }
+                ),
+                "status": "pending",
+                "execution_lock": None,
+                # This covers both a partially confirmed current intent and a
+                # settled zero-effect generation. Discovery may observe a new
+                # draft, but only an operator may supersede frozen authority.
+                "has_execution_intent": 1,
+            }
+        )
+
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(discovery, "structured_log") as log,
+        ):
+            inserted = await discovery.insert_lottery_if_new(
+                {
+                    "platform": "bilibili",
+                    "source_type": "up",
+                    "source_value": "123",
+                },
+                "https://t.bilibili.com/123",
+                "canonical://bilibili/dynamic/123",
+                90,
+                {
+                    "rule_text": "新规则",
+                    "action_plan": {
+                        "required_actions": ["followed"],
+                        "review_required": True,
+                    },
+                },
+            )
+
+        self.assertFalse(inserted)
+        locked_lookup = next(
+            query
+            for query in fake_database.fetch_queries
+            if "FROM lotteries AS l" in query
+        )
+        self.assertIn("FROM lottery_execution_intents", locked_lookup)
+        self.assertEqual(1, len(fake_database.executions))
+        _, values = fake_database.executions[0]
+        self.assertIsNone(values["rule_text"])
+        self.assertIsNone(values["action_plan"])
+        self.assertEqual(0, values["rule_changed"])
+        self.assertEqual(0, values["action_plan_changed"])
+        log.assert_any_call(
+            "warning",
+            "discovery_rule_refresh_deferred_frozen_intent",
+            lottery_id=44,
+            canonical_url="canonical://bilibili/dynamic/123",
+        )
+
     async def test_insert_failure_is_not_silently_reported_as_duplicate(self):
         fake_database = _InsertFailureDatabase()
 
@@ -253,6 +315,29 @@ class DiscoveryRuleRefreshPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     "canonical://bilibili/dynamic/123",
                     90,
                 )
+
+    async def test_long_tracked_source_uses_bounded_stable_locator(self):
+        fake_database = _FakeDatabase(existing=None)
+        source = {
+            "id": 42,
+            "platform": "bilibili",
+            "source_type": "url_list",
+            "source_value": "https://example.test/" + ("x" * 100),
+        }
+
+        with patch.object(discovery, "database", fake_database):
+            inserted = await discovery.insert_lottery_if_new(
+                source,
+                "https://t.bilibili.com/123",
+                "canonical://bilibili/dynamic/123",
+                90,
+            )
+
+        self.assertTrue(inserted)
+        insert_query, values = fake_database.executions[0]
+        self.assertIn("INSERT INTO lotteries", insert_query)
+        self.assertEqual("tracked_source:42", values["source_id"])
+        self.assertLessEqual(len(values["source_id"]), 64)
 
     async def test_concurrent_unique_race_is_reported_as_existing(self):
         fake_database = _InsertFailureDatabase(fallback_existing={"id": 44})

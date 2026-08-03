@@ -35,26 +35,36 @@ from app import task_runner  # noqa: E402
 FOLLOW_HANDLE = "@抽奖博主"
 
 
-def xiaohongshu_plan(**overrides):
+def xiaohongshu_plan(*, required_actions=None, **overrides):
+    selected_actions = tuple(
+        required_actions
+        if required_actions is not None
+        else XIAOHONGSHU_REQUIRED_ACTIONS
+    )
+    payloads = {
+        "followed": {"target_handle": FOLLOW_HANDLE},
+        "liked": {},
+        "commented": {
+            "text": "认真参与抽奖",
+            "topic_tags": [],
+            "mentions": [],
+        },
+        "favorited": {},
+    }
     plan = {
         "version": 2,
         "platform": "xiaohongshu",
         "rule_snapshot_id": 301,
         "rule_hash": "a" * 64,
         "execution_path_id": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
-        "required_actions": list(XIAOHONGSHU_REQUIRED_ACTIONS),
+        "required_actions": list(selected_actions),
         "action_payloads": {
-            "followed": {"target_handle": FOLLOW_HANDLE},
-            "liked": {},
-            "commented": {
-                "text": "认真参与抽奖",
-                "topic_tags": [],
-                "mentions": [],
-            },
-            "favorited": {},
+            action: payloads[action] for action in selected_actions
         },
         "content_requirements": {
-            "follow_targets": [FOLLOW_HANDLE],
+            "follow_targets": (
+                [FOLLOW_HANDLE] if "followed" in selected_actions else []
+            ),
             "commented": {"topic_tags": [], "mentions": []},
             "reposted": {"topic_tags": [], "mentions": []},
         },
@@ -92,18 +102,26 @@ class ActionPlanContractTests(unittest.TestCase):
             validate_action_plan_v2(plan, require_executable=False)
         self.assertEqual(caught.exception.code, expected)
 
-    def test_manual_plan_expresses_exact_four_action_contract(self):
-        plan = xiaohongshu_plan()
-        validated = validate_action_plan_v2(plan, require_executable=False)
-        self.assertEqual(validated.required_actions, XIAOHONGSHU_REQUIRED_ACTIONS)
-        self.assertEqual(
-            validated.execution_path_id,
-            XIAOHONGSHU_MANUAL_EXECUTION_PATH,
-        )
-        self.assertEqual(
-            validated.content_requirements["reposted"],
-            {"topic_tags": [], "mentions": []},
-        )
+    def test_manual_plan_accepts_canonical_nonempty_action_subsets(self):
+        for actions in (
+            ("liked",),
+            ("liked", "commented", "favorited"),
+            XIAOHONGSHU_REQUIRED_ACTIONS,
+        ):
+            with self.subTest(actions=actions):
+                validated = validate_action_plan_v2(
+                    xiaohongshu_plan(required_actions=actions),
+                    require_executable=False,
+                )
+                self.assertEqual(validated.required_actions, actions)
+                self.assertEqual(
+                    validated.execution_path_id,
+                    XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+                )
+                self.assertEqual(
+                    validated.content_requirements["reposted"],
+                    {"topic_tags": [], "mentions": []},
+                )
 
     def test_manual_plan_is_not_accepted_as_executable(self):
         with self.assertRaises(ActionPlanV2Error) as caught:
@@ -118,29 +136,26 @@ class ActionPlanContractTests(unittest.TestCase):
             "xiaohongshu_manual_plan_must_be_non_executable",
         )
 
-    def test_missing_favorite_or_repost_substitution_is_rejected(self):
-        for actions in (
-            ["followed", "liked", "commented"],
-            ["followed", "liked", "commented", "reposted"],
+    def test_empty_wrong_order_and_repost_are_rejected(self):
+        empty = xiaohongshu_plan(required_actions=())
+
+        wrong_order = xiaohongshu_plan(
+            required_actions=("liked", "commented")
+        )
+        wrong_order["required_actions"] = ["commented", "liked"]
+        wrong_order["plan_hash"] = compute_action_plan_hash(wrong_order)
+
+        reposted = xiaohongshu_plan(required_actions=("liked",))
+        reposted["required_actions"].append("reposted")
+        reposted["action_payloads"]["reposted"] = {"text": "转发参与"}
+        reposted["plan_hash"] = compute_action_plan_hash(reposted)
+
+        for plan, expected in (
+            (empty, "action_plan_required_actions_invalid"),
+            (wrong_order, "action_plan_action_order_invalid"),
+            (reposted, "action_plan_required_actions_invalid"),
         ):
-            with self.subTest(actions=actions):
-                plan = xiaohongshu_plan()
-                plan["required_actions"] = actions
-                plan["action_payloads"] = {
-                    action: copy.deepcopy(
-                        plan["action_payloads"].get(
-                            action,
-                            {"text": "转发参与"} if action == "reposted" else {},
-                        )
-                    )
-                    for action in actions
-                }
-                plan["plan_hash"] = compute_action_plan_hash(plan)
-                expected = (
-                    "xiaohongshu_four_action_plan_required"
-                    if "reposted" not in actions
-                    else "action_plan_required_actions_invalid"
-                )
+            with self.subTest(expected=expected):
                 self.assert_plan_code(expected, plan)
 
     def test_wrong_execution_path_is_rejected(self):
@@ -153,10 +168,10 @@ class ActionPlanContractTests(unittest.TestCase):
 
 
 class AdapterCapabilityTests(unittest.IsolatedAsyncioTestCase):
-    async def test_selector_config_never_enables_real_actions(self):
+    async def test_complete_selector_config_enables_only_browser_adapter_capability(self):
         adapter = XiaohongshuAdapter(selector_config=complete_observation_config())
-        self.assertFalse(adapter.REAL_ACTIONS)
-        self.assertEqual(adapter.STATUS, "manual_only")
+        self.assertTrue(adapter.REAL_ACTIONS)
+        self.assertEqual(adapter.STATUS, "configured")
         self.assertTrue(adapter.MANUAL_CONFIRMATION_REQUIRED)
         self.assertFalse(adapter.OFFICIAL_INTERACTION_API_AVAILABLE)
         self.assertEqual(
@@ -165,22 +180,19 @@ class AdapterCapabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("reposted", adapter.SELECTOR_PROBES)
 
-    async def test_every_interaction_method_fails_before_touching_page(self):
+    async def test_comment_requires_reviewed_text_and_repost_stays_unsupported(self):
         adapter = XiaohongshuAdapter(selector_config=complete_observation_config())
         page = object()
-        for action, method in (
-            ("followed", adapter._follow),
-            ("liked", adapter._like),
-            ("commented", adapter._comment),
-            ("favorited", adapter._favorite),
-            ("reposted", adapter._repost),
+        with self.assertRaisesRegex(
+            UnsupportedPlatformAction,
+            "xiaohongshu_reviewed_comment_text_required",
         ):
-            with self.subTest(action=action):
-                with self.assertRaisesRegex(
-                    UnsupportedPlatformAction,
-                    f"xiaohongshu_no_official_interaction_api:{action}",
-                ):
-                    await method(page)
+            adapter._comment_text(adapter.configured_selectors["commented"])
+        with self.assertRaisesRegex(
+            UnsupportedPlatformAction,
+            "xiaohongshu_no_official_interaction_api:reposted",
+        ):
+            await adapter._repost(page)
 
     def test_complete_probe_is_manual_only_not_real_ready(self):
         result = {
@@ -256,10 +268,7 @@ class RealRunGateTests(unittest.IsolatedAsyncioTestCase):
 
         db = GateOrderingDatabase("true")
         with patch.dict(os.environ, {"REAL_RUN_ENABLED": "true"}, clear=False):
-            await self.assert_blocked(
-                "xiaohongshu_no_official_interaction_api",
-                db,
-            )
+            await self.assert_blocked("xiaohongshu_note_target_required", db)
         self.assertEqual(db.fetch_one_calls, 1)
 
 
@@ -267,11 +276,13 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
     def test_platform_specific_phase_order_does_not_regress_bilibili(self):
         xhs_task = {
             "platform": "xiaohongshu",
-            "action_plan": xiaohongshu_plan(),
+            "action_plan": xiaohongshu_plan(
+                required_actions=("liked", "commented", "favorited")
+            ),
         }
         self.assertEqual(
             task_runner.requested_phases(xhs_task, require_plan=False),
-            ["followed", "liked", "commented", "favorited"],
+            ["liked", "commented", "favorited"],
         )
         self.assertEqual(
             task_runner.requested_phases(
@@ -292,11 +303,7 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_favorite_dry_run_is_rejected_before_claim_or_phase_write(self):
-        for action_plan in (
-            xiaohongshu_plan(),
-            {"required_actions": ["followed", "liked", "commented"]},
-            None,
-        ):
+        for action_plan in (xiaohongshu_plan(),):
             with self.subTest(action_plan=action_plan):
                 message = {
                     "task_id": "xhs-dry-1",
@@ -325,11 +332,14 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
                     9,
                     ["followed", "liked", "commented", "favorited"],
                     platform="xiaohongshu",
+                    action_plan=xiaohongshu_plan(),
                 )
         save_phase.assert_not_awaited()
 
     def test_shadow_binding_accepts_non_executable_reviewed_plan(self):
-        plan = xiaohongshu_plan()
+        plan = xiaohongshu_plan(
+            required_actions=("liked", "commented", "favorited")
+        )
         lottery = {
             "platform": "xiaohongshu",
             "raw_url": "https://www.xiaohongshu.com/explore/abc123",
@@ -412,7 +422,9 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
             "mode": "shadow_run",
             "raw_url": page.url,
             "canonical_url": "canonical://xiaohongshu/note/abc123",
-            "action_plan": xiaohongshu_plan(),
+            "action_plan": xiaohongshu_plan(
+                required_actions=("liked", "commented", "favorited")
+            ),
         }
         with (
             patch.object(
@@ -450,7 +462,7 @@ class PhaseAndShadowTests(unittest.IsolatedAsyncioTestCase):
         payload = event.await_args.kwargs["payload"]
         self.assertEqual(
             payload["required_phases"],
-            ["followed", "liked", "commented", "favorited"],
+            ["liked", "commented", "favorited"],
         )
         self.assertTrue(payload["selector_observation_complete"])
         self.assertFalse(payload["qualified"])

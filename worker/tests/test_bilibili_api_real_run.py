@@ -27,6 +27,8 @@ stub_playwright()
 stub_httpx()
 stub_worker_runtime_dependencies()
 
+from app.platform_modules import bilibili as bilibili_module  # noqa: E402
+
 
 class FakePipeline:
     async def execute(self):
@@ -290,9 +292,27 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         async def old_phase(_task_id):
             return "reposted"
 
+        async def allow_gate(task, **_kwargs):
+            from app.action_plan import validate_action_plan_v2
+
+            plan = validate_action_plan_v2(
+                task["action_plan"], reject_media=True
+            )
+            return SimpleNamespace(
+                action_plan=plan,
+                execution_action_plan=plan,
+                requested_actions=plan.required_actions,
+                execution_intent_kind="legacy_full",
+            )
+
         with (
             patch.object(task_runner, "database", fake_db),
             patch.object(task_runner, "get_latest_phase", old_phase),
+            patch.object(
+                task_runner,
+                "enforce_task_real_run_gate",
+                allow_gate,
+            ),
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -325,20 +345,41 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             ),
         )
 
-        original_client = task_runner.BilibiliApiClient
-        original_executor = task_runner.BilibiliApiExecutor
-        task_runner.BilibiliApiClient = FakeForwardBiliClient
-        task_runner.BilibiliApiExecutor = FakeBiliExecutor
+        original_client = bilibili_module.BilibiliApiClient
+        original_executor = bilibili_module.BilibiliApiExecutor
+        bilibili_module.BilibiliApiClient = FakeForwardBiliClient
+        bilibili_module.BilibiliApiExecutor = FakeBiliExecutor
         FakeBiliExecutor.last_actions = None
+
+        async def allow_gate(task, **_kwargs):
+            from app.action_plan import validate_action_plan_v2
+
+            plan = validate_action_plan_v2(
+                task["action_plan"], reject_media=True
+            )
+            return SimpleNamespace(
+                action_plan=plan,
+                execution_action_plan=plan,
+                requested_actions=plan.required_actions,
+                execution_intent_kind="legacy_full",
+            )
+
         try:
-            with self.assertRaisesRegex(
-                task_runner.BilibiliForwardedTargetRequiresReview,
-                "bilibili_forwarded_origin_requires_review",
+            with patch.object(
+                task_runner,
+                "enforce_task_real_run_gate",
+                allow_gate,
             ):
-                asyncio.run(task_runner.execute_bilibili_api_real_task(message))
+                with self.assertRaisesRegex(
+                    task_runner.BilibiliForwardedTargetRequiresReview,
+                    "bilibili_forwarded_origin_requires_review",
+                ):
+                    asyncio.run(
+                        task_runner.execute_bilibili_api_real_task(message)
+                    )
         finally:
-            task_runner.BilibiliApiClient = original_client
-            task_runner.BilibiliApiExecutor = original_executor
+            bilibili_module.BilibiliApiClient = original_client
+            bilibili_module.BilibiliApiExecutor = original_executor
 
         self.assertIsNone(FakeBiliExecutor.last_actions)
         self.assertEqual(fake_db.bilibili_action_ledger, [])
@@ -354,11 +395,11 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         from app.adapters.registry import get_adapter
         from app.event_store import service as event_service
 
-        original_client = task_runner.BilibiliApiClient
-        original_executor = task_runner.BilibiliApiExecutor
+        original_client = bilibili_module.BilibiliApiClient
+        original_executor = bilibili_module.BilibiliApiExecutor
         original_gate = task_runner.enforce_task_real_run_gate
-        task_runner.BilibiliApiClient = FakeBiliClient
-        task_runner.BilibiliApiExecutor = FakeBiliExecutor
+        bilibili_module.BilibiliApiClient = FakeBiliClient
+        bilibili_module.BilibiliApiExecutor = FakeBiliExecutor
         task_runner.database = fake_db
         task_runner.redis = fake_redis
         safety.database = fake_db
@@ -391,7 +432,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
                 return SimpleNamespace(
                     action_plan=validate_action_plan_v2(
                         task["action_plan"], reject_media=True
-                    )
+                    ),
+                    execution_intent_kind="legacy_full",
                 )
 
             async def record_safety_window(account_id, platform=None):
@@ -410,7 +452,7 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             self.assertEqual(
                 gate_calls,
                 [(message["task_id"], False)]
-                + [(message["task_id"], True)] * 8,
+                + [(message["task_id"], True)] * 9,
             )
             self.assertEqual(FakeBiliExecutor.last_actions, ["follow", "like", "comment", "repost"])
             self.assertEqual(fake_db.phases, ["followed", "liked", "commented", "reposted", "completed"])
@@ -421,8 +463,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             self.assertTrue(all(entry["ok"] == 1 for entry in fake_db.bilibili_action_ledger))
             self.assertEqual(fake_db.bilibili_action_ledger[1]["phase"], "liked")
         finally:
-            task_runner.BilibiliApiClient = original_client
-            task_runner.BilibiliApiExecutor = original_executor
+            bilibili_module.BilibiliApiClient = original_client
+            bilibili_module.BilibiliApiExecutor = original_executor
             task_runner.enforce_task_real_run_gate = original_gate
 
     def test_confirmed_action_settlement_failure_opens_breaker_and_quarantines_account(self):
@@ -454,12 +496,12 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         )
 
         originals = {
-            "client": task_runner.BilibiliApiClient,
-            "executor": task_runner.BilibiliApiExecutor,
+            "client": bilibili_module.BilibiliApiClient,
+            "executor": bilibili_module.BilibiliApiExecutor,
             "gate": task_runner.enforce_task_real_run_gate,
-            "persist": task_runner.persist_bilibili_action_result,
+            "persist": bilibili_module._persist_bilibili_action_result_owned,
             "breaker": task_runner.open_unknown_outcome_breaker,
-            "ledger": task_runner.save_bilibili_action_ledger,
+            "ledger": bilibili_module._save_bilibili_action_ledger_owned,
             "event": task_runner.record_event,
             "status": task_runner.set_account_status,
         }
@@ -473,7 +515,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             return SimpleNamespace(
                 action_plan=validate_action_plan_v2(
                     task["action_plan"], reject_media=True
-                )
+                ),
+                execution_intent_kind="legacy_full",
             )
 
         async def fail_settlement(**_kwargs):
@@ -491,24 +534,24 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         async def record_status(*args):
             status_calls.append(args)
 
-        task_runner.BilibiliApiClient = FakeBiliClient
-        task_runner.BilibiliApiExecutor = FakeBiliExecutor
+        bilibili_module.BilibiliApiClient = FakeBiliClient
+        bilibili_module.BilibiliApiExecutor = FakeBiliExecutor
         task_runner.enforce_task_real_run_gate = allow_gate
-        task_runner.persist_bilibili_action_result = fail_settlement
+        bilibili_module._persist_bilibili_action_result_owned = fail_settlement
         task_runner.open_unknown_outcome_breaker = record_breaker
-        task_runner.save_bilibili_action_ledger = record_ledger
+        bilibili_module._save_bilibili_action_ledger_owned = record_ledger
         task_runner.record_event = record_event
         task_runner.set_account_status = record_status
         try:
             with self.assertRaises(task_runner.BilibiliActionSettlementFailed):
                 asyncio.run(task_runner.execute_bilibili_api_real_task(message))
         finally:
-            task_runner.BilibiliApiClient = originals["client"]
-            task_runner.BilibiliApiExecutor = originals["executor"]
+            bilibili_module.BilibiliApiClient = originals["client"]
+            bilibili_module.BilibiliApiExecutor = originals["executor"]
             task_runner.enforce_task_real_run_gate = originals["gate"]
-            task_runner.persist_bilibili_action_result = originals["persist"]
+            bilibili_module._persist_bilibili_action_result_owned = originals["persist"]
             task_runner.open_unknown_outcome_breaker = originals["breaker"]
-            task_runner.save_bilibili_action_ledger = originals["ledger"]
+            bilibili_module._save_bilibili_action_ledger_owned = originals["ledger"]
             task_runner.record_event = originals["event"]
             task_runner.set_account_status = originals["status"]
 
@@ -554,7 +597,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             return SimpleNamespace(
                 action_plan=validate_action_plan_v2(
                     task["action_plan"], reject_media=True
-                )
+                ),
+                execution_intent_kind="legacy_full",
             )
 
         async def fail_action_settlement(**_kwargs):
@@ -578,12 +622,20 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             )
 
         with (
-            patch.object(task_runner, "BilibiliApiClient", FakeBiliClient),
-            patch.object(task_runner, "BilibiliApiExecutor", FakeBiliExecutor),
+            patch.object(bilibili_module, "BilibiliApiClient", FakeBiliClient),
+            patch.object(bilibili_module, "BilibiliApiExecutor", FakeBiliExecutor),
             patch.object(task_runner, "enforce_task_real_run_gate", allow_gate),
-            patch.object(task_runner, "persist_bilibili_action_result", fail_action_settlement),
+            patch.object(
+                bilibili_module,
+                "_persist_bilibili_action_result_owned",
+                fail_action_settlement,
+            ),
             patch.object(task_runner, "open_unknown_outcome_breaker", record_breaker),
-            patch.object(task_runner, "save_bilibili_action_ledger", record_ledger),
+            patch.object(
+                bilibili_module,
+                "_save_bilibili_action_ledger_owned",
+                record_ledger,
+            ),
             patch.object(task_runner, "record_event", record_event),
             patch.object(task_runner, "set_account_status", fail_account_status),
         ):
@@ -631,7 +683,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             return SimpleNamespace(
                 action_plan=validate_action_plan_v2(
                     task["action_plan"], reject_media=True
-                )
+                ),
+                execution_intent_kind="legacy_full",
             )
 
         async def cancel_settlement(**_kwargs):
@@ -650,12 +703,20 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             status_calls.append(args)
 
         with (
-            patch.object(task_runner, "BilibiliApiClient", FakeBiliClient),
-            patch.object(task_runner, "BilibiliApiExecutor", FakeBiliExecutor),
+            patch.object(bilibili_module, "BilibiliApiClient", FakeBiliClient),
+            patch.object(bilibili_module, "BilibiliApiExecutor", FakeBiliExecutor),
             patch.object(task_runner, "enforce_task_real_run_gate", allow_gate),
-            patch.object(task_runner, "persist_bilibili_action_result", cancel_settlement),
+            patch.object(
+                bilibili_module,
+                "_persist_bilibili_action_result_owned",
+                cancel_settlement,
+            ),
             patch.object(task_runner, "open_unknown_outcome_breaker", record_breaker),
-            patch.object(task_runner, "save_bilibili_action_ledger", record_ledger),
+            patch.object(
+                bilibili_module,
+                "_save_bilibili_action_ledger_owned",
+                record_ledger,
+            ),
             patch.object(task_runner, "record_event", record_event),
             patch.object(task_runner, "set_account_status", record_status),
         ):
@@ -703,13 +764,13 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         )
 
         originals = {
-            "client": task_runner.BilibiliApiClient,
-            "executor": task_runner.BilibiliApiExecutor,
+            "client": bilibili_module.BilibiliApiClient,
+            "executor": bilibili_module.BilibiliApiExecutor,
             "gate": task_runner.enforce_task_real_run_gate,
-            "persist": task_runner.persist_bilibili_action_result,
+            "persist": bilibili_module._persist_bilibili_action_result_owned,
             "breaker": task_runner.open_unknown_outcome_breaker,
             "emergency": task_runner.emergency_stop_real_runs_and_revoke_lease,
-            "ledger": task_runner.save_bilibili_action_ledger,
+            "ledger": bilibili_module._save_bilibili_action_ledger_owned,
             "event": task_runner.record_event,
             "status": task_runner.set_account_status,
         }
@@ -724,7 +785,8 @@ class BilibiliApiRealRunTests(unittest.TestCase):
             return SimpleNamespace(
                 action_plan=validate_action_plan_v2(
                     task["action_plan"], reject_media=True
-                )
+                ),
+                execution_intent_kind="legacy_full",
             )
 
         async def fail_settlement(**_kwargs):
@@ -740,26 +802,26 @@ class BilibiliApiRealRunTests(unittest.TestCase):
         async def record_event(**_kwargs):
             return "event-1"
 
-        task_runner.BilibiliApiClient = FakeBiliClient
-        task_runner.BilibiliApiExecutor = FakeBiliExecutor
+        bilibili_module.BilibiliApiClient = FakeBiliClient
+        bilibili_module.BilibiliApiExecutor = FakeBiliExecutor
         task_runner.enforce_task_real_run_gate = allow_gate
-        task_runner.persist_bilibili_action_result = fail_settlement
+        bilibili_module._persist_bilibili_action_result_owned = fail_settlement
         task_runner.open_unknown_outcome_breaker = fail_breaker
         task_runner.emergency_stop_real_runs_and_revoke_lease = record_emergency
-        task_runner.save_bilibili_action_ledger = no_op
+        bilibili_module._save_bilibili_action_ledger_owned = no_op
         task_runner.record_event = record_event
         task_runner.set_account_status = no_op
         try:
             with self.assertRaises(task_runner.TaskSettlementUnconfirmed):
                 asyncio.run(task_runner.execute_bilibili_api_real_task(message))
         finally:
-            task_runner.BilibiliApiClient = originals["client"]
-            task_runner.BilibiliApiExecutor = originals["executor"]
+            bilibili_module.BilibiliApiClient = originals["client"]
+            bilibili_module.BilibiliApiExecutor = originals["executor"]
             task_runner.enforce_task_real_run_gate = originals["gate"]
-            task_runner.persist_bilibili_action_result = originals["persist"]
+            bilibili_module._persist_bilibili_action_result_owned = originals["persist"]
             task_runner.open_unknown_outcome_breaker = originals["breaker"]
             task_runner.emergency_stop_real_runs_and_revoke_lease = originals["emergency"]
-            task_runner.save_bilibili_action_ledger = originals["ledger"]
+            bilibili_module._save_bilibili_action_ledger_owned = originals["ledger"]
             task_runner.record_event = originals["event"]
             task_runner.set_account_status = originals["status"]
 

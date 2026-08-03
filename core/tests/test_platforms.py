@@ -15,22 +15,30 @@ from app.adapter_config import (  # noqa: E402
 )
 from app.platforms import get_platform  # noqa: E402
 
-STRUCTURED = ("bilibili",)
+STRUCTURED = ("bilibili", "xiaohongshu")
 
 
 def _complete_config(platform):
-    return {
-        platform: {
+    configured = {
             "followed": {"click": ["button.follow"], "done": ["button.following"]},
             "liked": {"click": ["button.like"], "done": ["button.liked"]},
-            "reposted": {"click": ["button.repost"], "done": ["div.repost-sent"]},
             "commented": {
                 "input": ["textarea"],
                 "submit": ["button.publish"],
                 "done": ["div.comment-sent"],
             },
-        }
     }
+    if platform == "xiaohongshu":
+        configured["favorited"] = {
+            "click": ["button.favorite"],
+            "done": ["button.favorited"],
+        }
+    else:
+        configured["reposted"] = {
+            "click": ["button.repost"],
+            "done": ["div.repost-sent"],
+        }
+    return {platform: configured}
 
 
 class PlatformAdapterStatusTests(unittest.TestCase):
@@ -65,19 +73,30 @@ class PlatformAdapterStatusTests(unittest.TestCase):
             os.environ[SELECTOR_ENV] = json.dumps(_complete_config(platform))
             cfg = get_platform(platform)
             self.assertTrue(cfg["action_adapter"], platform)
-            self.assertEqual(cfg["adapter_status"], "configured", platform)
+            self.assertEqual(
+                cfg["adapter_status"],
+                (
+                    "exact_browser_evidence_required"
+                    if platform == "xiaohongshu"
+                    else "configured"
+                ),
+                platform,
+            )
             os.environ.pop(SELECTOR_ENV, None)
 
-    def test_xiaohongshu_selectors_never_enable_real_actions(self):
+    def test_xiaohongshu_exact_selectors_enable_browser_adapter(self):
         os.environ[SELECTOR_ENV] = json.dumps(_complete_config("xiaohongshu"))
 
         cfg = get_platform("xiaohongshu")
 
-        self.assertFalse(cfg["action_adapter"])
-        self.assertFalse(cfg["real_run_supported"])
-        self.assertEqual("manual_assisted_only", cfg["adapter_status"])
+        self.assertTrue(cfg["action_adapter"])
+        self.assertTrue(cfg["real_run_supported"])
         self.assertEqual(
-            "xiaohongshu_no_official_interaction_api",
+            "exact_browser_evidence_required",
+            cfg["adapter_status"],
+        )
+        self.assertEqual(
+            "xiaohongshu_exact_browser_evidence_required",
             cfg["real_run_blocker"],
         )
 

@@ -2,12 +2,35 @@ import json
 from http.cookies import SimpleCookie
 
 from app.platforms import get_platform
+from shared.cookie_contracts import BILIBILI_API_UNIQUE_COOKIE_NAMES
+
+
+def _validate_api_cookie_name_uniqueness(
+    platform: str,
+    cookies: list[dict],
+) -> None:
+    if str(platform or "").strip().casefold() != "bilibili":
+        return
+    counts: dict[str, int] = {}
+    for cookie in cookies:
+        name = str(cookie.get("name") or "").strip()
+        if name in BILIBILI_API_UNIQUE_COOKIE_NAMES:
+            counts[name] = counts.get(name, 0) + 1
+    duplicated = sorted(
+        name for name, count in counts.items() if count > 1
+    )
+    if duplicated:
+        raise ValueError(
+            "Duplicate Bilibili API Cookie names are not allowed: "
+            + ", ".join(duplicated)
+        )
 
 
 async def inject_account_cookies(context, platform: str, credential: str):
     cookies = json.loads(credential)
     if not isinstance(cookies, list) or not cookies:
         raise ValueError("Account cookie is empty or invalid")
+    _validate_api_cookie_name_uniqueness(platform, cookies)
 
     await context.add_cookies([normalize_cookie(platform, cookie) for cookie in cookies])
 
@@ -30,6 +53,7 @@ def normalize_cookie(platform: str, cookie: dict) -> dict:
 
 
 def serialize_cookies(platform: str, cookies: list[dict]) -> str:
+    _validate_api_cookie_name_uniqueness(platform, cookies)
     normalized = [
         normalize_cookie(platform, cookie)
         for cookie in cookies
@@ -50,12 +74,21 @@ def credential_to_cookie_header(credential: str) -> str:
         if not isinstance(data, list):
             raise ValueError("JSON credential must be a cookie list")
         pairs = []
+        names: set[str] = set()
         for item in data:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
             if not name or item.get("value") is None:
                 continue
+            if (
+                name in BILIBILI_API_UNIQUE_COOKIE_NAMES
+                and name in names
+            ):
+                raise ValueError(
+                    f"Duplicate cookie name is not allowed: {name}"
+                )
+            names.add(name)
             pairs.append(f"{name}={item.get('value')}")
         return "; ".join(pairs)
 

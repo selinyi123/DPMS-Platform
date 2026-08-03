@@ -226,8 +226,10 @@ class FakeDatabase:
         self.task_reconciliation_required = 0
         self.account_lease_id = "lease-1"
         self.account_lease_generation = 1
+        self.account_lease_operation_kind = task_mode
         self.account_lease_released_at = None
         self.external_action_intents: list[dict] = []
+        self.task_execution_intent_binding: dict | None = None
         self._last_affected_rows = 1
         self.account_id = 9001
         self.account_status = "ready"
@@ -241,19 +243,33 @@ class FakeDatabase:
         self.task_action_plan_hash = self.lottery_action_plan["plan_hash"]
         self.selector_config = {}
         self.screenshot_path = None
+        self._encrypted_account_credential = None
 
     async def fetch_one(self, query, values=None):
         values = values or {}
+        if "FROM task_execution_intent_bindings" in query:
+            return (
+                dict(self.task_execution_intent_binding)
+                if self.task_execution_intent_binding is not None
+                else None
+            )
         if "SELECT ROW_COUNT()" in query:
             return {"affected": self._last_affected_rows}
         if "FROM adapter_selector_configs" in query:
             return {"config_json": json.dumps(self.selector_config, ensure_ascii=False)}
         if "FROM accounts" in query:
+            if self._encrypted_account_credential is None:
+                from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
+
+                self._encrypted_account_credential = cookie_vault.encrypt(
+                    FAKE_ACCOUNT_CREDENTIAL,
+                    aad=CREDENTIAL_AAD,
+                )
             return {
                 "id": self.account_id,
                 "status": self.account_status,
                 "daily_task_count": 0,
-                "encrypted_credential": FAKE_ACCOUNT_CREDENTIAL,
+                "encrypted_credential": self._encrypted_account_credential,
                 "platform": self.lottery_platform,
                 "execution_revision": 1,
             }
@@ -283,9 +299,16 @@ class FakeDatabase:
                 "account_lease_id": self.account_lease_id,
                 "account_lease_generation": self.account_lease_generation,
                 "reconciliation_required": self.task_reconciliation_required,
+                "execution_intent_kind": (
+                    self.task_execution_intent_binding.get(
+                        "binding_kind"
+                    )
+                    if self.task_execution_intent_binding
+                    else None
+                ),
                 "lease_id": self.account_lease_id,
                 "lease_generation": self.account_lease_generation,
-                "operation_kind": "real_run",
+                "operation_kind": self.account_lease_operation_kind,
                 "owner_id": task_id,
                 "lease_task_id": task_id,
                 "lease_active": 1,
@@ -298,7 +321,7 @@ class FakeDatabase:
                 "lease_id": self.account_lease_id,
                 "account_id": self.account_id,
                 "generation": self.account_lease_generation,
-                "operation_kind": "real_run",
+                "operation_kind": self.account_lease_operation_kind,
                 "owner_id": self.task_id,
                 "task_id": self.task_id,
                 "lease_active": 1,
@@ -453,6 +476,8 @@ class FakeDatabase:
             if (
                 values.get("lease_id") == self.account_lease_id
                 and int(values.get("generation") or 0) == self.account_lease_generation
+                and values.get("operation_kind")
+                == self.account_lease_operation_kind
             ):
                 self.account_lease_released_at = "now"
         return None
@@ -585,5 +610,12 @@ class FakePool:
     def __init__(self, page: FakePage):
         self._context = FakeContext(page)
 
-    async def get_account_context(self, account_id, profile_dir, proxy=None) -> FakeContext:
+    async def get_account_context(
+        self,
+        account_id,
+        profile_dir,
+        proxy=None,
+        *,
+        platform=None,
+    ) -> FakeContext:
         return self._context

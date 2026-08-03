@@ -58,7 +58,7 @@ class AccountRiskPayloadTests(unittest.TestCase):
             {"has_recent_risk": False, "cooldown_hours": 24},
         )
 
-    def test_risk_payload_exposes_latest_event_and_cooldown_until(self):
+    def test_risk_payload_exposes_controlling_event_with_legacy_alias(self):
         row = {
             "id": 4,
             "account_id": 14,
@@ -71,9 +71,19 @@ class AccountRiskPayloadTests(unittest.TestCase):
 
         self.assertTrue(payload["has_recent_risk"])
         self.assertEqual(payload["cooldown_hours"], 4)
-        self.assertEqual(payload["latest_event"]["account_id"], 14)
-        self.assertEqual(payload["latest_event"]["detail"], {"reason": "action_window"})
-        self.assertEqual(payload["latest_event"]["created_at"], "2026-06-24T06:16:36")
+        self.assertEqual(payload["controlling_event"]["account_id"], 14)
+        self.assertEqual(
+            payload["controlling_event"]["detail"],
+            {"reason": "action_window"},
+        )
+        self.assertEqual(
+            payload["controlling_event"]["created_at"],
+            "2026-06-24T06:16:36",
+        )
+        self.assertIs(
+            payload["latest_event"],
+            payload["controlling_event"],
+        )
         self.assertEqual(payload["cooldown_until"], "2026-06-24T10:16:36")
 
     def test_hard_risk_reasons_keep_full_day_cooldown(self):

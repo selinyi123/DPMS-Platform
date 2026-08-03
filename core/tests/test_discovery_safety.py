@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -65,6 +66,7 @@ class _BoundedScanDatabase:
         self.sources = sources
         self.fetch_all_query = ""
         self.fetch_all_values = None
+        self.fetch_all_calls = []
         self.executions = []
 
     async def fetch_one(self, query, values=None):
@@ -75,20 +77,71 @@ class _BoundedScanDatabase:
     async def fetch_all(self, query, values=None):
         self.fetch_all_query = str(query)
         self.fetch_all_values = dict(values or {})
+        self.fetch_all_calls.append(
+            (self.fetch_all_query, self.fetch_all_values)
+        )
         # Deliberately ignore LIMIT to prove the Python-side hard bound too.
-        return list(self.sources)
+        platform = str(self.fetch_all_values.get("platform") or "")
+        allowed_types = {
+            str(value)
+            for key, value in self.fetch_all_values.items()
+            if key.startswith("source_type_")
+        }
+        rows = [
+            source
+            for source in self.sources
+            if str(source.get("platform") or "") == platform
+            and (
+                not allowed_types
+                or str(source.get("source_type") or "") in allowed_types
+            )
+            and discovery.should_scan(source)
+        ]
+        return sorted(
+            rows,
+            key=lambda source: (
+                source.get("last_scan_at") is not None,
+                source.get("last_scan_at") or datetime.min,
+                source["id"],
+            ),
+        )
 
     async def execute(self, query, values=None):
-        self.executions.append((str(query), dict(values or {})))
+        query_text = str(query)
+        bound = dict(values or {})
+        self.executions.append((query_text, bound))
+        advanced_ids = {
+            int(value)
+            for key, value in bound.items()
+            if key.startswith("invalid_id_")
+        }
+        if "last_scan_at = NOW()" in query_text:
+            if "id" in bound:
+                advanced_ids.add(int(bound["id"]))
+            now = datetime.now()
+            for source in self.sources:
+                if int(source["id"]) in advanced_ids:
+                    source["last_scan_at"] = now
         return 1
 
 
 def _source(source_id, *, platform="bilibili", value=None):
+    default_values = {
+        "bilibili": str(9000 + source_id),
+        "weibo": f"https://m.weibo.cn/status/AbCdEf{source_id}",
+        "xiaohongshu": (
+            "https://www.xiaohongshu.com/explore/"
+            f"{source_id:024x}"
+        ),
+        "douyin": f"https://www.douyin.com/video/{source_id:019d}",
+    }
     return {
         "id": source_id,
         "platform": platform,
-        "source_type": "up",
-        "source_value": str(value if value is not None else 9000 + source_id),
+        "source_type": "up" if platform == "bilibili" else "url_list",
+        "source_value": str(
+            value if value is not None else default_values[platform]
+        ),
         "last_scan_at": None,
         "scan_interval_minutes": 30,
     }
@@ -116,6 +169,19 @@ def _keyword_candidate(candidate_id):
     )
 
 
+class _RecordWithoutGet:
+    """Minimal stand-in for a databases.Record row."""
+
+    def __init__(self, values):
+        self._values = dict(values)
+
+    def keys(self):
+        return self._values.keys()
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+
 class DiscoverySingleflightTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         discovery._discovery_run_task = None
@@ -133,12 +199,16 @@ class DiscoverySingleflightTests(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         calls = 0
 
-        async def fake_run_once():
+        async def fake_run_once(**_kwargs):
             nonlocal calls
             calls += 1
             started.set()
             await release.wait()
-            return {"sources": 3, "scanned": 2}
+            return {
+                "sources": 3,
+                "scanned": 2,
+                "by_platform": {"weibo": {"scanned": 1}},
+            }
 
         with patch.object(discovery, "_run_discovery_once", side_effect=fake_run_once):
             first = asyncio.create_task(discovery.run_discovery())
@@ -151,6 +221,12 @@ class DiscoverySingleflightTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first_result, second_result)
         self.assertIsNot(first_result, second_result)
+        self.assertIsNot(
+            first_result["by_platform"]["weibo"],
+            second_result["by_platform"]["weibo"],
+        )
+        first_result["by_platform"]["weibo"]["scanned"] = 99
+        self.assertEqual(1, second_result["by_platform"]["weibo"]["scanned"])
         self.assertEqual(1, calls)
 
     async def test_cancelled_waiter_does_not_cancel_shared_scan(self):
@@ -158,7 +234,7 @@ class DiscoverySingleflightTests(unittest.IsolatedAsyncioTestCase):
         release = asyncio.Event()
         calls = 0
 
-        async def fake_run_once():
+        async def fake_run_once(**_kwargs):
             nonlocal calls
             calls += 1
             started.set()
@@ -205,16 +281,212 @@ class DiscoveryBoundedScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(150, stats["sources"])
         self.assertEqual(discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT, stats["scanned"])
         self.assertEqual(discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT, fetch_candidates.await_count)
+        self.assertEqual(4, len(fake_database.fetch_all_calls))
         self.assertEqual(
-            {"source_limit": discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT},
-            fake_database.fetch_all_values,
+            discovery.DISCOVERY_PLATFORM_SOURCE_QUERY_LIMIT,
+            fake_database.fetch_all_values["source_limit"],
         )
+        self.assertEqual("xiaohongshu", fake_database.fetch_all_values["platform"])
         self.assertIn("TIMESTAMPADD", fake_database.fetch_all_query)
+        self.assertIn("platform = :platform", fake_database.fetch_all_query)
+        self.assertIn("source_type = :source_type_0", fake_database.fetch_all_query)
         self.assertIn(
             "ORDER BY (last_scan_at IS NULL) DESC, last_scan_at ASC, id ASC",
             fake_database.fetch_all_query,
         )
         self.assertIn("LIMIT :source_limit", fake_database.fetch_all_query)
+
+    async def test_legacy_unsupported_source_is_dormant_and_does_not_take_slot(self):
+        unsupported = _source(1, platform="weibo")
+        unsupported["source_type"] = "up"
+        supported = _source(2, platform="weibo")
+        fake_database = _BoundedScanDatabase([unsupported, supported])
+        fetch_candidates = AsyncMock(return_value=[])
+
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(discovery, "expire_old_lotteries", AsyncMock(return_value=0)),
+            patch.object(discovery, "fetch_candidates_for_source", fetch_candidates),
+        ):
+            stats = await discovery._run_discovery_once()
+
+        self.assertEqual(1, stats["by_platform"]["weibo"]["scheduled"])
+        self.assertEqual(1, stats["by_platform"]["weibo"]["scanned"])
+        self.assertEqual(1, fetch_candidates.await_count)
+        self.assertEqual(2, fetch_candidates.await_args.args[0]["id"])
+        weibo_query = next(
+            (query, values)
+            for query, values in fake_database.fetch_all_calls
+            if values["platform"] == "weibo"
+        )
+        self.assertIn("source_type = :source_type_0", weibo_query[0])
+        self.assertEqual("url_list", weibo_query[1]["source_type_0"])
+
+    async def test_invalid_oldest_window_advances_so_valid_row_is_not_starved(self):
+        oversized_keyword = "x" * (
+            discovery.BILIBILI_KEYWORD_QUERY_MAX_CHARS + 1
+        )
+        invalid_rows = [
+            _keyword_source(source_id, oversized_keyword)
+            for source_id in range(
+                1, discovery.DISCOVERY_PLATFORM_SOURCE_QUERY_LIMIT + 1
+            )
+        ]
+        valid = _source(discovery.DISCOVERY_PLATFORM_SOURCE_QUERY_LIMIT + 1)
+        fake_database = _BoundedScanDatabase([*invalid_rows, valid])
+        fetch_candidates = AsyncMock(return_value=[])
+
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(discovery, "expire_old_lotteries", AsyncMock(return_value=0)),
+            patch.object(discovery, "fetch_candidates_for_source", fetch_candidates),
+            patch.object(discovery, "structured_log"),
+        ):
+            first = await discovery._run_discovery_once()
+            second = await discovery._run_discovery_once()
+
+        self.assertEqual(0, first["scanned"])
+        self.assertEqual(
+            discovery.DISCOVERY_PLATFORM_SOURCE_QUERY_LIMIT,
+            first["by_platform"]["bilibili"]["failed"],
+        )
+        self.assertEqual(1, second["scanned"])
+        self.assertEqual(1, fetch_candidates.await_count)
+        self.assertEqual(valid["id"], fetch_candidates.await_args.args[0]["id"])
+        invalid_updates = [
+            values
+            for query, values in fake_database.executions
+            if "invalid_id_0" in values
+            and "UPDATE tracked_sources" in query
+        ]
+        self.assertEqual(1, len(invalid_updates))
+        self.assertEqual(
+            discovery.DISCOVERY_PLATFORM_SOURCE_QUERY_LIMIT,
+            len(
+                [
+                    key
+                    for key in invalid_updates[0]
+                    if key.startswith("invalid_id_")
+                ]
+            ),
+        )
+
+    def test_round_robin_prevents_one_platform_from_starving_the_others(self):
+        batches = {
+            "bilibili": [_source(index) for index in range(1, 101)],
+            "weibo": [_source(201, platform="weibo")],
+            "douyin": [_source(301, platform="douyin")],
+            "xiaohongshu": [_source(401, platform="xiaohongshu")],
+        }
+
+        selected = discovery.fair_round_robin_sources(
+            batches,
+            limit=discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT,
+        )
+
+        self.assertEqual(discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT, len(selected))
+        self.assertEqual(
+            {"bilibili", "weibo", "douyin", "xiaohongshu"},
+            {source["platform"] for source in selected},
+        )
+        self.assertEqual(
+            [1, 2, 3],
+            [
+                source["id"]
+                for source in selected
+                if source["platform"] == "bilibili"
+            ][:3],
+        )
+
+    async def test_slow_failing_bilibili_does_not_block_other_platform(self):
+        source_rows = [
+            _source(1),
+            _source(2, platform="weibo"),
+        ]
+        fake_database = _BoundedScanDatabase(source_rows)
+        bilibili_started = asyncio.Event()
+        release_bilibili = asyncio.Event()
+        weibo_completed = asyncio.Event()
+
+        async def fetch(source, **_kwargs):
+            if source["platform"] == "bilibili":
+                bilibili_started.set()
+                await release_bilibili.wait()
+                raise RuntimeError("bilibili unavailable")
+            weibo_completed.set()
+            return []
+
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(discovery, "expire_old_lotteries", AsyncMock(return_value=0)),
+            patch.object(discovery, "fetch_candidates_for_source", side_effect=fetch),
+        ):
+            task = asyncio.create_task(discovery._run_discovery_once())
+            await bilibili_started.wait()
+            await asyncio.wait_for(weibo_completed.wait(), timeout=1)
+            self.assertFalse(task.done())
+            release_bilibili.set()
+            stats = await task
+
+        self.assertEqual(1, stats["by_platform"]["weibo"]["scanned"])
+        self.assertEqual(1, stats["by_platform"]["bilibili"]["failed"])
+
+    async def test_session_factory_failure_is_isolated_to_its_platform(self):
+        source_rows = [
+            _source(1),
+            _source(2, platform="weibo"),
+        ]
+        fake_database = _BoundedScanDatabase(source_rows)
+
+        def fail_session_factory(_module):
+            raise RuntimeError("broken platform session")
+
+        original_get_platform_module = discovery.get_platform_module
+        bilibili_module = replace(
+            original_get_platform_module("bilibili"),
+            discovery_session_factory=fail_session_factory,
+        )
+
+        def get_platform_module(platform):
+            if platform == "bilibili":
+                return bilibili_module
+            return original_get_platform_module(platform)
+
+        fetch_candidates = AsyncMock(return_value=[])
+
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(
+                discovery,
+                "get_platform_module",
+                side_effect=get_platform_module,
+            ),
+            patch.object(discovery, "expire_old_lotteries", AsyncMock(return_value=0)),
+            patch.object(discovery, "fetch_candidates_for_source", fetch_candidates),
+        ):
+            stats = await discovery._run_discovery_once()
+
+        self.assertEqual(1, stats["by_platform"]["bilibili"]["failed"])
+        self.assertEqual(1, stats["by_platform"]["weibo"]["scanned"])
+        self.assertEqual(1, fetch_candidates.await_count)
+
+    async def test_malformed_candidate_does_not_abort_later_source(self):
+        fake_database = _BoundedScanDatabase([])
+        fetch_candidates = AsyncMock(side_effect=[[{}], []])
+        with (
+            patch.object(discovery, "database", fake_database),
+            patch.object(discovery, "fetch_candidates_for_source", fetch_candidates),
+        ):
+            stats = await discovery._scan_platform_sources(
+                "bilibili",
+                [_source(1), _source(2)],
+                discovery.get_platform_module("bilibili"),
+            )
+
+        self.assertEqual(2, stats["scanned"])
+        self.assertEqual(1, stats["failed"])
+        self.assertEqual(2, fetch_candidates.await_count)
+        self.assertEqual(2, len(fake_database.executions))
 
     async def test_expansion_failure_does_not_abort_remaining_sources(self):
         source_rows = [_source(1), _source(2)]
@@ -238,6 +510,29 @@ class DiscoveryBoundedScanTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BilibiliKeywordSearchSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_platform_module_receives_plain_source_snapshot(self):
+        source = _RecordWithoutGet(_keyword_source(7, "抽奖"))
+        fetch = AsyncMock(return_value=[])
+        session = SimpleNamespace(
+            platform_module=SimpleNamespace(platform_id="bilibili"),
+            fetch_candidates=fetch,
+        )
+
+        with patch.object(
+            discovery,
+            "get_platform_module",
+            return_value=SimpleNamespace(),
+        ):
+            result = await discovery.fetch_candidates_for_source(
+                source,
+                discovery_session=session,
+            )
+
+        self.assertEqual(result, [])
+        forwarded = fetch.await_args.args[0]
+        self.assertIs(type(forwarded), dict)
+        self.assertEqual(forwarded["source_value"], "抽奖")
+
     def test_split_keywords_deduplicates_rejects_oversized_and_limits_queries(self):
         oversized = "长" * (discovery.BILIBILI_KEYWORD_QUERY_MAX_CHARS + 1)
         source_value = ",".join(
@@ -342,7 +637,12 @@ class BilibiliKeywordSearchSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(candidates), len({item["raw_url"] for item in candidates}))
 
     async def test_search_call_budget_is_global_across_sources(self):
-        source_value = ",".join(f"keyword-{index}" for index in range(20))
+        # Persisted keyword source validation permits at most the same eight
+        # queries that one provider call path can consume.
+        source_value = ",".join(
+            f"keyword-{index}"
+            for index in range(discovery.BILIBILI_KEYWORD_SOURCE_QUERY_LIMIT)
+        )
         keyword_sources = [
             _keyword_source(source_id, source_value)
             for source_id in range(1, discovery.DISCOVERY_ACTIVE_SOURCE_SCAN_LIMIT + 1)

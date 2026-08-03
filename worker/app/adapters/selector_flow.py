@@ -19,7 +19,7 @@ class SelectorFlowAdapter(BaseAdapter):
     """Selector-config-driven adapter shared by platforms with structured selectors.
 
     Real actions stay disabled until the platform selector config is complete:
-    followed/liked/reposted need click selectors and commented needs an
+    followed/liked/favorited/reposted need click selectors and commented needs an
     input + submit group reviewed from probe evidence. Every mutation also
     requires an explicit success/read-back selector before it can be clicked.
     """
@@ -69,6 +69,9 @@ class SelectorFlowAdapter(BaseAdapter):
     async def _like(self, page: Page):
         await self._click_phase(page, "liked")
 
+    async def _favorite(self, page: Page):
+        await self._click_phase(page, "favorited")
+
     async def _comment(self, page: Page):
         config = self._phase_config("commented")
         if not isinstance(config, dict):
@@ -88,7 +91,7 @@ class SelectorFlowAdapter(BaseAdapter):
             return
 
         await BehaviorEngine.random_delay()
-        text = str(config.get("text") or self.COMMENT_TEXT).strip()
+        text = self._comment_text(config)
         for selector in inputs:
             box = page.locator(selector).first
             try:
@@ -109,6 +112,11 @@ class SelectorFlowAdapter(BaseAdapter):
                 await verify_done_state(page, config, "commented", self.PLATFORM)
                 return
         raise UnsupportedPlatformAction(f"{self.PLATFORM} comment input selector was not found")
+
+    def _comment_text(self, config: dict) -> str:
+        """Resolve comment text; platform adapters may require an exact binding."""
+
+        return str(config.get("text") or self.COMMENT_TEXT).strip()
 
     async def _repost(self, page: Page):
         config = self._phase_config("reposted")

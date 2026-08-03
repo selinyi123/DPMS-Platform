@@ -9,6 +9,8 @@ os.environ.setdefault("UPDATE_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_TOKEN", "test-admin-token")
 
 from app.api.lotteries import (  # noqa: E402
+    RealRunCompletionAuthority,
+    require_action_plan_mutation_safe,
     require_dispatch_snapshot_unchanged,
     require_dispatchable_lottery_state,
     require_lottery_not_executing,
@@ -65,6 +67,23 @@ class LotteryStateGuardTests(unittest.TestCase):
             require_no_completed_actions_for_full_real_dispatch(["liked", "commented"])
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(caught.exception.detail["completed_actions"], ["liked", "commented"])
+
+    def test_confirmed_partial_actions_freeze_mutable_action_plan(self):
+        with self.assertRaises(HTTPException) as caught:
+            require_action_plan_mutation_safe(
+                RealRunCompletionAuthority(
+                    completed_actions=("liked",),
+                )
+            )
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(
+            caught.exception.detail["code"],
+            "confirmed_real_actions_require_frozen_plan",
+        )
+        self.assertEqual(
+            caught.exception.detail["completed_actions"],
+            ["liked"],
+        )
 
     def test_repair_preflight_rejects_newly_completed_action(self):
         before = {

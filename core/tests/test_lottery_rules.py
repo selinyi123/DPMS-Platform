@@ -113,6 +113,25 @@ class BilibiliLotteryRuleTests(unittest.TestCase):
             plan["content_requirements"]["follow_targets"],
         )
 
+    def test_full_opus_binds_only_participation_instruction_mention(self):
+        plan = parse_lottery_rule(
+            "七月的暑期抽奖给大家安排上！\n"
+            "本期帽子由 @旅客君 和 @日边 联合设计，购买请前往 "
+            "@绒爪实验室 的店铺。\n"
+            "参与方式：关注本账号、评论并转发本动态，同时评论请记得 "
+            "@旅客君LookUplus，否则无效。",
+            "bilibili",
+        )
+
+        self.assertEqual(
+            ["@旅客君LookUplus"],
+            plan["content_requirements"]["commented"]["mentions"],
+        )
+        self.assertEqual(
+            [], plan["content_requirements"]["reposted"]["mentions"]
+        )
+        self.assertEqual([], plan["content_requirements"]["follow_targets"])
+
     def test_generic_friend_placeholder_has_no_fake_exact_identity(self):
         plan = parse_lottery_rule("@两位好友并转发，抽奖送键盘", "bilibili")
 
@@ -300,6 +319,30 @@ class XiaohongshuLotteryRuleTests(unittest.TestCase):
         self.assertTrue(plan["is_lottery"])
         self.assertIn("favorited", plan["required_actions"])
         self.assertNotIn("favorited", plan["unsupported_actions"])
+
+    def test_participation_context_recognizes_emoji_action_subset(self):
+        plan = parse_lottery_rule(
+            "抽奖福利，参与方式：👍+💬+⭐，抽1位送同款",
+            "xiaohongshu",
+        )
+
+        self.assertTrue(plan["is_lottery"])
+        self.assertEqual(
+            ["liked", "commented", "favorited"],
+            plan["required_actions"],
+        )
+        self.assertFalse(plan["review_required"])
+
+    def test_action_emoji_outside_participation_context_are_not_actions(self):
+        plan = parse_lottery_rule(
+            "抽奖福利，奖品太喜欢啦👍，评论区抽1位送同款⭐",
+            "xiaohongshu",
+        )
+
+        self.assertTrue(plan["is_lottery"])
+        self.assertEqual(["commented"], plan["required_actions"])
+        self.assertNotIn("liked", plan["required_actions"])
+        self.assertNotIn("favorited", plan["required_actions"])
 
     def test_share_is_unresolved_and_never_substitutes_for_favorite(self):
         plan = parse_lottery_rule(

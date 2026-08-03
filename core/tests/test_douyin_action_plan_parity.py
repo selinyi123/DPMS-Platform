@@ -76,6 +76,10 @@ class DouyinActionPlanParityTests(unittest.TestCase):
             worker_contract.DOUYIN_MANUAL_EXECUTION_PATH,
         )
         self.assertEqual(
+            core_contract.DOUYIN_DEVICE_EXECUTION_PATH,
+            worker_contract.DOUYIN_DEVICE_EXECUTION_PATH,
+        )
+        self.assertEqual(
             core_contract.DOUYIN_NO_OFFICIAL_API_BLOCKER,
             worker_contract.DOUYIN_NO_OFFICIAL_API_BLOCKER,
         )
@@ -83,16 +87,15 @@ class DouyinActionPlanParityTests(unittest.TestCase):
             tuple(core_contract.DOUYIN_ACTION_ORDER),
             tuple(worker_contract.DOUYIN_ACTION_ORDER),
         )
-        for action in ("favorited", "reposted"):
-            plan = manual_plan(action=action)
-            self.assertEqual(
-                core_contract.compute_action_plan_hash(plan),
-                worker_contract.compute_action_plan_hash(plan),
-            )
-            for contract in (core_contract, worker_contract):
-                with self.subTest(action=action, contract=contract.__name__):
-                    validated = self.validate(contract, plan)
-                    self.assertIn(action, validated.required_actions)
+        plan = manual_plan(action="favorited")
+        self.assertEqual(
+            core_contract.compute_action_plan_hash(plan),
+            worker_contract.compute_action_plan_hash(plan),
+        )
+        for contract in (core_contract, worker_contract):
+            with self.subTest(contract=contract.__name__):
+                validated = self.validate(contract, plan)
+                self.assertIn("favorited", validated.required_actions)
 
     def test_executable_and_path_tampering_use_the_same_fail_closed_codes(self):
         executable = manual_plan()
@@ -111,15 +114,17 @@ class DouyinActionPlanParityTests(unittest.TestCase):
                 with self.subTest(expected=expected, contract=contract.__name__):
                     self.assertEqual(expected, self.rejection_code(contract, plan))
 
-    def test_plain_repost_without_source_text_is_valid_in_both_contracts(self):
+    def test_repost_is_rejected_in_both_contracts(self):
         plan = manual_plan(action="reposted")
         plan["action_payloads"]["reposted"] = {}
         plan["plan_hash"] = core_contract.compute_action_plan_hash(plan)
 
         for contract in (core_contract, worker_contract):
             with self.subTest(contract=contract.__name__):
-                validated = self.validate(contract, plan)
-                self.assertEqual({}, validated.payload_for("reposted"))
+                self.assertEqual(
+                    "action_plan_required_actions_invalid",
+                    self.rejection_code(contract, plan),
+                )
 
 
 if __name__ == "__main__":

@@ -8,60 +8,48 @@ starts a real task and again before every external mutation.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
 from app.action_plan import (
     ActionPlanV2Error,
-    BILIBILI_API_EXECUTION_PATH,
-    DOUYIN_NO_OFFICIAL_API_BLOCKER,
-    WEIBO_OAUTH_EXECUTION_PATH,
     ValidatedActionPlanV2,
     canonical_json_bytes,
-    compute_bilibili_api_config_hash,
-    compute_config_hash,
     compute_rule_hash,
-    compute_target_hash,
     validate_action_plan_v2,
 )
-from app.bilibili.preflight import API_PREFLIGHT_KIND, validate_preflight_observation
-from app.bilibili.runtime import extract_bilibili_dynamic_id
-from app.weibo.capabilities import (
-    WeiboOAuthCapabilityError,
-    validate_weibo_oauth_capability_attestation,
+from app.execution_intents import (
+    ExecutionIntentValidationError,
+    validate_task_execution_intent,
 )
-from app.weibo.credentials import (
-    decrypt_weibo_rip,
-    weibo_rip_hmac,
-    weibo_rip_required,
+from app.task_streams import LEGACY_TASK_STREAM_KEY
+from shared.execution_contracts import (
+    lease_operation_kind_for_execution_intent,
+)
+from app.platform_modules.base import PlatformRoutingError
+from app.platform_modules.evidence import RealRunGateBlocked
+from app.platform_modules.registry import (
+    PlatformModuleUnavailableError,
+    get_platform_module,
 )
 
 
 REAL_RUN_POLICY_KEY = "real_run_gate"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _EXPLICIT_FALSE = frozenset({"0", "false", "no", "off"})
-_SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE = frozenset()
-_MANUAL_ONLY_REAL_RUN_BLOCKS = {
-    "douyin": DOUYIN_NO_OFFICIAL_API_BLOCKER,
-    "xiaohongshu": "xiaohongshu_no_official_interaction_api",
-}
-_BILIBILI_API_EXECUTION_PATH = BILIBILI_API_EXECUTION_PATH
-_SUPPORTED_REAL_RUN_PLATFORMS = frozenset({"bilibili", "weibo"}) | (
-    _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE
-) | frozenset(_MANUAL_ONLY_REAL_RUN_BLOCKS)
 
 
 def platform_real_run_block_reason(platform: str) -> str | None:
     """Return the authoritative pre-execution capability blocker, if any."""
 
-    normalized = str(platform or "").strip().lower()
-    if normalized in _MANUAL_ONLY_REAL_RUN_BLOCKS:
-        return _MANUAL_ONLY_REAL_RUN_BLOCKS[normalized]
-    if normalized in _SELECTOR_PATHS_AWAITING_BOUND_CONFIG_EVIDENCE:
-        return "selector_evidence_binding_required"
-    return None
+    try:
+        module = get_platform_module(platform)
+    except PlatformModuleUnavailableError:
+        return "platform_module_unavailable"
+    except PlatformRoutingError:
+        return "unsupported_real_run_platform"
+    return module.real_run_block_reason
 
 
 class GateDatabase(Protocol):
@@ -70,18 +58,6 @@ class GateDatabase(Protocol):
     async def fetch_all(self, query: str, values: Mapping[str, Any] | None = None): ...
 
     async def execute(self, query: str, values: Mapping[str, Any] | None = None): ...
-
-
-class RealRunGateBlocked(RuntimeError):
-    """Raised when a worker cannot prove that a real action is still allowed."""
-
-    def __init__(self, code: str, detail: str | None = None) -> None:
-        self.code = code
-        self.detail = detail
-        message = f"real_run_gate_blocked:{code}"
-        if detail:
-            message = f"{message}:{detail}"
-        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -94,6 +70,11 @@ class RealRunGateSnapshot:
     policy_version: int
     stage: str
     action_plan: ValidatedActionPlanV2
+    execution_action_plan: ValidatedActionPlanV2
+    requested_actions: tuple[str, ...]
+    execution_intent_id: str | None
+    execution_intent_kind: str
+    execution_intent_binding_hash: str | None
     execution_evidence_id: str
     account_lease_id: str
     account_lease_generation: int
@@ -122,12 +103,67 @@ SELECT
   tr.account_lease_id AS task_account_lease_id,
   tr.account_lease_generation AS task_account_lease_generation,
   tr.reconciliation_required AS task_reconciliation_required,
+  intent_root.contract_version AS root_contract_version,
+  intent_root.intent_id AS root_intent_id,
+  intent_root.intent_hash AS root_intent_hash,
+  intent_root.lottery_id AS root_lottery_id,
+  intent_root.source_task_id AS root_source_task_id,
+  intent_root.source_account_id AS root_source_account_id,
+  intent_root.platform AS root_platform,
+  intent_root.raw_url AS root_raw_url,
+  intent_root.canonical_url AS root_canonical_url,
+  intent_root.full_action_plan AS root_full_action_plan,
+  intent_root.full_action_plan_hash AS root_full_action_plan_hash,
+  intent_root.full_required_actions AS root_full_required_actions,
+  intent_root.full_required_actions_hash AS root_full_required_actions_hash,
+  intent_root.rule_snapshot_id AS root_rule_snapshot_id,
+  intent_root.rule_hash AS root_rule_hash,
+  intent_root.execution_path_id AS root_execution_path_id,
+  intent_root.target_hash AS root_target_hash,
+  intent_binding.contract_version AS binding_contract_version,
+  intent_binding.task_id AS binding_task_id,
+  intent_binding.intent_id AS binding_intent_id,
+  intent_binding.lottery_id AS binding_lottery_id,
+  intent_binding.account_id AS binding_account_id,
+  intent_binding.binding_kind AS binding_kind,
+  intent_binding.requested_actions AS binding_requested_actions,
+  intent_binding.requested_actions_hash AS binding_requested_actions_hash,
+  intent_binding.bound_action_plan AS binding_action_plan,
+  intent_binding.bound_action_plan_hash AS binding_action_plan_hash,
+  intent_binding.evidence_action_plan_hash
+    AS binding_evidence_action_plan_hash,
+  intent_binding.rule_snapshot_id AS binding_rule_snapshot_id,
+  intent_binding.rule_hash AS binding_rule_hash,
+  intent_binding.execution_evidence_id AS binding_execution_evidence_id,
+  intent_binding.execution_evidence_kind
+    AS binding_execution_evidence_kind,
+  intent_binding.exact_execution_evidence_id
+    AS binding_exact_execution_evidence_id,
+  intent_binding.oauth_calibration_id AS binding_oauth_calibration_id,
+  intent_binding.execution_path_id AS binding_execution_path_id,
+  intent_binding.target_hash AS binding_target_hash,
+  intent_binding.config_hash AS binding_config_hash,
+  intent_binding.execution_revision AS binding_execution_revision,
+  intent_binding.account_lease_id AS binding_account_lease_id,
+  intent_binding.account_lease_generation
+    AS binding_account_lease_generation,
+  intent_binding.binding_hash AS binding_hash,
+  legacy_outbox.stream_key AS legacy_outbox_stream_key,
+  legacy_outbox.status AS legacy_outbox_status,
+  legacy_outbox.dedup_key AS legacy_outbox_dedup_key,
+  legacy_outbox.payload AS legacy_outbox_payload,
   a.id AS bound_account_id,
   a.platform AS account_platform,
   a.status AS account_status,
   a.execution_revision AS account_execution_revision,
   CASE WHEN OCTET_LENGTH(a.encrypted_credential) > 0 THEN 1 ELSE 0 END
     AS account_credential_present,
+  EXISTS (
+    SELECT 1
+    FROM account_active_risk_states active_risk
+    WHERE active_risk.account_id = tr.account_id
+      AND active_risk.active_until > NOW()
+  ) AS account_active_risk,
   l.id AS bound_lottery_id,
   l.platform AS lottery_platform,
   l.status AS lottery_status,
@@ -145,89 +181,6 @@ SELECT
   rs.attested_by AS rule_snapshot_attested_by,
   rs.attested_at AS rule_snapshot_attested_at,
   rs.rule_hash AS snapshot_rule_hash,
-  oauth_cal.calibration_id AS oauth_calibration_id,
-  oauth_cal.account_id AS oauth_calibration_account_id,
-  oauth_cal.platform AS oauth_calibration_platform,
-  oauth_cal.status AS oauth_calibration_status,
-  oauth_cal.result AS oauth_calibration_result,
-  oauth_cal.created_at AS oauth_calibration_created_at,
-  oauth_cal.finished_at AS oauth_calibration_finished_at,
-  CASE WHEN oauth_cal.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-             AND oauth_cal.created_at <= NOW()
-             AND oauth_cal.finished_at IS NOT NULL
-             AND oauth_cal.finished_at <= NOW()
-       THEN 1 ELSE 0 END AS oauth_calibration_fresh,
-  e.id AS evidence_id,
-  e.lottery_id AS evidence_lottery_id,
-  e.account_id AS evidence_account_id,
-  e.platform AS evidence_platform,
-  e.rule_snapshot_id AS evidence_rule_snapshot_id,
-  e.execution_path_id AS evidence_execution_path_id,
-  e.target_hash AS evidence_target_hash,
-  e.rule_hash AS evidence_rule_hash,
-  e.action_plan_hash AS evidence_action_plan_hash,
-  e.config_hash AS evidence_config_hash,
-  e.probe_id AS evidence_probe_id,
-  e.shadow_task_id AS evidence_shadow_task_id,
-  e.probe_observation_kind AS evidence_probe_observation_kind,
-  e.probe_observation_hash AS evidence_probe_observation_hash,
-  e.shadow_observation_kind AS evidence_shadow_observation_kind,
-  e.shadow_observation_hash AS evidence_shadow_observation_hash,
-  e.status AS evidence_status,
-  e.verified_at AS evidence_verified_at,
-  e.expires_at AS evidence_expires_at,
-  CASE WHEN e.expires_at > NOW() THEN 1 ELSE 0 END AS evidence_active,
-  CASE WHEN e.verified_at >= GREATEST(ac.finished_at, shadow.finished_at)
-             AND e.verified_at <= NOW()
-             AND e.expires_at <= LEAST(
-               DATE_ADD(ac.finished_at, INTERVAL 24 HOUR),
-               DATE_ADD(shadow.finished_at, INTERVAL 24 HOUR)
-             )
-             AND e.expires_at > NOW()
-       THEN 1 ELSE 0 END AS evidence_time_bounded,
-  ac.status AS evidence_probe_status,
-  ac.result AS evidence_probe_observation,
-  ac.observation_kind AS source_probe_observation_kind,
-  ac.observation_hash AS source_probe_observation_hash,
-  ac.finished_at AS evidence_probe_finished_at,
-  CASE WHEN ac.finished_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-             AND ac.finished_at <= NOW() THEN 1 ELSE 0 END AS evidence_probe_fresh,
-  CASE WHEN probe_lease.released_at >= ac.finished_at
-             AND probe_lease.released_at <= NOW()
-             AND probe_lease.operation_kind = 'adapter_probe'
-             AND probe_lease.owner_id = ac.probe_id
-             AND probe_lease.task_id IS NULL
-       THEN 1 ELSE 0 END AS evidence_probe_lease_released,
-  CASE WHEN ac.started_at IS NOT NULL
-             AND probe_lease.acquired_at <= ac.started_at
-             AND ac.started_at <= ac.finished_at
-             AND probe_lease.expires_at >= ac.finished_at
-             AND probe_lease.released_at >= ac.finished_at
-             AND probe_lease.released_at <= NOW()
-       THEN 1 ELSE 0 END AS evidence_probe_lease_covers_observation,
-  shadow.status AS evidence_shadow_status,
-  shadow.task_mode AS evidence_shadow_task_mode,
-  shadow.preflight_observation AS evidence_shadow_observation,
-  shadow.preflight_observation_kind AS source_shadow_observation_kind,
-  shadow.preflight_observation_hash AS source_shadow_observation_hash,
-  shadow.finished_at AS evidence_shadow_finished_at,
-  CASE WHEN shadow.finished_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
-             AND shadow.finished_at <= NOW() THEN 1 ELSE 0 END AS evidence_shadow_fresh,
-  CASE WHEN shadow_lease.released_at >= shadow.finished_at
-             AND shadow_lease.released_at <= NOW()
-             AND shadow_lease.operation_kind = 'shadow_run'
-             AND shadow_lease.owner_id = shadow.task_id
-             AND shadow_lease.task_id = shadow.task_id
-       THEN 1 ELSE 0 END AS evidence_shadow_lease_released,
-  CASE WHEN shadow.started_at IS NOT NULL
-             AND shadow_lease.acquired_at <= shadow.started_at
-             AND shadow.started_at <= shadow.finished_at
-             AND shadow_lease.expires_at >= shadow.finished_at
-             AND shadow_lease.released_at >= shadow.finished_at
-             AND shadow_lease.released_at <= NOW()
-       THEN 1 ELSE 0 END AS evidence_shadow_lease_covers_observation,
-  shadow.target_hash AS evidence_shadow_target_hash,
-  shadow.config_hash AS evidence_shadow_config_hash,
   aol.account_id AS lease_account_id,
   aol.lease_id,
   aol.generation AS lease_generation,
@@ -256,69 +209,19 @@ SELECT
   pd.outcome AS decision_outcome,
   pv.active AS policy_active
 FROM task_runs tr
+LEFT JOIN task_execution_intent_bindings intent_binding
+  ON intent_binding.task_id = tr.task_id
+LEFT JOIN lottery_execution_intents intent_root
+  ON intent_root.lottery_id = intent_binding.lottery_id
+ AND intent_root.intent_id = intent_binding.intent_id
+LEFT JOIN outbox_events legacy_outbox
+  ON legacy_outbox.dedup_key = tr.task_id
+ AND legacy_outbox.stream_key = :legacy_task_stream_key
+ AND legacy_outbox.status = 'sent'
 LEFT JOIN accounts a ON a.id = tr.account_id
 LEFT JOIN lotteries l ON l.id = tr.lottery_id
 LEFT JOIN lottery_rule_snapshots rs
   ON rs.id = l.authoritative_rule_snapshot_id AND rs.lottery_id = l.id
-LEFT JOIN account_calibrations oauth_cal
-  ON oauth_cal.calibration_id = tr.execution_evidence_id
- AND oauth_cal.account_id = tr.account_id
- AND oauth_cal.platform = 'weibo'
- AND oauth_cal.id = (
-   SELECT latest_oauth.id
-     FROM account_calibrations latest_oauth
-     WHERE latest_oauth.account_id = tr.account_id
-       AND latest_oauth.platform = 'weibo'
-       AND latest_oauth.status = 'succeeded'
-       AND JSON_UNQUOTE(
-             JSON_EXTRACT(latest_oauth.result, '$.calibration_scope')
-           ) = 'oauth_identity_and_capabilities'
-    ORDER BY latest_oauth.id DESC
-    LIMIT 1
- )
-LEFT JOIN execution_evidence_bindings e
-  ON e.id = tr.execution_evidence_id
- AND e.lottery_id = tr.lottery_id
- AND e.account_id = tr.account_id
- AND e.rule_snapshot_id = tr.rule_snapshot_id
- AND e.execution_path_id = tr.execution_path_id
- AND e.target_hash = tr.target_hash
- AND e.rule_hash = tr.rule_hash
- AND e.action_plan_hash = tr.action_plan_hash
- AND e.config_hash = tr.config_hash
-LEFT JOIN adapter_calibrations ac
-  ON ac.probe_id = e.probe_id
- AND ac.lottery_id = e.lottery_id
- AND ac.account_id = e.account_id
- AND ac.platform = e.platform
- AND ac.rule_snapshot_id = e.rule_snapshot_id
- AND ac.execution_path_id = e.execution_path_id
- AND ac.target_hash = e.target_hash
- AND ac.rule_hash = e.rule_hash
- AND ac.action_plan_hash = e.action_plan_hash
- AND ac.config_hash = e.config_hash
- AND ac.observation_kind = e.probe_observation_kind
- AND ac.observation_hash = e.probe_observation_hash
-LEFT JOIN task_runs shadow
-  ON shadow.task_id = e.shadow_task_id
- AND shadow.lottery_id = e.lottery_id
- AND shadow.account_id = e.account_id
- AND shadow.rule_snapshot_id = e.rule_snapshot_id
- AND shadow.execution_path_id = e.execution_path_id
- AND shadow.target_hash = e.target_hash
- AND shadow.rule_hash = e.rule_hash
- AND shadow.action_plan_hash = e.action_plan_hash
- AND shadow.config_hash = e.config_hash
- AND shadow.preflight_observation_kind = e.shadow_observation_kind
- AND shadow.preflight_observation_hash = e.shadow_observation_hash
-LEFT JOIN account_operation_leases probe_lease
-  ON probe_lease.lease_id = ac.account_lease_id
- AND probe_lease.account_id = ac.account_id
- AND probe_lease.generation = ac.account_lease_generation
-LEFT JOIN account_operation_leases shadow_lease
-  ON shadow_lease.lease_id = shadow.account_lease_id
- AND shadow_lease.account_id = shadow.account_id
- AND shadow_lease.generation = shadow.account_lease_generation
 LEFT JOIN account_operation_leases aol
   ON aol.account_id = tr.account_id AND aol.lease_id = tr.account_lease_id
 LEFT JOIN policy_decisions pd ON pd.decision_id = tr.decision_id
@@ -337,6 +240,25 @@ def _row_get(row, key: str, default=None):
         return row[key]
     except (KeyError, TypeError):
         return default
+
+
+class _EvidenceContextRow:
+    """Expose platform evidence over a shared authoritative task row."""
+
+    __slots__ = ("_base", "_evidence")
+
+    def __init__(
+        self,
+        base: Any,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        self._base = base
+        self._evidence = evidence
+
+    def get(self, key: str, default=None):
+        if key in self._evidence:
+            return self._evidence[key]
+        return _row_get(self._base, key, default)
 
 
 def _parse_bool(value: Any) -> bool:
@@ -369,21 +291,6 @@ def _review_required(value: Any) -> bool:
     if normalized in _TRUTHY:
         return True
     return True
-
-
-def _json_object(value: Any, *, code: str) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        return dict(value)
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="strict")
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RealRunGateBlocked(code) from exc
-        if isinstance(parsed, dict):
-            return parsed
-    raise RealRunGateBlocked(code)
 
 
 def _exact_utf8_text(value: Any, *, code: str) -> str:
@@ -502,302 +409,13 @@ def _as_int(value: Any, *, code: str) -> int:
         raise RealRunGateBlocked(code) from exc
 
 
-def _valid_sha256(value: Any) -> bool:
-    normalized = str(value or "").strip()
-    return len(normalized) == 64 and all(ch in "0123456789abcdef" for ch in normalized)
-
-
-def _validate_execution_evidence(
-    task: Mapping[str, Any],
-    row: Any,
-    *,
-    account_id: int,
-    lottery_id: int,
-    platform: str,
-    plan: ValidatedActionPlanV2,
-) -> str:
-    message_evidence_id = str(task.get("execution_evidence_id") or "").strip()
-    task_evidence_id = str(_row_get(row, "task_execution_evidence_id") or "").strip()
-    evidence_id = str(_row_get(row, "evidence_id") or "").strip()
-    try:
-        evidence_account_id = int(_row_get(row, "evidence_account_id"))
-        evidence_lottery_id = int(_row_get(row, "evidence_lottery_id"))
-        evidence_snapshot_id = int(_row_get(row, "evidence_rule_snapshot_id"))
-        execution_revision = int(_row_get(row, "account_execution_revision"))
-    except (TypeError, ValueError) as exc:
-        raise RealRunGateBlocked("execution_evidence_binding_invalid") from exc
-    if execution_revision <= 0:
-        raise RealRunGateBlocked("account_execution_revision_invalid")
-    expected_target_hash = compute_target_hash(
-        str(_row_get(row, "lottery_canonical_url") or "").strip()
-    )
-    expected_config_hash = compute_bilibili_api_config_hash(execution_revision)
-    message_target_hash = str(task.get("target_hash") or "").strip()
-    message_config_hash = str(task.get("config_hash") or "").strip()
-    if (
-        not evidence_id
-        or message_evidence_id != evidence_id
-        or task_evidence_id != evidence_id
-        or evidence_account_id != account_id
-        or evidence_lottery_id != lottery_id
-        or evidence_snapshot_id != plan.rule_snapshot_id
-        or str(_row_get(row, "evidence_platform") or "").strip().lower() != platform
-        or str(_row_get(row, "evidence_execution_path_id") or "").strip()
-        != plan.execution_path_id
-        or str(_row_get(row, "evidence_rule_hash") or "").strip() != plan.rule_hash
-        or str(_row_get(row, "evidence_action_plan_hash") or "").strip()
-        != plan.plan_hash
-        or str(_row_get(row, "evidence_target_hash") or "").strip()
-        != expected_target_hash
-        or message_target_hash != expected_target_hash
-        or str(_row_get(row, "task_target_hash") or "").strip()
-        != expected_target_hash
-        or str(_row_get(row, "evidence_config_hash") or "").strip()
-        != expected_config_hash
-        or message_config_hash != expected_config_hash
-        or str(_row_get(row, "task_config_hash") or "").strip()
-        != expected_config_hash
-    ):
-        raise RealRunGateBlocked("execution_evidence_binding_invalid")
-    if (
-        str(_row_get(row, "evidence_status") or "").strip().lower() != "verified"
-        or _row_get(row, "evidence_verified_at") is None
-        or _row_get(row, "evidence_expires_at") is None
-        or int(_row_get(row, "evidence_active", 0) or 0) != 1
-        or int(_row_get(row, "evidence_time_bounded", 0) or 0) != 1
-    ):
-        raise RealRunGateBlocked("execution_evidence_not_active")
-    # A single aggregate row is authoritative only when it links two immutable
-    # GET-only observations and both source leases covered their observation
-    # window before being released.
-    if (
-        not str(_row_get(row, "evidence_probe_id") or "").strip()
-        or not str(_row_get(row, "evidence_shadow_task_id") or "").strip()
-        or str(_row_get(row, "evidence_probe_status") or "").strip().lower()
-        != "succeeded"
-        or _row_get(row, "evidence_probe_finished_at") is None
-        or str(_row_get(row, "evidence_shadow_status") or "").strip().lower()
-        != "succeeded"
-        or str(_row_get(row, "evidence_shadow_task_mode") or "").strip().lower()
-        != "shadow_run"
-        or str(_row_get(row, "evidence_shadow_target_hash") or "").strip()
-        != expected_target_hash
-        or str(_row_get(row, "evidence_shadow_config_hash") or "").strip()
-        != expected_config_hash
-        or int(_row_get(row, "evidence_probe_fresh", 0) or 0) != 1
-        or int(_row_get(row, "evidence_shadow_fresh", 0) or 0) != 1
-        or int(_row_get(row, "evidence_probe_lease_released", 0) or 0) != 1
-        or int(_row_get(row, "evidence_shadow_lease_released", 0) or 0) != 1
-        or int(_row_get(row, "evidence_probe_lease_covers_observation", 0) or 0)
-        != 1
-        or int(_row_get(row, "evidence_shadow_lease_covers_observation", 0) or 0)
-        != 1
-    ):
-        raise RealRunGateBlocked("probe_shadow_evidence_incomplete")
-    expected_follow_handle = (
-        plan.follow_target_handle if "followed" in plan.required_actions else None
-    )
-    try:
-        dynamic_id = extract_bilibili_dynamic_id(
-            str(_row_get(row, "lottery_raw_url") or "").strip(),
-            str(_row_get(row, "lottery_canonical_url") or "").strip()
-        )
-        probe_observation = validate_preflight_observation(
-            _json_object(
-                _row_get(row, "evidence_probe_observation"),
-                code="probe_observation_invalid",
-            ),
-            expected_dynamic_id=dynamic_id,
-            expected_actions=plan.required_actions,
-            expected_execution_revision=execution_revision,
-            expected_config_hash=expected_config_hash,
-            expected_follow_handle=expected_follow_handle,
-        )
-        shadow_observation = validate_preflight_observation(
-            _json_object(
-                _row_get(row, "evidence_shadow_observation"),
-                code="shadow_observation_invalid",
-            ),
-            expected_dynamic_id=dynamic_id,
-            expected_actions=plan.required_actions,
-            expected_execution_revision=execution_revision,
-            expected_config_hash=expected_config_hash,
-            expected_follow_handle=expected_follow_handle,
-        )
-    except RealRunGateBlocked:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise RealRunGateBlocked("probe_shadow_observation_invalid") from exc
-    if (
-        str(_row_get(row, "evidence_probe_observation_kind") or "").strip()
-        != API_PREFLIGHT_KIND
-        or str(_row_get(row, "source_probe_observation_kind") or "").strip()
-        != API_PREFLIGHT_KIND
-        or str(_row_get(row, "evidence_shadow_observation_kind") or "").strip()
-        != API_PREFLIGHT_KIND
-        or str(_row_get(row, "source_shadow_observation_kind") or "").strip()
-        != API_PREFLIGHT_KIND
-        or probe_observation.observation_hash
-        != str(_row_get(row, "evidence_probe_observation_hash") or "").strip()
-        or probe_observation.observation_hash
-        != str(_row_get(row, "source_probe_observation_hash") or "").strip()
-        or shadow_observation.observation_hash
-        != str(_row_get(row, "evidence_shadow_observation_hash") or "").strip()
-        or shadow_observation.observation_hash
-        != str(_row_get(row, "source_shadow_observation_hash") or "").strip()
-    ):
-        raise RealRunGateBlocked("probe_shadow_observation_integrity_invalid")
-    return evidence_id
-
-
-def _contains_secret_material(value: Any) -> bool:
-    """Detect secret-bearing keys in non-secret calibration evidence."""
-
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            normalized = str(key or "").strip().casefold()
-            if normalized in {
-                "access_token",
-                "refresh_token",
-                "client_secret",
-                "oauth_token",
-            }:
-                return True
-            if _contains_secret_material(item):
-                return True
-    elif isinstance(value, (list, tuple)):
-        return any(_contains_secret_material(item) for item in value)
-    return False
-
-
-def _validate_weibo_oauth_execution_evidence(
-    task: Mapping[str, Any],
-    row: Any,
-    *,
-    account_id: int,
-    plan: ValidatedActionPlanV2,
-) -> tuple[str, int, dict[str, Any], str]:
-    """Bind the queued task to one latest admin-attested calibration."""
-
-    if plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
-        raise RealRunGateBlocked("weibo_execution_path_not_supported")
-    if "weibo_rip" in task:
-        raise RealRunGateBlocked("weibo_rip_plaintext_forbidden")
-    evidence_id = str(task.get("execution_evidence_id") or "").strip()
-    if (
-        not evidence_id
-        or evidence_id
-        != str(_row_get(row, "task_execution_evidence_id") or "").strip()
-        or evidence_id
-        != str(_row_get(row, "oauth_calibration_id") or "").strip()
-    ):
-        raise RealRunGateBlocked("weibo_oauth_calibration_binding_invalid")
-    try:
-        calibration_account_id = int(
-            _row_get(row, "oauth_calibration_account_id")
-        )
-        execution_revision = int(_row_get(row, "account_execution_revision"))
-        message_revision = int(task.get("execution_revision"))
-    except (TypeError, ValueError) as exc:
-        raise RealRunGateBlocked("weibo_oauth_execution_revision_mismatch") from exc
-    if (
-        calibration_account_id != account_id
-        or execution_revision <= 0
-        or message_revision != execution_revision
-        or str(_row_get(row, "oauth_calibration_platform") or "")
-        .strip()
-        .lower()
-        != "weibo"
-        or str(_row_get(row, "oauth_calibration_status") or "")
-        .strip()
-        .lower()
-        != "succeeded"
-        or int(_row_get(row, "oauth_calibration_fresh", 0) or 0) != 1
-    ):
-        raise RealRunGateBlocked("weibo_oauth_capability_evidence_stale")
-    if int(_row_get(row, "account_credential_present", 0) or 0) != 1:
-        raise RealRunGateBlocked("weibo_oauth_credential_required")
-
-    rip_required = weibo_rip_required(plan.required_actions)
-    try:
-        rip = decrypt_weibo_rip(
-            task.get("weibo_rip_encrypted"), required=rip_required
-        )
-    except ValueError as exc:
-        code = getattr(exc, "code", "weibo_rip_invalid")
-        raise RealRunGateBlocked(code) from exc
-    expected_target_hash = compute_target_hash(
-        str(_row_get(row, "lottery_canonical_url") or "").strip()
-    )
-    expected_config_hash = compute_config_hash(
-        {
-            "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
-            "execution_revision": execution_revision,
-            "runtime_capability_requirements": plan.runtime_capability_requirements,
-            "weibo_rip_hash": weibo_rip_hmac(rip) if rip else "",
-        }
-    )
-    if (
-        str(task.get("target_hash") or "").strip() != expected_target_hash
-        or str(_row_get(row, "task_target_hash") or "").strip()
-        != expected_target_hash
-        or str(task.get("config_hash") or "").strip() != expected_config_hash
-        or str(_row_get(row, "task_config_hash") or "").strip()
-        != expected_config_hash
-    ):
-        raise RealRunGateBlocked("weibo_oauth_task_binding_invalid")
-
-    result = _json_object(
-        _row_get(row, "oauth_calibration_result"),
-        code="weibo_oauth_capability_evidence_required",
-    )
-    if set(result) != {
-        "identity",
-        "calibration_scope",
-        "requires_manual_identity_review",
-        "account_status_target",
-        "oauth_capabilities",
-    } or _contains_secret_material(result):
-        raise RealRunGateBlocked("weibo_oauth_capability_contract_mismatch")
-    identity = result.get("identity")
-    if (
-        not isinstance(identity, Mapping)
-        or set(identity) != {"verified", "method", "uid"}
-        or identity.get("verified") is not True
-        or identity.get("method") != "weibo_account_get_uid"
-    ):
-        raise RealRunGateBlocked("weibo_oauth_identity_verification_required")
-    uid = identity.get("uid")
-    if (
-        not isinstance(uid, str)
-        or not uid.isascii()
-        or not uid.isdecimal()
-        or not 1 <= len(uid) <= 20
-        or int(uid) <= 0
-        or result.get("calibration_scope") != "oauth_identity_and_capabilities"
-        or result.get("requires_manual_identity_review") is not False
-        or result.get("account_status_target") != "ready"
-    ):
-        raise RealRunGateBlocked("weibo_oauth_identity_verification_required")
-    try:
-        capabilities = validate_weibo_oauth_capability_attestation(
-            result.get("oauth_capabilities"),
-            calibration_id=evidence_id,
-            account_id=account_id,
-            execution_revision=execution_revision,
-            runtime_capability_requirements=plan.runtime_capability_requirements,
-        )
-    except WeiboOAuthCapabilityError as exc:
-        raise RealRunGateBlocked(exc.code) from exc
-    return evidence_id, execution_revision, capabilities, uid
-
-
 def _validate_account_lease(
     task: Mapping[str, Any],
     row: Any,
     *,
     task_id: str,
     account_id: int,
+    execution_intent_kind: str,
 ) -> tuple[str, int]:
     message_lease_id = str(task.get("account_lease_id") or "").strip()
     task_lease_id = str(_row_get(row, "task_account_lease_id") or "").strip()
@@ -809,6 +427,16 @@ def _validate_account_lease(
         lease_account_id = int(_row_get(row, "lease_account_id"))
     except (TypeError, ValueError) as exc:
         raise RealRunGateBlocked("account_lease_binding_invalid") from exc
+    try:
+        expected_operation_kind = (
+            lease_operation_kind_for_execution_intent(
+                execution_intent_kind
+            )
+        )
+    except ValueError as exc:
+        raise RealRunGateBlocked(
+            "account_lease_binding_invalid"
+        ) from exc
     if (
         not lease_id
         or message_lease_id != lease_id
@@ -818,7 +446,7 @@ def _validate_account_lease(
         or task_generation != lease_generation
         or lease_account_id != account_id
         or str(_row_get(row, "lease_operation_kind") or "").strip().lower()
-        != "real_run"
+        != expected_operation_kind
         or str(_row_get(row, "lease_owner_id") or "").strip() != task_id
         or str(_row_get(row, "lease_task_id") or "").strip() != task_id
         or int(_row_get(row, "lease_active", 0) or 0) != 1
@@ -858,21 +486,25 @@ async def enforce_real_run_gate(
         if not _parse_bool(_row_get(setting, "setting_value")):
             raise RealRunGateBlocked("real_run_disabled")
 
-        if platform not in _SUPPORTED_REAL_RUN_PLATFORMS:
-            raise RealRunGateBlocked("unsupported_real_run_platform")
-        capability_block = platform_real_run_block_reason(platform)
-        if capability_block:
+        try:
+            platform_module = get_platform_module(platform)
+        except PlatformModuleUnavailableError as exc:
+            raise RealRunGateBlocked("platform_module_unavailable") from exc
+        except PlatformRoutingError as exc:
+            raise RealRunGateBlocked("unsupported_real_run_platform") from exc
+        precondition_code = platform_module.real_run_precondition_code(task)
+        if precondition_code:
             # Respect the process and durable global opt-ins first, then stop
             # before loading a page, selector config, evidence or credentials.
-            raise RealRunGateBlocked(capability_block)
-        if platform == "weibo" and not str(
-            task.get("execution_evidence_id") or ""
-        ).strip():
-            raise RealRunGateBlocked(
-                "weibo_oauth_capability_evidence_required"
-            )
+            raise RealRunGateBlocked(precondition_code)
 
-        row = await db.fetch_one(_TASK_DECISION_QUERY, {"task_id": task_id})
+        row = await db.fetch_one(
+            _TASK_DECISION_QUERY,
+            {
+                "task_id": task_id,
+                "legacy_task_stream_key": LEGACY_TASK_STREAM_KEY,
+            },
+        )
         if row is None:
             raise RealRunGateBlocked("task_binding_missing")
 
@@ -893,48 +525,60 @@ async def enforce_real_run_gate(
             or lottery_platform != platform
         ):
             raise RealRunGateBlocked("task_binding_mismatch")
+        if _parse_bool(_row_get(row, "account_active_risk")):
+            raise RealRunGateBlocked("recent_account_risk_event")
         if str(_row_get(row, "task_mode") or "").strip().lower() != "real_run":
             raise RealRunGateBlocked("task_not_real_run")
         plan = await _validate_target_and_action_plan(
             task,
             row,
         )
-        if platform == "bilibili":
-            if plan.execution_path_id != _BILIBILI_API_EXECUTION_PATH:
-                raise RealRunGateBlocked("execution_path_not_supported")
-            evidence_id = _validate_execution_evidence(
+        try:
+            execution_intent = validate_task_execution_intent(
                 task,
                 row,
+                task_id=task_id,
+                account_id=account_id,
+                lottery_id=lottery_id,
+                platform=platform,
+                full_plan=plan,
+                expected_evidence_kind=(
+                    platform_module.execution_evidence_kind_for(
+                        plan.plan
+                    )
+                    or ""
+                ),
+            )
+        except ExecutionIntentValidationError as exc:
+            raise RealRunGateBlocked(exc.code) from exc
+        try:
+            evidence_context = (
+                await platform_module.load_real_run_evidence_context(
+                    db=db,
+                    task_id=task_id,
+                )
+            )
+            evidence_binding = platform_module.validate_real_run_evidence(
+                task=task,
+                row=_EvidenceContextRow(row, evidence_context),
                 account_id=account_id,
                 lottery_id=lottery_id,
                 platform=platform,
                 plan=plan,
+                execution_plan=execution_intent.action_plan,
             )
-            execution_revision = _as_int(
-                _row_get(row, "account_execution_revision"),
-                code="account_execution_revision_invalid",
-            )
-            oauth_capabilities = None
-            weibo_uid = None
-        elif platform == "weibo":
-            (
-                evidence_id,
-                execution_revision,
-                oauth_capabilities,
-                weibo_uid,
-            ) = _validate_weibo_oauth_execution_evidence(
-                task,
-                row,
-                account_id=account_id,
-                plan=plan,
-            )
-        else:  # guarded by _SUPPORTED_REAL_RUN_PLATFORMS above
-            raise RealRunGateBlocked("unsupported_real_run_platform")
+        except PlatformRoutingError as exc:
+            raise RealRunGateBlocked(exc.code) from exc
+        evidence_id = evidence_binding.evidence_id
+        execution_revision = evidence_binding.execution_revision
+        oauth_capabilities = evidence_binding.oauth_capabilities
+        weibo_uid = evidence_binding.account_identity
         lease_id, lease_generation = _validate_account_lease(
             task,
             row,
             task_id=task_id,
             account_id=account_id,
+            execution_intent_kind=execution_intent.binding_kind,
         )
 
         task_status = str(_row_get(row, "task_status") or "").strip().lower()
@@ -1013,6 +657,11 @@ async def enforce_real_run_gate(
             policy_version=task_policy_version,
             stage=stage,
             action_plan=plan,
+            execution_action_plan=execution_intent.action_plan,
+            requested_actions=execution_intent.requested_actions,
+            execution_intent_id=execution_intent.intent_id,
+            execution_intent_kind=execution_intent.binding_kind,
+            execution_intent_binding_hash=execution_intent.binding_hash,
             execution_evidence_id=evidence_id,
             account_lease_id=lease_id,
             account_lease_generation=lease_generation,

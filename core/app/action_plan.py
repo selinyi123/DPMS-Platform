@@ -12,25 +12,46 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
+from app.platform_modules import PlatformCapabilityError, get_platform_module
+from app.platform_modules.catalog import (
+    BILIBILI_ACTION_ORDER as PLATFORM_BILIBILI_ACTION_ORDER,
+    BILIBILI_API_EXECUTION_PATH as PLATFORM_BILIBILI_API_EXECUTION_PATH,
+    DOUYIN_ACTION_ORDER as PLATFORM_DOUYIN_ACTION_ORDER,
+    DOUYIN_DEVICE_EXECUTION_PATH as PLATFORM_DOUYIN_DEVICE_EXECUTION_PATH,
+    DOUYIN_MANUAL_EXECUTION_PATH as PLATFORM_DOUYIN_MANUAL_EXECUTION_PATH,
+    DOUYIN_NO_OFFICIAL_API_BLOCKER as PLATFORM_DOUYIN_NO_OFFICIAL_API_BLOCKER,
+    WEIBO_ACTION_CAPABILITY_REQUIREMENTS as PLATFORM_WEIBO_ACTION_CAPABILITY_REQUIREMENTS,
+    WEIBO_ACTION_ORDER as PLATFORM_WEIBO_ACTION_ORDER,
+    WEIBO_MANUAL_EXECUTION_BLOCKER as PLATFORM_WEIBO_MANUAL_EXECUTION_BLOCKER,
+    WEIBO_MANUAL_EXECUTION_PATH as PLATFORM_WEIBO_MANUAL_EXECUTION_PATH,
+    WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION as PLATFORM_WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION,
+    WEIBO_OAUTH_EXECUTION_PATH as PLATFORM_WEIBO_OAUTH_EXECUTION_PATH,
+    XIAOHONGSHU_ACTION_ORDER as PLATFORM_XIAOHONGSHU_ACTION_ORDER,
+    XIAOHONGSHU_BROWSER_EXECUTION_PATH as PLATFORM_XIAOHONGSHU_BROWSER_EXECUTION_PATH,
+    XIAOHONGSHU_MANUAL_EXECUTION_PATH as PLATFORM_XIAOHONGSHU_MANUAL_EXECUTION_PATH,
+    XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER as PLATFORM_XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER,
+)
 
-LEGACY_ACTION_ORDER = ("followed", "liked", "commented", "reposted")
+
+LEGACY_ACTION_ORDER = PLATFORM_BILIBILI_ACTION_ORDER
 # Preserve the relative order of every existing action while adding collection
 # before repost.  The global order is used for deterministic presentation and
 # hashes; platform validators still enforce their own supported subset.
 ACTION_ORDER = ("followed", "liked", "commented", "favorited", "reposted")
 ACTION_SET = frozenset(ACTION_ORDER)
-BILIBILI_ACTION_ORDER = LEGACY_ACTION_ORDER
-WEIBO_ACTION_ORDER = ACTION_ORDER
-XIAOHONGSHU_ACTION_ORDER = ("followed", "liked", "commented", "favorited")
-DOUYIN_ACTION_ORDER = ACTION_ORDER
-PLATFORM_ACTION_ORDERS = {
+BILIBILI_ACTION_ORDER = PLATFORM_BILIBILI_ACTION_ORDER
+WEIBO_ACTION_ORDER = PLATFORM_WEIBO_ACTION_ORDER
+XIAOHONGSHU_ACTION_ORDER = PLATFORM_XIAOHONGSHU_ACTION_ORDER
+DOUYIN_ACTION_ORDER = PLATFORM_DOUYIN_ACTION_ORDER
+PLATFORM_ACTION_ORDERS = MappingProxyType({
     "bilibili": BILIBILI_ACTION_ORDER,
     "weibo": WEIBO_ACTION_ORDER,
     "xiaohongshu": XIAOHONGSHU_ACTION_ORDER,
     "douyin": DOUYIN_ACTION_ORDER,
-}
+})
 TEXT_ACTIONS = frozenset({"commented", "reposted"})
 OPTIONAL_TEXT_METADATA = frozenset(
     {"topic_tags", "mentions", "media_refs", "translation"}
@@ -45,31 +66,21 @@ HANDLE_PATTERN = re.compile(r"@[\w\u4e00-\u9fff-]{1,64}\Z")
 MENTION_IN_TEXT_PATTERN = re.compile(
     r"@[\w\u4e00-\u9fff-]{1,64}(?![\w\u4e00-\u9fff-])"
 )
-BILIBILI_API_EXECUTION_PATH = "bilibili_api_v2"
+BILIBILI_API_EXECUTION_PATH = PLATFORM_BILIBILI_API_EXECUTION_PATH
 BILIBILI_API_PREFLIGHT_CONTRACT_VERSION = 1
-WEIBO_OAUTH_EXECUTION_PATH = "weibo_oauth_v1"
-WEIBO_MANUAL_EXECUTION_PATH = "weibo_manual_v1"
-WEIBO_MANUAL_EXECUTION_BLOCKER = "weibo_manual_execution_selected"
-WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION = 1
-WEIBO_ACTION_CAPABILITY_REQUIREMENTS = {
-    "followed": {
-        "endpoint": "friendships/create",
-        "permission": "advanced",
-        "client_type": "weibo",
-    },
-    "liked": {"endpoint": "attitudes/create", "permission": "advanced"},
-    "commented": {"endpoint": "comments/create", "permission": "standard"},
-    "favorited": {"endpoint": "favorites/create", "permission": "standard"},
-    "reposted": {"endpoint": "statuses/repost", "permission": "standard"},
-}
+WEIBO_OAUTH_EXECUTION_PATH = PLATFORM_WEIBO_OAUTH_EXECUTION_PATH
+WEIBO_MANUAL_EXECUTION_PATH = PLATFORM_WEIBO_MANUAL_EXECUTION_PATH
+WEIBO_MANUAL_EXECUTION_BLOCKER = PLATFORM_WEIBO_MANUAL_EXECUTION_BLOCKER
+WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION = PLATFORM_WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION
+WEIBO_ACTION_CAPABILITY_REQUIREMENTS = PLATFORM_WEIBO_ACTION_CAPABILITY_REQUIREMENTS
 WEIBO_RIP_ACTIONS = frozenset({"followed", "commented", "reposted"})
 WEIBO_PREFLIGHT_UNIQUE_HANDLE_LIMIT = 32
-XIAOHONGSHU_MANUAL_EXECUTION_PATH = "xiaohongshu_manual_v1"
-XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER = (
-    "xiaohongshu_no_official_interaction_api"
-)
-DOUYIN_MANUAL_EXECUTION_PATH = "douyin_manual_v1"
-DOUYIN_NO_OFFICIAL_API_BLOCKER = "douyin_no_official_interaction_api"
+XIAOHONGSHU_MANUAL_EXECUTION_PATH = PLATFORM_XIAOHONGSHU_MANUAL_EXECUTION_PATH
+XIAOHONGSHU_BROWSER_EXECUTION_PATH = PLATFORM_XIAOHONGSHU_BROWSER_EXECUTION_PATH
+XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER = PLATFORM_XIAOHONGSHU_NO_OFFICIAL_API_BLOCKER
+DOUYIN_MANUAL_EXECUTION_PATH = PLATFORM_DOUYIN_MANUAL_EXECUTION_PATH
+DOUYIN_DEVICE_EXECUTION_PATH = PLATFORM_DOUYIN_DEVICE_EXECUTION_PATH
+DOUYIN_NO_OFFICIAL_API_BLOCKER = PLATFORM_DOUYIN_NO_OFFICIAL_API_BLOCKER
 
 
 class ActionPlanV2Error(ValueError):
@@ -110,18 +121,14 @@ def action_order_for_platform(platform: str) -> tuple[str, ...]:
     four-action subset for backward compatibility.
     """
 
-    key = str(platform or "").strip().casefold()
-    return PLATFORM_ACTION_ORDERS.get(key, LEGACY_ACTION_ORDER)
+    platform_module = get_platform_module(platform)
+    return platform_module.action_order if platform_module else LEGACY_ACTION_ORDER
 
 
 def default_execution_path_for_platform(platform: str) -> str:
-    key = str(platform or "").strip().casefold()
-    if key == "weibo":
-        return WEIBO_OAUTH_EXECUTION_PATH
-    if key == "xiaohongshu":
-        return XIAOHONGSHU_MANUAL_EXECUTION_PATH
-    if key == "douyin":
-        return DOUYIN_MANUAL_EXECUTION_PATH
+    platform_module = get_platform_module(platform)
+    if platform_module is not None:
+        return platform_module.default_execution_path_id
     # Preserve the previous request-model default for every existing caller.
     return BILIBILI_API_EXECUTION_PATH
 
@@ -187,20 +194,33 @@ def compute_bilibili_api_config_hash(execution_revision: int) -> str:
     )
 
 
+def compute_xiaohongshu_browser_config_hash(
+    execution_revision: int,
+    selector_config: Mapping[str, Any],
+) -> str:
+    """Hash the exact selector bytes and account credential generation."""
+
+    from shared.xiaohongshu_browser_contract import (
+        XiaohongshuBrowserContractError,
+        compute_xiaohongshu_browser_config_hash as shared_config_hash,
+    )
+
+    try:
+        return shared_config_hash(execution_revision, selector_config)
+    except XiaohongshuBrowserContractError as exc:
+        raise ActionPlanV2Error(exc.code) from exc
+
+
 def weibo_runtime_capability_requirements(
     required_actions: list[str] | tuple[str, ...],
 ) -> dict[str, Any]:
     """Return the versioned, non-secret OAuth capability contract for a plan."""
 
-    selected = set(required_actions)
-    return {
-        "contract_version": WEIBO_OAUTH_CAPABILITY_CONTRACT_VERSION,
-        "actions": {
-            action: dict(WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action])
-            for action in WEIBO_ACTION_ORDER
-            if action in selected
-        },
-    }
+    platform_module = get_platform_module("weibo")
+    return platform_module.build_runtime_capability_requirements(
+        tuple(required_actions),
+        WEIBO_OAUTH_EXECUTION_PATH,
+    ) or {}
 
 
 def _required_string(plan: Mapping[str, Any], field: str) -> str:
@@ -291,18 +311,22 @@ def validate_action_payload(
         error_code=f"action_payload_{action}_text_invalid",
     ) > 4096:
         raise ActionPlanV2Error(f"action_payload_{action}_text_too_large")
-    if str(platform or "").strip().casefold() == "weibo":
-        # Weibo's write APIs cap comment/repost text at 140 characters. Count
-        # UTF-16 code units conservatively (a non-BMP emoji consumes two), as
-        # commonly enforced by platform clients. Never truncate reviewed text.
+    platform_module = get_platform_module(platform or "")
+    if platform_module and platform_module.max_text_utf16_units is not None:
+        # A platform module may impose a tighter reviewed-text limit. Count
+        # UTF-16 code units conservatively and never truncate reviewed text.
         try:
             utf16_units = len(text.encode("utf-16-le")) // 2
         except UnicodeEncodeError as exc:
             raise ActionPlanV2Error(
                 f"action_payload_{action}_text_invalid"
             ) from exc
-        if utf16_units > 140:
-            raise ActionPlanV2Error(f"weibo_{action}_text_too_long")
+        if utf16_units > platform_module.max_text_utf16_units:
+            template = (
+                platform_module.text_too_long_error_template
+                or "action_payload_{action}_text_too_long"
+            )
+            raise ActionPlanV2Error(template.format(action=action))
 
     topic_tags = _validated_metadata_list(payload, "topic_tags")
     mentions = _validated_metadata_list(payload, "mentions")
@@ -718,26 +742,23 @@ def validate_action_plan_v2(
         if isinstance(raw_platform, str)
         else ""
     )
-    is_weibo = platform_key == "weibo"
-    is_xiaohongshu = platform_key == "xiaohongshu"
-    is_douyin = platform_key == "douyin"
-    manual_execution_paths = {
-        "xiaohongshu": XIAOHONGSHU_MANUAL_EXECUTION_PATH,
-        "douyin": DOUYIN_MANUAL_EXECUTION_PATH,
-    }
+    platform_module = get_platform_module(platform_key)
+    if platform_module is None:
+        # The legacy action-order helper remains available to old read-only
+        # callers, but an attested/executable plan must belong to one of the
+        # four registered platform business modules. Otherwise an unknown
+        # platform could inherit Bilibili's path and action semantics.
+        raise ActionPlanV2Error("action_plan_platform_unsupported")
     # Manual-only platforms have no proven official participant-interaction
     # write API. Even a non-executable validator must reject a forged
     # executable claim before generic validation can treat it as authoritative.
-    if platform_key in manual_execution_paths and plan.get("executable") is not False:
-        raise ActionPlanV2Error(
-            f"{platform_key}_manual_plan_must_be_non_executable"
-        )
-    if (
-        is_weibo
-        and plan.get("execution_path_id") == WEIBO_MANUAL_EXECUTION_PATH
-        and plan.get("executable") is not False
-    ):
-        raise ActionPlanV2Error("weibo_manual_plan_must_be_non_executable")
+    non_executable_error = (
+        platform_module.non_executable_error(plan.get("execution_path_id"))
+        if platform_module
+        else None
+    )
+    if non_executable_error and plan.get("executable") is not False:
+        raise ActionPlanV2Error(non_executable_error)
     if require_executable and plan.get("executable") is not True:
         raise ActionPlanV2Error("action_plan_not_executable")
     if plan.get("review_required") is not False:
@@ -747,7 +768,13 @@ def validate_action_plan_v2(
         not isinstance(reviewed_by, str)
         or not reviewed_by.strip()
         or reviewed_by != reviewed_by.strip()
-        or len(reviewed_by.encode("utf-8")) > 128
+        or (
+            _utf8_length(
+                reviewed_by,
+                error_code="action_plan_review_attestation_invalid",
+            )
+            > 128
+        )
         or plan.get("rule_complete_confirmed") is not True
     ):
         raise ActionPlanV2Error("action_plan_review_attestation_invalid")
@@ -757,18 +784,11 @@ def validate_action_plan_v2(
         raise ActionPlanV2Error("action_plan_rule_snapshot_id_invalid")
     rule_hash = _required_string(plan, "rule_hash")
     path_id = _required_string(plan, "execution_path_id")
-    expected_manual_path = manual_execution_paths.get(platform_key)
-    if expected_manual_path and path_id != expected_manual_path:
-        raise ActionPlanV2Error(
-            "xiaohongshu_execution_path_not_supported"
-            if is_xiaohongshu
-            else f"{platform_key}_execution_path_invalid"
-        )
-    if is_weibo and path_id not in {
-        WEIBO_OAUTH_EXECUTION_PATH,
-        WEIBO_MANUAL_EXECUTION_PATH,
-    }:
-        raise ActionPlanV2Error("weibo_execution_path_invalid")
+    if platform_module:
+        try:
+            platform_module.validate_action_plan_path(path_id)
+        except PlatformCapabilityError as exc:
+            raise ActionPlanV2Error(exc.code) from exc
     plan_hash = _required_string(plan, "plan_hash")
     for field, value_hash in (("rule_hash", rule_hash), ("hash", plan_hash)):
         if len(value_hash) != 64 or any(ch not in "0123456789abcdef" for ch in value_hash):
@@ -792,8 +812,12 @@ def validate_action_plan_v2(
     normalized = tuple(action for action in platform_order if action in set(actions))
     if tuple(actions) != normalized:
         raise ActionPlanV2Error("action_plan_action_order_invalid")
-    if platform.casefold() == "xiaohongshu" and normalized != XIAOHONGSHU_ACTION_ORDER:
-        raise ActionPlanV2Error("xiaohongshu_four_action_plan_required")
+    if (
+        platform_module
+        and platform_module.require_all_actions_error
+        and normalized != platform_module.action_order
+    ):
+        raise ActionPlanV2Error(platform_module.require_all_actions_error)
     deferred_canonicalization_error: ActionPlanV2Error | None = None
     try:
         computed_plan_hash = compute_action_plan_hash(plan)
@@ -810,7 +834,9 @@ def validate_action_plan_v2(
         actions,
         plan.get("action_payloads"),
         allowed_actions=platform_action_set,
-        allow_empty_repost_text=is_weibo or is_douyin,
+        allow_empty_repost_text=bool(
+            platform_module and platform_module.allow_empty_repost_text
+        ),
         platform=platform_key,
     )
     content_requirements = _validated_content_requirements(
@@ -836,11 +862,14 @@ def validate_action_plan_v2(
         source_content_requirements = _validated_content_requirements(
             raw_source_content_requirements
         )
-    if is_weibo:
-        validate_weibo_preflight_unique_handle_limit(
-            payloads,
-            content_requirements,
-            source_content_requirements,
+    if platform_module and platform_module.action_plan_post_validator:
+        platform_module.action_plan_post_validator(
+            plan=plan,
+            path_id=path_id,
+            actions=normalized,
+            payloads=payloads,
+            content_requirements=content_requirements,
+            source_content_requirements=source_content_requirements,
         )
     source_follow_target_keys = set(
         _mention_identity_keys(source_content_requirements["follow_targets"])
@@ -875,11 +904,13 @@ def validate_action_plan_v2(
             raise ActionPlanV2Error(
                 "action_plan_friend_mention_requirement_binding_mismatch"
             )
-    if is_xiaohongshu and content_requirements["reposted"] != {
-        "topic_tags": [],
-        "mentions": [],
-    }:
-        raise ActionPlanV2Error("xiaohongshu_repost_content_not_supported")
+    if platform_module:
+        for action, error_code in platform_module.empty_content_requirement_errors:
+            if content_requirements[action] != {
+                "topic_tags": [],
+                "mentions": [],
+            }:
+                raise ActionPlanV2Error(error_code)
     for action in CONTENT_REQUIREMENT_ACTIONS:
         for field, mismatch_code in (
             ("topic_tags", "action_plan_required_topic_mismatch"),
@@ -915,13 +946,15 @@ def validate_action_plan_v2(
     if not isinstance(runtime_capability_requirements, Mapping):
         raise ActionPlanV2Error("weibo_oauth_capability_contract_mismatch")
     runtime_capability_requirements = dict(runtime_capability_requirements)
-    if is_weibo:
-        expected_capabilities = (
-            weibo_runtime_capability_requirements(actions)
-            if path_id == WEIBO_OAUTH_EXECUTION_PATH
-            else {}
+    if platform_module:
+        expected_capabilities = platform_module.build_runtime_capability_requirements(
+            normalized,
+            path_id,
         )
-        if runtime_capability_requirements != expected_capabilities:
+        if (
+            expected_capabilities is not None
+            and runtime_capability_requirements != expected_capabilities
+        ):
             raise ActionPlanV2Error("weibo_oauth_capability_contract_mismatch")
     return ValidatedActionPlanV2(
         plan=plan,

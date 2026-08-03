@@ -6,6 +6,7 @@ import copy
 import base64
 import hashlib
 import hmac
+import json
 import sys
 import unittest
 from contextlib import asynccontextmanager
@@ -49,6 +50,8 @@ from app.action_plan import (  # noqa: E402
     WEIBO_ACTION_ORDER,
     WEIBO_OAUTH_EXECUTION_PATH,
     compute_action_plan_hash,
+    compute_config_hash,
+    compute_target_hash,
     validate_action_plan_v2,
     weibo_runtime_capability_requirements,
 )
@@ -85,7 +88,10 @@ from app.weibo.credentials import (  # noqa: E402
 )
 from app import task_runner  # noqa: E402
 from app import account_calibrator  # noqa: E402
-from app import real_run_gate  # noqa: E402
+from app.platform_modules import weibo as weibo_module  # noqa: E402
+from app.platform_modules.weibo import (  # noqa: E402
+    validate_weibo_oauth_execution_evidence,
+)
 
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
@@ -857,6 +863,50 @@ class OAuthExecutorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_oauth_account_credential_uses_strict_purpose_binding(self):
+        envelope = {
+            "credential_kind": "weibo_oauth",
+            "access_token": "ascii-token_123",
+            "uid": "12345678",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        }
+
+        class Database:
+            async def fetch_one(self, query, values):
+                del query, values
+                return {
+                    "platform": "weibo",
+                    "encrypted_credential": b"purpose-bound-ciphertext",
+                    "execution_revision": EXECUTION_REVISION,
+                }
+
+        class Vault:
+            def __init__(self):
+                self.strict_call = None
+
+            def decrypt(self, *args, **kwargs):
+                raise AssertionError("legacy decrypt must not be used for OAuth")
+
+            def decrypt_strict(self, ciphertext, *, aad):
+                self.strict_call = (ciphertext, aad)
+                return json.dumps(envelope)
+
+        vault = Vault()
+        with patch.object(task_runner, "database", Database()), patch.object(
+            task_runner, "cookie_vault", vault
+        ):
+            credential = await task_runner.load_weibo_oauth_credential(
+                ACCOUNT_ID,
+                expected_uid=envelope["uid"],
+                expected_execution_revision=EXECUTION_REVISION,
+            )
+
+        self.assertEqual(credential.uid, envelope["uid"])
+        self.assertEqual(
+            vault.strict_call,
+            (b"purpose-bound-ciphertext", task_runner.CREDENTIAL_AAD),
+        )
+
     def test_rip_digest_is_keyed_and_purpose_bound(self):
         master = b"k" * 32
         encoded_key = base64.b64encode(master).decode("ascii")
@@ -983,13 +1033,32 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
                 del stream
                 captured.append(values["payload"])
 
-        malicious = dict(task, weibo_rip=raw_ip)
+        malicious = dict(
+            task,
+            platform="must-not-be-retained",
+            mode="must-not-be-retained",
+            execution_path_id="must-not-be-retained",
+            weibo_rip=raw_ip,
+            encrypted_credential="must-not-be-retained",
+            access_token="must-not-be-retained",
+            cookies={"session": "must-not-be-retained"},
+        )
         with patch.object(task_runner, "database", Database()), patch.object(
             task_runner, "redis", Redis()
         ):
-            await task_runner.dead_letter_message("1-0", malicious, "invalid")
+            await task_runner.dead_letter_message(
+                "1-0",
+                malicious,
+                "platform_not_supported:must-not-be-retained",
+            )
         self.assertEqual(len(captured), 2)
         self.assertTrue(all(raw_ip not in payload for payload in captured))
+        self.assertTrue(
+            all(
+                "must-not-be-retained" not in payload
+                for payload in captured
+            )
+        )
 
     async def test_invalid_plaintext_message_for_active_task_is_retained_for_recovery(self):
         task_id = str(uuid4())
@@ -999,7 +1068,11 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
                 self.seen = (query, values)
                 return {"status": "queued"}
 
-        redis = SimpleNamespace(xack=AsyncMock(), xdel=AsyncMock())
+        redis = SimpleNamespace(
+            eval=AsyncMock(),
+            xack=AsyncMock(),
+            xdel=AsyncMock(),
+        )
         dead_letter = AsyncMock()
         task = {"task_id": task_id}
         with patch.object(task_runner, "database", Database()), patch.object(
@@ -1014,6 +1087,7 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
             "1-0", task, "weibo_rip_plaintext_forbidden"
         )
         redis.xack.assert_not_awaited()
+        redis.eval.assert_not_awaited()
         redis.xdel.assert_not_awaited()
 
     async def test_invalid_message_without_active_authoritative_task_is_acked(self):
@@ -1022,7 +1096,11 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
                 del query, values
                 return {"status": "failed"}
 
-        redis = SimpleNamespace(xack=AsyncMock(), xdel=AsyncMock())
+        redis = SimpleNamespace(
+            eval=AsyncMock(),
+            xack=AsyncMock(),
+            xdel=AsyncMock(),
+        )
         with patch.object(task_runner, "database", Database()), patch.object(
             task_runner, "redis", redis
         ), patch.object(
@@ -1038,11 +1116,16 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
         redis.xack.assert_awaited_once_with(
             task_runner.STREAM_KEY, task_runner.GROUP_NAME, "2-0"
         )
+        redis.eval.assert_not_awaited()
         redis.xdel.assert_awaited_once_with(task_runner.STREAM_KEY, "2-0")
 
     async def test_noncanonical_task_id_cannot_retain_invalid_message(self):
         database = SimpleNamespace(fetch_one=AsyncMock())
-        redis = SimpleNamespace(xack=AsyncMock(), xdel=AsyncMock())
+        redis = SimpleNamespace(
+            eval=AsyncMock(),
+            xack=AsyncMock(),
+            xdel=AsyncMock(),
+        )
         with patch.object(task_runner, "database", database), patch.object(
             task_runner, "redis", redis
         ), patch.object(
@@ -1054,7 +1137,10 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(acknowledged)
         database.fetch_one.assert_not_awaited()
-        redis.xack.assert_awaited_once()
+        redis.eval.assert_not_awaited()
+        redis.xack.assert_awaited_once_with(
+            task_runner.STREAM_KEY, task_runner.GROUP_NAME, "3-0"
+        )
         redis.xdel.assert_not_awaited()
 
     async def test_plaintext_stream_entry_is_not_acked_when_delete_fails(self):
@@ -1064,6 +1150,7 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
                 return {"status": "failed"}
 
         redis = SimpleNamespace(
+            eval=AsyncMock(),
             xack=AsyncMock(),
             xdel=AsyncMock(side_effect=RuntimeError("redis unavailable")),
         )
@@ -1080,6 +1167,7 @@ class QueuePrivacyTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         redis.xdel.assert_awaited_once_with(task_runner.STREAM_KEY, "4-0")
+        redis.eval.assert_not_awaited()
         redis.xack.assert_not_awaited()
 
 
@@ -1089,6 +1177,7 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.transaction_active = False
                 self.rolled_back = False
+                self.claim_reads = []
 
             @asynccontextmanager
             async def transaction(self):
@@ -1100,6 +1189,24 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
                     raise
                 finally:
                     self.transaction_active = False
+
+            async def fetch_one(self, query, values):
+                self.assert_transactional()
+                self.claim_reads.append((" ".join(query.split()), dict(values)))
+                return {
+                    "calibration_id": CALIBRATION_ID,
+                    "account_id": ACCOUNT_ID,
+                    "platform": "weibo",
+                    "check_url": "https://weibo.com/",
+                    "staged_result": None,
+                    "calibration_status": "queued",
+                    "account_platform": "weibo",
+                    "account_execution_revision": EXECUTION_REVISION,
+                }
+
+            def assert_transactional(self):
+                if not self.transaction_active:
+                    raise AssertionError("claim read must be transactional")
 
         db = Database()
         claim_calls = []
@@ -1127,6 +1234,12 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(db.rolled_back)
+        self.assertEqual(len(db.claim_reads), 1)
+        self.assertIn("FOR UPDATE", db.claim_reads[0][0])
+        self.assertEqual(
+            db.claim_reads[0][1],
+            {"calibration_id": CALIBRATION_ID},
+        )
         self.assertEqual(len(claim_calls), 1)
         query, values = claim_calls[0]
         self.assertIn("calibration_id = :calibration_id", query)
@@ -1165,6 +1278,12 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, decrypted):
                 self.decrypted = decrypted
 
+            def decrypt_strict(self, blob, *, aad):
+                del blob, aad
+                if isinstance(self.decrypted, dict):
+                    return self.decrypted
+                raise ValueError("legacy browser credential")
+
             def decrypt(self, blob, *, aad):
                 del blob, aad
                 return self.decrypted
@@ -1175,29 +1294,59 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
             ):
                 return await account_calibrator.resolve_weibo_calibration_kind(task)
 
+        oauth_identity = {
+            "account_id": "17",
+            "check_url": account_calibrator.WEIBO_OAUTH_IDENTITY_URL,
+            "staged_result": None,
+            "calibration_kind": "browser_session",
+        }
         self.assertEqual(
-            await resolve(
-                {"account_id": "17", "calibration_kind": "weibo_oauth_identity"},
-                oauth_envelope,
-            ),
+            await resolve(oauth_identity, oauth_envelope),
             "weibo_oauth_identity",
         )
         self.assertEqual(
-            await resolve({"account_id": "17"}, "SUB=browser-cookie; XSRF=abc"),
+            await resolve(
+                {
+                    "account_id": "17",
+                    "check_url": "https://weibo.com/",
+                    "staged_result": None,
+                    "calibration_kind": "weibo_oauth_capability",
+                },
+                "SUB=browser-cookie; XSRF=abc",
+            ),
             "browser_session",
         )
+        self.assertEqual(
+            await resolve(
+                {
+                    **oauth_identity,
+                    "staged_result": {"operator_attestation": {}},
+                    "calibration_kind": "weibo_oauth_identity",
+                },
+                oauth_envelope,
+            ),
+            "weibo_oauth_capability",
+        )
+        with self.assertRaisesRegex(
+            ValueError, "weibo_oauth_calibration_binding_invalid"
+        ):
+            await resolve(
+                {
+                    "account_id": "17",
+                    "check_url": "https://weibo.com/",
+                    "staged_result": None,
+                },
+                oauth_envelope,
+            )
         with self.assertRaisesRegex(
             ValueError, "weibo_browser_calibration_credential_kind_mismatch"
         ):
             await resolve(
-                {"account_id": "17", "calibration_kind": "browser_session"},
-                oauth_envelope,
-            )
-        with self.assertRaisesRegex(
-            ValueError, "weibo_oauth_calibration_credential_kind_mismatch"
-        ):
-            await resolve(
-                {"account_id": "17", "calibration_kind": "weibo_oauth_capability"},
+                {
+                    "account_id": "17",
+                    "check_url": account_calibrator.WEIBO_OAUTH_IDENTITY_URL,
+                    "staged_result": None,
+                },
                 "SUB=browser-cookie; XSRF=abc",
             )
 
@@ -1248,7 +1397,7 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
                     raise AssertionError("settlement read must be transactional")
 
         class Vault:
-            def decrypt(self, blob, *, aad):
+            def decrypt_strict(self, blob, *, aad):
                 del blob, aad
                 return envelope
 
@@ -1326,6 +1475,19 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
 
             async def fetch_one(self, query, values):
                 del values
+                if "c.check_url" in query:
+                    if self.transaction_depth <= 0:
+                        raise AssertionError("claim read must be transactional")
+                    return {
+                        "calibration_id": CALIBRATION_ID,
+                        "account_id": ACCOUNT_ID,
+                        "platform": "weibo",
+                        "check_url": account_calibrator.WEIBO_OAUTH_IDENTITY_URL,
+                        "staged_result": None,
+                        "calibration_status": "queued",
+                        "account_platform": "weibo",
+                        "account_execution_revision": EXECUTION_REVISION,
+                    }
                 if "SELECT c.calibration_id" in query:
                     return {
                         "calibration_id": CALIBRATION_ID,
@@ -1350,7 +1512,7 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError(query)
 
         class Vault:
-            def decrypt(self, blob, *, aad):
+            def decrypt_strict(self, blob, *, aad):
                 del blob, aad
                 return envelope
 
@@ -1449,11 +1611,66 @@ class CalibrationRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TaskRunnerOAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def oauth_evidence_contract(
+        self,
+        *,
+        runtime_plan,
+        capability_actions,
+        encrypted_rip="",
+        rip_hash="",
+    ):
+        canonical_url = f"canonical://weibo/status/{STATUS_ID}"
+        target_hash = compute_target_hash(canonical_url)
+        config_hash = compute_config_hash(
+            {
+                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
+                "execution_revision": EXECUTION_REVISION,
+                "runtime_capability_requirements": (
+                    runtime_plan.runtime_capability_requirements
+                ),
+                "weibo_rip_hash": rip_hash,
+            }
+        )
+        task = {
+            "execution_evidence_id": CALIBRATION_ID,
+            "execution_revision": EXECUTION_REVISION,
+            "target_hash": target_hash,
+            "config_hash": config_hash,
+            "weibo_rip_encrypted": encrypted_rip,
+        }
+        row = {
+            "task_execution_evidence_id": CALIBRATION_ID,
+            "oauth_calibration_id": CALIBRATION_ID,
+            "oauth_calibration_account_id": ACCOUNT_ID,
+            "account_execution_revision": EXECUTION_REVISION,
+            "oauth_calibration_platform": "weibo",
+            "oauth_calibration_status": "succeeded",
+            "oauth_calibration_fresh": 1,
+            "account_credential_present": 1,
+            "lottery_canonical_url": canonical_url,
+            "task_target_hash": target_hash,
+            "task_config_hash": config_hash,
+            "oauth_calibration_result": {
+                "identity": {
+                    "verified": True,
+                    "method": "weibo_account_get_uid",
+                    "uid": "12345678",
+                },
+                "calibration_scope": "oauth_identity_and_capabilities",
+                "requires_manual_identity_review": False,
+                "account_status_target": "ready",
+                "oauth_capabilities": attestation(
+                    actions=capability_actions
+                ),
+            },
+        }
+        return task, row
+
     def test_oauth_gate_does_not_depend_on_browser_shadow_evidence(self):
         plan = validate_action_plan_v2(oauth_plan(("liked",)))
         canonical_url = f"canonical://weibo/status/{STATUS_ID}"
-        target_hash = real_run_gate.compute_target_hash(canonical_url)
-        config_hash = real_run_gate.compute_config_hash(
+        target_hash = compute_target_hash(canonical_url)
+        config_hash = compute_config_hash(
             {
                 "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
                 "execution_revision": EXECUTION_REVISION,
@@ -1500,7 +1717,7 @@ class TaskRunnerOAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "evidence_shadow_observation": None,
         }
         evidence_id, revision, capabilities, uid = (
-            real_run_gate._validate_weibo_oauth_execution_evidence(
+            validate_weibo_oauth_execution_evidence(
                 task,
                 row,
                 account_id=ACCOUNT_ID,
@@ -1511,6 +1728,104 @@ class TaskRunnerOAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(revision, EXECUTION_REVISION)
         self.assertEqual(uid, "12345678")
         self.assertEqual(capabilities["calibration_id"], CALIBRATION_ID)
+
+    def test_repair_subset_without_rip_action_ignores_full_plan_rip_need(self):
+        full_plan = validate_action_plan_v2(
+            oauth_plan(("liked", "commented"))
+        )
+        runtime_plan = validate_action_plan_v2(oauth_plan(("liked",)))
+        task, row = self.oauth_evidence_contract(
+            runtime_plan=runtime_plan,
+            capability_actions=("liked",),
+        )
+
+        evidence_id, revision, capabilities, _uid = (
+            validate_weibo_oauth_execution_evidence(
+                task,
+                row,
+                account_id=ACCOUNT_ID,
+                plan=full_plan,
+                execution_plan=runtime_plan,
+            )
+        )
+
+        self.assertEqual(evidence_id, CALIBRATION_ID)
+        self.assertEqual(revision, EXECUTION_REVISION)
+        self.assertEqual(
+            capabilities["actions"]["liked"]["granted"],
+            True,
+        )
+        self.assertFalse(
+            capabilities["actions"]["commented"]["granted"]
+        )
+
+    def test_repair_message_precheck_defers_rip_scope_to_bound_gate(self):
+        for encrypted_rip in ("", "ciphertext"):
+            with self.subTest(encrypted_rip=encrypted_rip):
+                task = {
+                    "task_id": str(uuid4()),
+                    "account_id": str(ACCOUNT_ID),
+                    "lottery_id": "801",
+                    "platform": "weibo",
+                    "mode": "real_run",
+                    "action_plan": oauth_plan(
+                        ("liked", "commented")
+                    ),
+                    "execution_intent_kind": "repair",
+                    "weibo_rip_encrypted": encrypted_rip,
+                }
+
+                validated = task_runner.validate_task_message(task)
+
+                self.assertEqual(
+                    validated["weibo_rip_encrypted"],
+                    encrypted_rip,
+                )
+
+        invalid = dict(task, weibo_rip_encrypted={"ciphertext": True})
+        with self.assertRaises(task_runner.InvalidTaskMessage) as caught:
+            task_runner.validate_task_message(invalid)
+        self.assertEqual(
+            str(caught.exception),
+            "weibo_rip_encrypted_invalid",
+        )
+
+    def test_repair_subset_with_rip_action_requires_and_binds_rip(self):
+        full_plan = validate_action_plan_v2(
+            oauth_plan(("liked", "commented"))
+        )
+        runtime_plan = validate_action_plan_v2(
+            oauth_plan(("commented",))
+        )
+        task, row = self.oauth_evidence_contract(
+            runtime_plan=runtime_plan,
+            capability_actions=("commented",),
+            encrypted_rip="ciphertext",
+            rip_hash=weibo_rip_hmac(PUBLIC_RIP),
+        )
+
+        with patch(
+            "app.weibo.credentials.decrypt_weibo_rip",
+            return_value=PUBLIC_RIP,
+        ) as decrypt:
+            evidence_id, revision, capabilities, _uid = (
+                validate_weibo_oauth_execution_evidence(
+                    task,
+                    row,
+                    account_id=ACCOUNT_ID,
+                    plan=full_plan,
+                    execution_plan=runtime_plan,
+                )
+            )
+
+        decrypt.assert_called_once_with("ciphertext", required=True)
+        self.assertEqual(evidence_id, CALIBRATION_ID)
+        self.assertEqual(revision, EXECUTION_REVISION)
+        self.assertEqual(
+            capabilities["actions"]["commented"]["granted"],
+            True,
+        )
+        self.assertFalse(capabilities["actions"]["liked"]["granted"])
 
     async def test_all_read_preflights_precede_intents_and_all_five_mutations(self):
         plan = validate_action_plan_v2(oauth_plan())
@@ -1614,6 +1929,7 @@ class TaskRunnerOAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
             oauth_capabilities={"safe": True},
             weibo_uid="12345678",
             action_plan=plan,
+            execution_intent_kind="legacy_full",
         )
 
         async def allow_gate(*args, **kwargs):
@@ -1655,13 +1971,17 @@ class TaskRunnerOAuthIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(task_runner, "get_latest_phase", AsyncMock(return_value=None)), patch.object(
             task_runner, "enforce_task_real_run_gate", allow_gate
         ), patch.object(
-            task_runner, "load_weibo_oauth_credential", AsyncMock(return_value=Credential())
+            weibo_module,
+            "_load_weibo_oauth_credential_owned",
+            AsyncMock(return_value=Credential()),
         ), patch.object(
-            task_runner, "decrypt_weibo_rip", return_value=PUBLIC_RIP
+            weibo_module, "decrypt_weibo_rip", return_value=PUBLIC_RIP
         ), patch(
             "app.weibo.client.weibo_rip_hmac", return_value="h" * 64
         ), patch.object(
-            task_runner, "WeiboApiClient", side_effect=lambda *args, **kwargs: client
+            weibo_module,
+            "WeiboApiClient",
+            side_effect=lambda *args, **kwargs: client,
         ), patch.object(
             task_runner, "refresh_task_lease", AsyncMock()
         ), patch.object(

@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
 import stat
 import threading
+import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -13,11 +15,11 @@ from pathlib import Path
 from app.adapters.registry import get_adapter
 from app.adapter_config import load_selector_config
 from app.action_plan import (
+    BILIBILI_ACTION_ORDER,
     BILIBILI_API_EXECUTION_PATH,
     DOUYIN_ACTION_ORDER,
     WEIBO_ACTION_ORDER,
     WEIBO_MAX_UNIQUE_HANDLES,
-    WEIBO_MANUAL_EXECUTION_PATH,
     WEIBO_OAUTH_EXECUTION_PATH,
     XIAOHONGSHU_REQUIRED_ACTIONS,
     ActionPlanV2Error,
@@ -26,22 +28,6 @@ from app.action_plan import (
     compute_target_hash,
     validate_action_plan_v2,
 )
-from app.bilibili.preflight import (
-    API_PREFLIGHT_KIND,
-    bilibili_author_handle,
-    run_readonly_api_preflight,
-)
-from app.bilibili.client import BilibiliApiActionOutcomeUnknown, BilibiliApiClient
-from app.bilibili.config import BiliEngineConfig
-from app.bilibili.executor import BilibiliApiExecutor
-from app.bilibili.runtime import (
-    API_TO_DPMS_PHASE,
-    account_status_for_results,
-    dpms_phases_to_api_actions,
-    extract_bilibili_dynamic_id,
-    parse_detail_card,
-    validate_card_for_actions,
-)
 from app.browser_pool import BrowserPool
 from app.db import database, execute_affected_rows, redis
 from app.event_store.service import record_event
@@ -49,6 +35,14 @@ from app.evidence_storage import (
     SHADOW_EVIDENCE_DIR,
     TASK_FAILURE_EVIDENCE_DIR,
 )
+from app.platform_modules.base import PlatformRoutingError
+from app.platform_modules.errors import (
+    BilibiliActionSettlementFailed,
+    BilibiliForwardedTargetRequiresReview,
+    ExternalActionOutcomeUnknown,
+)
+from app.platform_modules.registry import get_platform_module, registered_platforms
+from app.platform_modules.services import TaskExecutionServices
 from app.real_run_gate import (
     RealRunGateBlocked,
     enforce_real_run_gate,
@@ -63,14 +57,24 @@ from app.services.external_action_intents import (
     renew_account_operation_lease,
     settle_action_intent,
 )
-from app.services.execution_evidence import materialize_for_shadow_task
 from app.safety import (
     AccountStatusPersistenceFailed,
     detect_page_risk,
     ensure_account_can_run,
     set_account_status,
 )
+from app.task_streams import (
+    LEGACY_TASK_GROUP_NAME,
+    LEGACY_TASK_STREAM_KEY,
+    SAFE_TERMINAL_FANOUT_ACK_DELETE_LUA,
+    SAFE_TERMINAL_TASK_ACK_DELETE_LUA,
+    TaskStreamBinding,
+    task_stream_bindings,
+    validate_task_stream_message,
+)
 from app.utils.log import structured_log
+from shared.redis_consumer_groups import verify_redis_consumer_group
+from app.worker_identity import WORKER_ID
 from app.utils.navigation_safety import (
     install_main_frame_navigation_guard,
     validated_platform_canonical_uri,
@@ -79,23 +83,12 @@ from app.utils.navigation_safety import (
 )
 from app.utils.cookies import credential_to_cookie_header, inject_account_cookies
 from app.utils.crypto import CREDENTIAL_AAD, cookie_vault
-from app.weibo.client import (
-    WeiboApiActionOutcomeUnknown,
-    WeiboApiClient,
-    WeiboApiRejected,
-    build_weibo_mutation_request,
-    status_identifier_from_canonical_uri,
+from shared.execution_contracts import (
+    LEGACY_FULL_EXECUTION_INTENT_KIND,
+    lease_operation_kind_for_execution_intent,
 )
-from app.weibo.credentials import (
-    WeiboOAuthCredentialError,
-    decrypt_weibo_rip,
-    parse_weibo_oauth_credential,
-    weibo_rip_required,
-)
-from app.weibo.executor import (
-    WeiboExecutionOutcomeUnknown,
-    WeiboOAuthExecutor,
-)
+from shared.platform_scope import normalize_platform_scope
+
 
 try:
     import fcntl
@@ -103,11 +96,185 @@ except ImportError:  # pragma: no cover - browser workers are deployed on Linux
     fcntl = None
 
 
-STREAM_KEY = "lottery_tasks"
-GROUP_NAME = "workers"
-WORKER_ID = os.getenv("HOSTNAME") or f"worker-{os.getpid()}"
+# Compatibility names stay available to tests/operational tooling, but no
+# platform runtime is imported while the Worker process boots.  A name is
+# resolved only when its platform path is selected (or a caller explicitly
+# asks for that legacy attribute).
+_LAZY_PLATFORM_SYMBOLS = {
+    "API_PREFLIGHT_KIND": ("app.bilibili.preflight", "API_PREFLIGHT_KIND"),
+    "bilibili_author_handle": (
+        "app.bilibili.preflight",
+        "bilibili_author_handle",
+    ),
+    "run_readonly_api_preflight": (
+        "app.bilibili.preflight",
+        "run_readonly_api_preflight",
+    ),
+    "BilibiliApiActionOutcomeUnknown": (
+        "app.bilibili.client",
+        "BilibiliApiActionOutcomeUnknown",
+    ),
+    "BilibiliApiClient": ("app.bilibili.client", "BilibiliApiClient"),
+    "BiliEngineConfig": ("app.bilibili.config", "BiliEngineConfig"),
+    "BilibiliApiExecutor": ("app.bilibili.executor", "BilibiliApiExecutor"),
+    "API_TO_DPMS_PHASE": ("app.bilibili.runtime", "API_TO_DPMS_PHASE"),
+    "account_status_for_results": (
+        "app.bilibili.runtime",
+        "account_status_for_results",
+    ),
+    "dpms_phases_to_api_actions": (
+        "app.bilibili.runtime",
+        "dpms_phases_to_api_actions",
+    ),
+    "extract_bilibili_dynamic_id": (
+        "app.bilibili.runtime",
+        "extract_bilibili_dynamic_id",
+    ),
+    "parse_detail_card": ("app.bilibili.runtime", "parse_detail_card"),
+    "validate_card_for_actions": (
+        "app.bilibili.runtime",
+        "validate_card_for_actions",
+    ),
+    "WeiboApiActionOutcomeUnknown": (
+        "app.weibo.client",
+        "WeiboApiActionOutcomeUnknown",
+    ),
+    "WeiboApiClient": ("app.weibo.client", "WeiboApiClient"),
+    "WeiboApiRejected": ("app.weibo.client", "WeiboApiRejected"),
+    "build_weibo_mutation_request": (
+        "app.weibo.client",
+        "build_weibo_mutation_request",
+    ),
+    "status_identifier_from_canonical_uri": (
+        "app.weibo.client",
+        "status_identifier_from_canonical_uri",
+    ),
+    "WeiboOAuthCredentialError": (
+        "app.weibo.credentials",
+        "WeiboOAuthCredentialError",
+    ),
+    "decrypt_weibo_rip": ("app.weibo.credentials", "decrypt_weibo_rip"),
+    "parse_weibo_oauth_credential": (
+        "app.weibo.credentials",
+        "parse_weibo_oauth_credential",
+    ),
+    "weibo_rip_required": (
+        "app.weibo.credentials",
+        "weibo_rip_required",
+    ),
+    "WeiboExecutionOutcomeUnknown": (
+        "app.weibo.executor",
+        "WeiboExecutionOutcomeUnknown",
+    ),
+    "WeiboOAuthExecutor": ("app.weibo.executor", "WeiboOAuthExecutor"),
+    "materialize_for_shadow_task": (
+        "app.services.execution_evidence",
+        "materialize_for_shadow_task",
+    ),
+}
+
+
+def _platform_runtime_symbol(name: str):
+    cached = globals().get(name)
+    if cached is not None:
+        return cached
+    try:
+        module_name, export_name = _LAZY_PLATFORM_SYMBOLS[name]
+    except KeyError as exc:
+        raise AttributeError(name) from exc
+    value = getattr(importlib.import_module(module_name), export_name)
+    globals()[name] = value
+    return value
+
+
+def __getattr__(name: str):
+    return _platform_runtime_symbol(name)
+
+
+def _task_execution_services() -> TaskExecutionServices:
+    """Build a narrow, immutable facade from the current shared services.
+
+    Constructing this at dispatch time preserves existing test/operations
+    monkey-patching of platform-neutral infrastructure without exposing the
+    rest of this orchestrator module to a platform implementation.
+    """
+
+    return TaskExecutionServices(
+        database=database,
+        WORKER_ID=WORKER_ID,
+        ActionPlanV2Error=ActionPlanV2Error,
+        AccountStatusPersistenceFailed=AccountStatusPersistenceFailed,
+        RealRunGateBlocked=RealRunGateBlocked,
+        StartedActionIntent=StartedActionIntent,
+        TaskClaimConflict=TaskClaimConflict,
+        TaskOwnershipLost=TaskOwnershipLost,
+        TaskSettlementUnconfirmed=TaskSettlementUnconfirmed,
+        _claim_positive_int=_claim_positive_int,
+        await_safety_settlement=await_safety_settlement,
+        canonical_json_bytes=canonical_json_bytes,
+        compute_target_hash=compute_target_hash,
+        credential_to_cookie_header=credential_to_cookie_header,
+        emergency_stop_real_runs_and_revoke_lease=(
+            emergency_stop_real_runs_and_revoke_lease
+        ),
+        enforce_task_real_run_gate=enforce_task_real_run_gate,
+        execute_browser_observation_shadow=(
+            execute_browser_observation_shadow
+        ),
+        execute_real_task=execute_real_task,
+        gate_execution_action_plan=gate_execution_action_plan,
+        gate_requested_actions=gate_requested_actions,
+        get_latest_phase=get_latest_phase,
+        load_account_credential=load_account_credential,
+        mark_action_intent_unknown=mark_action_intent_unknown,
+        open_unknown_outcome_breaker=open_unknown_outcome_breaker,
+        parse_json_field=parse_json_field,
+        prepare_and_start_action_intent=prepare_and_start_action_intent,
+        quarantine_external_action_outcome=(
+            quarantine_external_action_outcome
+        ),
+        record_event=record_event,
+        refresh_task_lease=refresh_task_lease,
+        renew_account_operation_lease=renew_account_operation_lease,
+        row_get=row_get,
+        save_phase=save_phase,
+        set_account_status=set_account_status,
+        settle_action_intent=settle_action_intent,
+        structured_log=structured_log,
+        validate_action_plan_v2=validate_action_plan_v2,
+        cookie_vault=cookie_vault,
+        CREDENTIAL_AAD=CREDENTIAL_AAD,
+    )
+
+
+# Compatibility aliases for tests and operational tooling that still inspect
+# the historical queue during the migration drain.
+STREAM_KEY = LEGACY_TASK_STREAM_KEY
+GROUP_NAME = LEGACY_TASK_GROUP_NAME
 CONSUMER_NAME = WORKER_ID
-PHASE_ORDER = ["followed", "liked", "commented", "reposted"]
+# Every platform stream has its own bounded local/Pending Entry List footprint.
+# The per-platform limits are intentionally independent, so saturation or a
+# slow task in one durable lane cannot consume another platform's read budget.
+TASK_DISPATCH_MAX_INFLIGHT = 32
+TASK_STREAM_READ_COUNT = 8
+# Core recovery examines entries after 120 seconds of PEL idleness.  Refresh
+# only entries which are waiting for a platform lane; running entries must keep
+# using the authoritative DB lease/worker-heartbeat recovery semantics.
+TASK_PENDING_REFRESH_SECONDS = 30
+TASK_LANE_HEALTH_CONTRACT_VERSION = 2
+TASK_LANE_HEALTH_RECENT_SECONDS = 45
+TASK_LANE_HEALTH_PROGRESS_INTERVAL_SECONDS = 10
+TASK_LANE_HEALTH_MAX_REPORTED_AGE_SECONDS = 86_400
+TASK_LANE_HEALTH_MAX_CONSECUTIVE_FAILURES = 1_000_000
+TASK_LANE_LOOP_PROGRESS_OPERATIONS = frozenset(
+    {"capacity_wait", "capacity_available", "shutdown"}
+)
+LEGACY_SOURCE_STREAM_FIELD = "legacy_source_stream"
+LEGACY_SOURCE_MESSAGE_ID_FIELD = "legacy_source_message_id"
+_REDIS_STREAM_ID_RE = re.compile(r"^[0-9]+-[0-9]+$")
+# Compatibility aliases for existing recovery/tests. The authoritative orders
+# now belong to the independent platform modules.
+PHASE_ORDER = list(BILIBILI_ACTION_ORDER)
 DOUYIN_PHASE_ORDER = list(DOUYIN_ACTION_ORDER)
 WEIBO_PHASE_ORDER = list(WEIBO_ACTION_ORDER)
 XIAOHONGSHU_PHASE_ORDER = list(XIAOHONGSHU_REQUIRED_ACTIONS)
@@ -125,13 +292,234 @@ MAX_EVIDENCE_SCREENSHOT_HEIGHT = 20000
 MAX_EVIDENCE_SCREENSHOT_PIXELS = 40_000_000
 
 
+@dataclass
+class _TaskLaneHealthState:
+    binding: TaskStreamBinding
+    last_success_monotonic: float | None = None
+    last_success_operation: str | None = None
+    last_loop_progress_monotonic: float | None = None
+    last_loop_progress_operation: str | None = None
+    inflight_count: int = 0
+    last_error_monotonic: float | None = None
+    last_error_operation: str | None = None
+    last_error_type: str | None = None
+    consecutive_failures: int = 0
+
+
+def _new_task_lane_health_states() -> dict[str, _TaskLaneHealthState]:
+    return {
+        binding.stream_key: _TaskLaneHealthState(binding=binding)
+        for binding in task_stream_bindings(include_legacy=False)
+    }
+
+
+_TASK_LANE_HEALTH = _new_task_lane_health_states()
+
+
+def _safe_lane_health_label(value, *, maximum: int) -> str:
+    normalized = re.sub(
+        r"[^A-Za-z0-9_.:-]",
+        "_",
+        str(value or ""),
+    )
+    return normalized[:maximum]
+
+
+def _task_lane_state(binding: TaskStreamBinding) -> _TaskLaneHealthState:
+    state = _TASK_LANE_HEALTH.get(binding.stream_key)
+    if state is None or state.binding != binding:
+        state = _TaskLaneHealthState(binding=binding)
+        _TASK_LANE_HEALTH[binding.stream_key] = state
+    return state
+
+
+def _record_task_lane_success(
+    binding: TaskStreamBinding,
+    operation: str,
+) -> None:
+    """Record a successful Redis lane operation without retaining payloads."""
+
+    state = _task_lane_state(binding)
+    state.last_success_monotonic = time.monotonic()
+    state.last_success_operation = _safe_lane_health_label(
+        operation,
+        maximum=32,
+    )
+    state.consecutive_failures = 0
+
+
+def _record_task_lane_failure(
+    binding: TaskStreamBinding,
+    operation: str,
+    exc: BaseException,
+) -> None:
+    """Record bounded, non-secret failure metadata for one exact task lane."""
+
+    state = _task_lane_state(binding)
+    state.last_error_monotonic = time.monotonic()
+    state.last_error_operation = _safe_lane_health_label(
+        operation,
+        maximum=32,
+    )
+    state.last_error_type = _safe_lane_health_label(
+        type(exc).__name__ or "Exception",
+        maximum=64,
+    )
+    state.consecutive_failures = min(
+        state.consecutive_failures + 1,
+        TASK_LANE_HEALTH_MAX_CONSECUTIVE_FAILURES,
+    )
+
+
+def _record_task_lane_loop_progress(
+    binding: TaskStreamBinding,
+    operation: str,
+    *,
+    inflight_count: int,
+) -> None:
+    """Record bounded loop-liveness evidence without retaining task data."""
+
+    if operation not in TASK_LANE_LOOP_PROGRESS_OPERATIONS:
+        raise ValueError("invalid_task_lane_loop_progress_operation")
+    if (
+        isinstance(inflight_count, bool)
+        or not isinstance(inflight_count, int)
+        or not 0 <= inflight_count <= TASK_DISPATCH_MAX_INFLIGHT
+    ):
+        raise ValueError("invalid_task_lane_inflight_count")
+    state = _task_lane_state(binding)
+    state.last_loop_progress_monotonic = time.monotonic()
+    state.last_loop_progress_operation = operation
+    state.inflight_count = inflight_count
+
+
+def _reported_lane_age(
+    now: float,
+    observed_at: float | None,
+) -> int | None:
+    if observed_at is None:
+        return None
+    return min(
+        max(0, int(now - observed_at)),
+        TASK_LANE_HEALTH_MAX_REPORTED_AGE_SECONDS,
+    )
+
+
+def task_lane_health_snapshot(platforms=None) -> dict:
+    """Return a JSON-safe, bounded snapshot of every durable task lane.
+
+    A lane becomes dispatch-ready only after its own ``XREADGROUP`` succeeds.
+    Merely creating the group is insufficient because Redis can retain a
+    consumer with the same hostname across a Worker restart.  Contract v2
+    distinguishes that Redis evidence from a bounded, periodically refreshed
+    capacity-wait observation.  The latter keeps a genuinely saturated lane
+    healthy without pretending that another Redis read occurred.
+    """
+
+    if platforms is None:
+        selected_platforms = None
+    elif isinstance(platforms, str):
+        selected_platforms = frozenset(
+            normalize_platform_scope(platforms)
+        )
+    else:
+        platform_values = tuple(platforms)
+        selected_platforms = (
+            frozenset(normalize_platform_scope(platform_values))
+            if platform_values
+            else frozenset()
+        )
+    now = time.monotonic()
+    lanes = []
+    for stream_key in sorted(_TASK_LANE_HEALTH):
+        state = _TASK_LANE_HEALTH[stream_key]
+        binding = state.binding
+        if (
+            selected_platforms is not None
+            and binding.platform not in selected_platforms
+        ):
+            continue
+        success_age = _reported_lane_age(
+            now,
+            state.last_success_monotonic,
+        )
+        error_age = _reported_lane_age(
+            now,
+            state.last_error_monotonic,
+        )
+        loop_progress_age = _reported_lane_age(
+            now,
+            state.last_loop_progress_monotonic,
+        )
+        recent_read = bool(
+            state.last_success_operation == "xreadgroup"
+            and success_age is not None
+            and success_age <= TASK_LANE_HEALTH_RECENT_SECONDS
+        )
+        saturated_progress = bool(
+            state.last_success_operation == "xreadgroup"
+            and success_age is not None
+            and state.last_loop_progress_operation == "capacity_wait"
+            and loop_progress_age is not None
+            and loop_progress_age <= TASK_LANE_HEALTH_RECENT_SECONDS
+            and state.inflight_count == TASK_DISPATCH_MAX_INFLIGHT
+        )
+        healthy = bool(
+            state.consecutive_failures == 0
+            and (recent_read or saturated_progress)
+        )
+        status = (
+            "healthy"
+            if healthy
+            else (
+                "degraded"
+                if state.last_error_monotonic is not None
+                or state.last_success_operation == "xreadgroup"
+                else "starting"
+            )
+        )
+        lanes.append(
+            {
+                "stream": binding.stream_key,
+                "group": binding.group_name,
+                "platform": binding.platform,
+                "repair": bool(binding.repair),
+                "protocol_version": binding.protocol_version,
+                "status": status,
+                "last_success_operation": (
+                    state.last_success_operation
+                ),
+                "last_success_age_seconds": success_age,
+                "last_loop_progress_operation": (
+                    state.last_loop_progress_operation
+                ),
+                "last_loop_progress_age_seconds": loop_progress_age,
+                "inflight_count": state.inflight_count,
+                "inflight_limit": TASK_DISPATCH_MAX_INFLIGHT,
+                "saturated": (
+                    state.inflight_count
+                    == TASK_DISPATCH_MAX_INFLIGHT
+                ),
+                "last_error_operation": state.last_error_operation,
+                "last_error_type": state.last_error_type,
+                "last_error_age_seconds": error_age,
+                "consecutive_failures": state.consecutive_failures,
+            }
+        )
+    return {
+        "contract_version": TASK_LANE_HEALTH_CONTRACT_VERSION,
+        "lanes": lanes,
+    }
+
+
+def _reset_task_lane_health_for_tests() -> None:
+    """Reset process-local observations; production never calls this helper."""
+
+    _TASK_LANE_HEALTH.clear()
+    _TASK_LANE_HEALTH.update(_new_task_lane_health_states())
+
+
 class TaskAlreadyTerminal(Exception):
-    pass
-
-
-class BilibiliForwardedTargetRequiresReview(RuntimeError):
-    """The API target differs from the dynamic that the operator reviewed."""
-
     pass
 
 
@@ -159,28 +547,6 @@ class TaskOwnershipLost(Exception):
 
 class InvalidTaskMessage(Exception):
     pass
-
-
-class BilibiliActionSettlementFailed(RuntimeError):
-    """The API result is known, but its local audit settlement did not finish."""
-
-    def __init__(self, action: str, action_result, cause: BaseException) -> None:
-        self.action = action
-        self.action_result = action_result
-        self.reason = "confirmed_result_persistence_failed"
-        super().__init__(f"bilibili_action_settlement_failed:{action}:{type(cause).__name__}")
-
-
-class ExternalActionOutcomeUnknown(RuntimeError):
-    """A browser mutation may have happened but was not durably settled."""
-
-    def __init__(self, platform: str, action: str, cause: BaseException) -> None:
-        self.platform = str(platform or "unknown").strip().lower() or "unknown"
-        self.action = str(action or "unknown").strip().lower() or "unknown"
-        self.reason = f"{self.platform}_{self.action}_outcome_unknown"
-        super().__init__(
-            f"external_action_outcome_unknown:{self.platform}:{self.action}:{type(cause).__name__}"
-        )
 
 
 class TaskSettlementUnconfirmed(RuntimeError):
@@ -236,6 +602,22 @@ async def enforce_task_real_run_gate(task: dict, *, require_running: bool = Fals
     return snapshot
 
 
+def gate_execution_action_plan(snapshot):
+    """Return the exact task subset from a validated gate snapshot.
+
+    The fallback keeps older test doubles and third-party read-only
+    instrumentation compatible.  Production snapshots always carry the
+    independently validated ``execution_action_plan`` field.
+    """
+
+    return getattr(snapshot, "execution_action_plan", snapshot.action_plan)
+
+
+def gate_requested_actions(snapshot) -> tuple[str, ...]:
+    plan = gate_execution_action_plan(snapshot)
+    return tuple(getattr(snapshot, "requested_actions", plan.required_actions))
+
+
 def row_get(row, key: str, default=None):
     if row is None:
         return default
@@ -262,34 +644,19 @@ async def get_completed_bilibili_phases(
     lottery_id: int,
     dynamic_id: str,
 ) -> set[str]:
-    """Load successful actions only when their full task binding is exact."""
+    """Compatibility facade into Bilibili-owned ledger validation."""
 
-    rows = await database.fetch_all(
-        """SELECT account_id, lottery_id, dynamic_id, action, phase
-           FROM bilibili_action_ledger
-           WHERE task_id = :task_id AND ok = 1 AND outcome = 'ok'""",
-        {"task_id": task_id},
+    from app.platform_modules.bilibili import (
+        _get_completed_bilibili_phases_owned as owned_loader,
     )
-    completed: set[str] = set()
-    for row in rows:
-        phase = str(row_get(row, "phase", "") or "").strip().lower()
-        if phase not in PHASE_ORDER:
-            raise RuntimeError("bilibili_action_ledger_phase_invalid")
-        action = str(row_get(row, "action", "") or "").strip().lower()
-        try:
-            ledger_account_id = int(row_get(row, "account_id", 0) or 0)
-            ledger_lottery_id = int(row_get(row, "lottery_id", 0) or 0)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("bilibili_action_ledger_binding_invalid") from exc
-        if (
-            ledger_account_id != account_id
-            or ledger_lottery_id != lottery_id
-            or str(row_get(row, "dynamic_id", "") or "").strip() != dynamic_id
-            or API_TO_DPMS_PHASE.get(action) != phase
-        ):
-            raise RuntimeError("bilibili_action_ledger_binding_invalid")
-        completed.add(phase)
-    return completed
+
+    return await owned_loader(
+        task_id,
+        account_id=account_id,
+        lottery_id=lottery_id,
+        dynamic_id=dynamic_id,
+        runtime=_task_execution_services(),
+    )
 
 
 async def refresh_task_lease(task_id: str):
@@ -345,43 +712,25 @@ async def save_bilibili_action_ledger(
     message: str | None,
     ok: bool,
 ):
-    try:
-        await database.execute(
-            """INSERT INTO bilibili_action_ledger
-                 (task_id, account_id, lottery_id, dynamic_id, action, phase, code, outcome, message, ok, task_mode, source)
-               VALUES
-                 (:task_id, :account_id, :lottery_id, :dynamic_id, :action, :phase, :code, :outcome, :message, :ok, 'real_run', 'api_real_run')
-               ON DUPLICATE KEY UPDATE
-                 dynamic_id = VALUES(dynamic_id),
-                 phase = VALUES(phase),
-                 code = VALUES(code),
-                 outcome = VALUES(outcome),
-                 message = VALUES(message),
-                 ok = VALUES(ok),
-                 updated_at = CURRENT_TIMESTAMP""",
-            {
-                "task_id": task_id,
-                "account_id": account_id,
-                "lottery_id": lottery_id,
-                "dynamic_id": dynamic_id,
-                "action": action,
-                "phase": phase,
-                "code": code,
-                "outcome": outcome,
-                "message": message,
-                "ok": 1 if ok else 0,
-            },
-        )
-    except Exception as exc:
-        structured_log(
-            "warning",
-            "bilibili_action_ledger_write_failed",
-            task_id=task_id,
-            lottery_id=lottery_id,
-            action=action,
-            error=str(exc),
-        )
-        raise
+    """Compatibility facade into Bilibili-owned ledger persistence."""
+
+    from app.platform_modules.bilibili import (
+        _save_bilibili_action_ledger_owned as owned_writer,
+    )
+
+    return await owned_writer(
+        task_id=task_id,
+        account_id=account_id,
+        lottery_id=lottery_id,
+        dynamic_id=dynamic_id,
+        action=action,
+        phase=phase,
+        code=code,
+        outcome=outcome,
+        message=message,
+        ok=ok,
+        runtime=_task_execution_services(),
+    )
 
 
 async def persist_bilibili_action_result(
@@ -393,40 +742,21 @@ async def persist_bilibili_action_result(
     action: str,
     action_result,
 ) -> None:
-    """Durably settle one confirmed API result before another mutation starts."""
+    """Compatibility facade into Bilibili-owned result settlement."""
 
-    phase = API_TO_DPMS_PHASE.get(action)
-    await save_bilibili_action_ledger(
+    from app.platform_modules.bilibili import (
+        _persist_bilibili_action_result_owned as owned_settlement,
+    )
+
+    await owned_settlement(
         task_id=task_id,
         account_id=account_id,
         lottery_id=lottery_id,
         dynamic_id=dynamic_id,
         action=action,
-        phase=phase,
-        code=action_result.code,
-        outcome=action_result.outcome.value,
-        message=action_result.message,
-        ok=action_result.ok,
+        action_result=action_result,
+        runtime=_task_execution_services(),
     )
-    event_id = await record_event(
-        aggregate="task",
-        aggregate_id=task_id,
-        event_type="BilibiliApiActionCompleted",
-        payload={
-            "account_id": account_id,
-            "lottery_id": lottery_id,
-            "dynamic_id": dynamic_id,
-            "action": action,
-            "code": action_result.code,
-            "outcome": action_result.outcome.value,
-            "message": action_result.message,
-        },
-        correlation_id=task_id,
-    )
-    if not event_id:
-        raise RuntimeError("bilibili_action_event_persistence_failed")
-    if phase and action_result.ok:
-        await save_phase(task_id, account_id, lottery_id, phase)
 
 
 async def mark_task_started(
@@ -486,12 +816,31 @@ async def mark_task_started(
         ):
             raise TaskClaimConflict(f"Lottery {binding.lottery_id} is not claimable by {task_id}")
         platform = str(row_get(lottery, "platform") or "").strip().lower()
-        # Selector configuration is evidence for observation-only shadow runs.
-        # Official OAuth/API real paths bind their own immutable capability and
-        # endpoint contracts and must never inherit browser selector state.
-        needs_selector_binding = task_mode == "shadow_run" and platform != "bilibili"
-        if task_mode == "shadow_run" and platform == "bilibili":
-            await validate_bilibili_api_shadow_claim(
+        if isinstance(task_message, dict):
+            message_platform = str(
+                task_message.get("platform") or ""
+            ).strip().lower()
+            if not message_platform or message_platform != platform:
+                # Redis is a delivery channel, not the platform authority.  In
+                # particular, a dry-run message must not be able to select a
+                # peer module and then settle the locked lottery/account rows.
+                raise TaskClaimConflict("task_message_platform_mismatch")
+        # Selector-driven paths bind the untrusted delivery message to the
+        # current authoritative selector snapshot before account state can be
+        # changed. Official OAuth/API paths opt out through their path metadata.
+        try:
+            platform_module = get_platform_module(platform)
+            execution_path, _ = platform_module.route(
+                task_mode, row_get(lottery, "action_plan")
+            )
+            needs_selector_binding = platform_module.requires_selector_binding(
+                task_mode, row_get(lottery, "action_plan")
+            )
+        except PlatformRoutingError as exc:
+            raise TaskClaimConflict(exc.code) from exc
+        if task_mode == "shadow_run":
+            await execution_path.validate_shadow_claim(
+                runtime=_task_execution_services(),
                 task_message=task_message,
                 task_row=row,
                 lottery=lottery,
@@ -509,7 +858,11 @@ async def mark_task_started(
             if selector_row:
                 persisted_selectors = parse_json_field(row_get(selector_row, "config_json"))
                 if not isinstance(persisted_selectors, dict):
-                    raise TaskClaimConflict("shadow_task_selector_config_invalid")
+                    raise TaskClaimConflict(
+                        "shadow_task_selector_config_invalid"
+                        if task_mode == "shadow_run"
+                        else "task_selector_config_invalid"
+                    )
                 authoritative_selectors = persisted_selectors
             if task_mode == "shadow_run":
                 validate_shadow_task_binding(task_message, lottery)
@@ -520,6 +873,13 @@ async def mark_task_started(
             or str(row_get(account, "status") or "").strip().lower() != "ready"
         ):
             raise TaskClaimConflict(f"Account {binding.account_id} is not ready")
+        account_platform = str(row_get(account, "platform") or "").strip().lower()
+        if account_platform != platform:
+            # The queue message is not authoritative, and even a valid
+            # task_run can be backed by historic/corrupt cross-platform data.
+            # Re-check the locked account and lottery rows before changing
+            # either status so dry/shadow tasks cannot cross platform bounds.
+            raise TaskClaimConflict("task_account_platform_mismatch")
 
         await database.execute(
             """UPDATE task_runs
@@ -596,136 +956,19 @@ async def validate_bilibili_api_shadow_claim(
     lottery,
     account,
 ) -> None:
-    """Bind Bilibili Shadow to one immutable API contract and active lease."""
+    """Compatibility facade into Bilibili-owned claim validation."""
 
-    if not isinstance(task_message, dict):
-        raise TaskClaimConflict("shadow_task_message_missing")
-    try:
-        authoritative_plan = validate_action_plan_v2(
-            row_get(lottery, "action_plan"), reject_media=True
-        )
-        message_plan = validate_action_plan_v2(
-            task_message.get("action_plan"), reject_media=True
-        )
-    except ActionPlanV2Error as exc:
-        raise TaskClaimConflict(f"shadow_task_{exc.code}") from exc
-    if (
-        authoritative_plan.execution_path_id != BILIBILI_API_EXECUTION_PATH
-        or message_plan.execution_path_id != BILIBILI_API_EXECUTION_PATH
-        or canonical_json_bytes(authoritative_plan.plan)
-        != canonical_json_bytes(message_plan.plan)
-    ):
-        raise TaskClaimConflict("shadow_task_action_plan_mismatch")
+    from app.platform_modules.bilibili import (
+        validate_bilibili_api_shadow_claim as owned_validator,
+    )
 
-    canonical_url = str(row_get(lottery, "canonical_url") or "").strip()
-    target_hash = compute_target_hash(canonical_url)
-    execution_revision = _claim_positive_int(
-        row_get(account, "execution_revision"),
-        "shadow_task_execution_revision_invalid",
+    await owned_validator(
+        runtime=_task_execution_services(),
+        task_message=task_message,
+        task_row=task_row,
+        lottery=lottery,
+        account=account,
     )
-    if (
-        _claim_positive_int(
-            task_message.get("execution_revision"),
-            "shadow_task_execution_revision_invalid",
-        )
-        != execution_revision
-    ):
-        raise TaskClaimConflict("shadow_task_execution_revision_mismatch")
-    config_hash = compute_bilibili_api_config_hash(execution_revision)
-    snapshot_id = _claim_positive_int(
-        row_get(lottery, "authoritative_rule_snapshot_id"),
-        "shadow_task_rule_snapshot_binding_invalid",
-    )
-    task_snapshot_id = _claim_positive_int(
-        row_get(task_row, "rule_snapshot_id"),
-        "shadow_task_rule_snapshot_binding_invalid",
-    )
-    message_snapshot_id = _claim_positive_int(
-        task_message.get("rule_snapshot_id"),
-        "shadow_task_rule_snapshot_binding_invalid",
-    )
-    exact_strings = (
-        ("platform", str(task_message.get("platform") or "").strip().lower(), "bilibili"),
-        ("raw_url", str(task_message.get("raw_url") or "").strip(), str(row_get(lottery, "raw_url") or "").strip()),
-        ("canonical_url", str(task_message.get("canonical_url") or "").strip(), canonical_url),
-        ("rule_hash", str(task_message.get("rule_hash") or "").strip(), authoritative_plan.rule_hash),
-        ("action_plan_hash", str(task_message.get("action_plan_hash") or "").strip(), authoritative_plan.plan_hash),
-        ("execution_path_id", str(task_message.get("execution_path_id") or "").strip(), BILIBILI_API_EXECUTION_PATH),
-        ("target_hash", str(task_message.get("target_hash") or "").strip(), target_hash),
-        ("config_hash", str(task_message.get("config_hash") or "").strip(), config_hash),
-    )
-    for field, message_value, expected in exact_strings:
-        if not message_value or message_value != expected:
-            raise TaskClaimConflict(f"shadow_task_{field}_mismatch")
-    if (
-        snapshot_id != task_snapshot_id
-        or task_snapshot_id != message_snapshot_id
-        or message_snapshot_id != authoritative_plan.rule_snapshot_id
-        or str(row_get(task_row, "rule_hash") or "").strip() != authoritative_plan.rule_hash
-        or str(row_get(lottery, "rule_hash") or "").strip() != authoritative_plan.rule_hash
-        or str(row_get(task_row, "action_plan_hash") or "").strip() != authoritative_plan.plan_hash
-        or str(row_get(lottery, "action_plan_hash") or "").strip() != authoritative_plan.plan_hash
-        or str(row_get(task_row, "execution_path_id") or "").strip()
-        != BILIBILI_API_EXECUTION_PATH
-        or str(row_get(task_row, "target_hash") or "").strip() != target_hash
-        or str(row_get(task_row, "config_hash") or "").strip() != config_hash
-        or str(row_get(account, "platform") or "").strip().lower() != "bilibili"
-    ):
-        raise TaskClaimConflict("shadow_task_api_binding_mismatch")
-
-    lease_id = str(row_get(task_row, "account_lease_id") or "").strip()
-    lease_generation = _claim_positive_int(
-        row_get(task_row, "account_lease_generation"),
-        "shadow_task_account_lease_binding_invalid",
-    )
-    if (
-        str(task_message.get("account_lease_id") or "").strip() != lease_id
-        or _claim_positive_int(
-            task_message.get("account_lease_generation"),
-            "shadow_task_account_lease_binding_invalid",
-        )
-        != lease_generation
-    ):
-        raise TaskClaimConflict("shadow_task_account_lease_binding_invalid")
-    lease = await database.fetch_one(
-        """SELECT lease_id, account_id, generation, operation_kind, owner_id, task_id,
-                  CASE WHEN expires_at > NOW() THEN 1 ELSE 0 END AS lease_active,
-                  CASE WHEN released_at IS NULL THEN 1 ELSE 0 END AS lease_unreleased,
-                  CASE WHEN generation = (
-                    SELECT MAX(newest.generation) FROM account_operation_leases newest
-                    WHERE newest.account_id = :account_id
-                  ) THEN 1 ELSE 0 END AS lease_latest_generation,
-                  (SELECT COUNT(*) FROM account_operation_leases live
-                   WHERE live.account_id = :account_id AND live.released_at IS NULL
-                     AND live.expires_at > NOW()) AS active_account_lease_count
-           FROM account_operation_leases
-           WHERE lease_id = :lease_id AND account_id = :account_id
-             AND generation = :generation
-           FOR UPDATE""",
-        {
-            "lease_id": lease_id,
-            "account_id": _claim_positive_int(row_get(task_row, "account_id"), "shadow_task_account_binding_invalid"),
-            "generation": lease_generation,
-        },
-    )
-    task_id = str(row_get(task_row, "task_id") or "").strip()
-    if (
-        not lease
-        or str(row_get(lease, "lease_id") or "").strip() != lease_id
-        or _claim_positive_int(row_get(lease, "account_id"), "shadow_task_account_lease_binding_invalid")
-        != _claim_positive_int(row_get(task_row, "account_id"), "shadow_task_account_binding_invalid")
-        or _claim_positive_int(row_get(lease, "generation"), "shadow_task_account_lease_binding_invalid")
-        != lease_generation
-        or str(row_get(lease, "operation_kind") or "").strip().lower() != "shadow_run"
-        or str(row_get(lease, "owner_id") or "").strip() != task_id
-        or str(row_get(lease, "task_id") or "").strip() != task_id
-        or int(row_get(lease, "lease_active", 0) or 0) != 1
-        or int(row_get(lease, "lease_unreleased", 0) or 0) != 1
-        or int(row_get(lease, "lease_latest_generation", 0) or 0) != 1
-        or int(row_get(lease, "active_account_lease_count", 0) or 0) != 1
-        or int(row_get(task_row, "reconciliation_required", 0) or 0) != 0
-    ):
-        raise TaskClaimConflict("shadow_task_account_lease_binding_invalid")
 
 
 def validate_shadow_task_binding(task: dict | None, lottery) -> None:
@@ -749,10 +992,16 @@ def validate_shadow_task_binding(task: dict | None, lottery) -> None:
     if message_plan != authoritative_plan:
         raise TaskClaimConflict("shadow_task_action_plan_mismatch")
 
-    manual_platform = str(
-        row_get(lottery, "platform") or ""
-    ).strip().lower()
-    if manual_platform in {"douyin", "weibo", "xiaohongshu"}:
+    manual_platform = str(row_get(lottery, "platform") or "").strip().lower()
+    try:
+        platform_module = get_platform_module(manual_platform)
+        platform_module.route("shadow_run", authoritative_plan)
+    except PlatformRoutingError as exc:
+        raise TaskClaimConflict(exc.code) from exc
+    if platform_module.requires_selector_binding(
+        "shadow_run",
+        authoritative_plan,
+    ):
         if any(
             str(plan.get("platform") or "").strip().lower() != manual_platform
             for plan in (authoritative_plan, message_plan)
@@ -781,8 +1030,45 @@ def validate_task_selector_binding(task: dict | None, authoritative_selectors: d
         raise TaskClaimConflict("task_selector_config_mismatch")
 
 
+def _settlement_requested_actions(plan, execution_binding) -> tuple[str, ...] | None:
+    """Resolve the exact DB-bound action set whose effects close this task."""
+
+    if execution_binding is None:
+        # Narrow compatibility for a pre-contract full task.  The real-run gate
+        # has already required its trusted legacy fanout + Outbox authority.
+        return tuple(plan.required_actions)
+    kind = str(row_get(execution_binding, "binding_kind") or "").strip().lower()
+    requested = parse_json_field(
+        row_get(execution_binding, "requested_actions")
+    )
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or any(not isinstance(action, str) for action in requested)
+        or len(requested) != len(set(requested))
+        or str(
+            row_get(execution_binding, "evidence_action_plan_hash") or ""
+        ).strip()
+        != plan.plan_hash
+    ):
+        return None
+    selected = set(requested)
+    ordered = tuple(
+        action for action in plan.required_actions if action in selected
+    )
+    if tuple(requested) != ordered or not selected.issubset(
+        set(plan.required_actions)
+    ):
+        return None
+    if kind == "full":
+        return ordered if ordered == tuple(plan.required_actions) else None
+    if kind == "repair":
+        return ordered if len(ordered) < len(plan.required_actions) else None
+    return None
+
+
 def _real_success_intents_match_reviewed_plan(
-    *, task_row, lottery, intent_rows
+    *, task_row, lottery, intent_rows, execution_binding=None
 ) -> bool:
     """Prove every reviewed API mutation has one confirmed durable intent.
 
@@ -792,7 +1078,9 @@ def _real_success_intents_match_reviewed_plan(
     """
 
     platform = str(row_get(lottery, "platform") or "").strip().lower()
-    if platform not in {"bilibili", "weibo"}:
+    try:
+        platform_module = get_platform_module(platform)
+    except PlatformRoutingError:
         return False
     try:
         plan = validate_action_plan_v2(
@@ -802,13 +1090,14 @@ def _real_success_intents_match_reviewed_plan(
         return False
     task_plan_hash = str(row_get(task_row, "action_plan_hash") or "").strip()
     lottery_plan_hash = str(row_get(lottery, "action_plan_hash") or "").strip()
-    expected_execution_path = (
-        BILIBILI_API_EXECUTION_PATH
-        if platform == "bilibili"
-        else WEIBO_OAUTH_EXECUTION_PATH
-    )
+    try:
+        execution_path, _ = platform_module.route("real_run", plan.plan)
+    except PlatformRoutingError:
+        return False
+    if not execution_path.confirmed_intent_settlement:
+        return False
     if (
-        plan.execution_path_id != expected_execution_path
+        plan.execution_path_id != execution_path.path_id
         or str(plan.plan.get("platform") or "").strip().lower() != platform
         or not task_plan_hash
         or task_plan_hash != plan.plan_hash
@@ -816,14 +1105,19 @@ def _real_success_intents_match_reviewed_plan(
     ):
         return False
 
-    if platform == "bilibili":
-        try:
-            expected_actions = dpms_phases_to_api_actions(list(plan.required_actions))
-        except (TypeError, ValueError):
-            return False
-    else:
-        expected_actions = list(plan.required_actions)
-    if not expected_actions or len(expected_actions) != len(plan.required_actions):
+    requested_actions = _settlement_requested_actions(
+        plan,
+        execution_binding,
+    )
+    if requested_actions is None:
+        return False
+    try:
+        expected_actions = platform_module.expected_intent_actions(
+            list(requested_actions)
+        )
+    except (TypeError, ValueError):
+        return False
+    if not expected_actions or len(expected_actions) != len(requested_actions):
         return False
     observed_actions: list[str] = []
     observed_intent_ids: list[str] = []
@@ -923,7 +1217,34 @@ async def mark_task_finished(
 
         intent_rows = []
         intent_statuses: list[tuple[str, str]] = []
+        execution_binding = None
+        lease_operation_kind = binding.task_mode
         if binding.task_mode == "real_run":
+            execution_binding = await database.fetch_one(
+                """SELECT binding_kind, requested_actions,
+                          evidence_action_plan_hash
+                   FROM task_execution_intent_bindings
+                   WHERE task_id = :task_id
+                   FOR UPDATE""",
+                {"task_id": task_id},
+            )
+            execution_intent_kind = str(
+                row_get(execution_binding, "binding_kind")
+                or LEGACY_FULL_EXECUTION_INTENT_KIND
+            )
+            try:
+                lease_operation_kind = (
+                    lease_operation_kind_for_execution_intent(
+                        execution_intent_kind
+                    )
+                )
+            except ValueError as exc:
+                raise TaskSettlementUnconfirmed(
+                    task_id,
+                    RuntimeError(
+                        "execution_intent_lease_operation_kind_invalid"
+                    ),
+                ) from exc
             intent_rows = await database.fetch_all(
                 """SELECT intent_id, action, status, effect_certainty
                    FROM external_action_intents
@@ -949,16 +1270,13 @@ async def mark_task_finished(
             expected_certainty.get(status) != certainty
             for status, certainty in intent_statuses
         )
-        any_succeeded = any(
-            certainty == "confirmed_effect" for _status, certainty in intent_statuses
-        )
         any_started_or_unknown = any(
             certainty == "unknown" for _status, certainty in intent_statuses
         )
-        partial_real_failure = (
+        ambiguous_real_failure = (
             binding.task_mode == "real_run"
             and not success
-            and (any_succeeded or any_started_or_unknown)
+            and any_started_or_unknown
         )
         inconsistent_real_success = bool(
             binding.task_mode == "real_run"
@@ -967,11 +1285,12 @@ async def mark_task_finished(
                 task_row=row,
                 lottery=lottery,
                 intent_rows=intent_rows,
+                execution_binding=execution_binding,
             )
         )
         real_reconciliation_required = bool(
             quarantine_account and not success and binding.task_mode == "real_run"
-        ) or partial_real_failure or inconsistent_real_success or invalid_intent_state or int(
+        ) or ambiguous_real_failure or inconsistent_real_success or invalid_intent_state or int(
             row_get(row, "reconciliation_required", 0) or 0
         ) == 1
         if inconsistent_real_success:
@@ -1067,8 +1386,9 @@ async def mark_task_finished(
                 task_id, RuntimeError("account_operation_lease_binding_missing")
             )
         # Read-only tasks and known real terminal outcomes release precisely the
-        # generation they owned. Ambiguous/partially successful real failures
-        # retain the append-only lease and lottery lock for reconciliation.
+        # generation they owned. A confirmed partial result is safe to expose
+        # to the missing-action Repair path; only ambiguous or inconsistent
+        # real outcomes retain the append-only lease and lottery lock.
         if not (binding.task_mode == "real_run" and real_reconciliation_required):
             await database.execute(
                 """UPDATE account_operation_leases
@@ -1082,7 +1402,7 @@ async def mark_task_finished(
                     "lease_id": lease_id,
                     "generation": lease_generation,
                     "task_id": task_id,
-                    "operation_kind": binding.task_mode,
+                    "operation_kind": lease_operation_kind,
                 },
             )
             lease = await database.fetch_one(
@@ -1170,28 +1490,24 @@ async def execute_dry_run(
     platform: str = "",
     action_plan=None,
 ):
-    normalized_platform = str(platform or "").strip().lower()
-    if normalized_platform == "weibo":
+    normalized_platform = str(platform or "bilibili").strip().lower()
+    try:
+        platform_module = get_platform_module(normalized_platform)
+        execution_path, _ = platform_module.route("dry_run", action_plan)
+    except PlatformRoutingError as exc:
+        raise RuntimeError(exc.code) from exc
+    if execution_path.dry_run_requires_executable_plan:
         try:
-            preliminary_plan = validate_action_plan_v2(
-                action_plan,
-                require_executable=False,
-                reject_media=True,
-            )
-            if preliminary_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
-                raise RuntimeError("weibo_manual_shadow_only")
             validated_plan = validate_action_plan_v2(
                 action_plan,
                 reject_media=True,
             )
         except ActionPlanV2Error as exc:
             raise RuntimeError(exc.code) from exc
-        if validated_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
-            raise RuntimeError("weibo_execution_path_not_supported")
+        if validated_plan.execution_path_id != execution_path.path_id:
+            raise RuntimeError(f"{normalized_platform}_execution_path_not_supported")
         if tuple(phases) != validated_plan.required_actions:
-            raise RuntimeError("weibo_dry_run_phase_binding_mismatch")
-    elif normalized_platform in {"douyin", "xiaohongshu"}:
-        raise RuntimeError(f"{normalized_platform}_manual_shadow_only")
+            raise RuntimeError(f"{normalized_platform}_dry_run_phase_binding_mismatch")
     for phase_name in phases:
         await asyncio.sleep(0.2)
         await save_phase(task_id, account_id, lottery_id, phase_name)
@@ -1200,180 +1516,66 @@ async def execute_dry_run(
 
 
 async def execute_bilibili_api_shadow(task: dict) -> None:
-    """Persist one GET-only Bilibili API observation; never open a browser."""
+    """Compatibility facade into Bilibili-owned API observation."""
 
-    task_id = str(task.get("task_id") or "").strip()
-    account_id = int(task.get("account_id"))
-    lottery_id = int(task.get("lottery_id"))
-    try:
-        plan = validate_action_plan_v2(task.get("action_plan"), reject_media=True)
-    except ActionPlanV2Error as exc:
-        raise RuntimeError(f"bilibili_shadow_{exc.code}") from exc
-    if plan.execution_path_id != BILIBILI_API_EXECUTION_PATH:
-        raise RuntimeError("bilibili_shadow_execution_path_not_supported")
-    dynamic_id = extract_bilibili_dynamic_id(task.get("raw_url"), task.get("canonical_url"))
-    authority = await database.fetch_one(
-        """SELECT execution_revision, platform, status
-           FROM accounts WHERE id = :account_id""",
-        {"account_id": account_id},
+    from app.platform_modules.bilibili import (
+        execute_bilibili_api_shadow as owned_shadow,
     )
-    execution_revision = _claim_positive_int(
-        row_get(authority, "execution_revision"),
-        "bilibili_shadow_execution_revision_invalid",
+
+    await owned_shadow(
+        task,
+        None,
+        None,
+        runtime=_task_execution_services(),
     )
-    config_hash = compute_bilibili_api_config_hash(execution_revision)
-    if (
-        str(row_get(authority, "platform") or "").strip().lower() != "bilibili"
-        or str(row_get(authority, "status") or "").strip().lower() != "ready"
-        or str(task.get("config_hash") or "").strip() != config_hash
-        or str(task.get("target_hash") or "").strip()
-        != compute_target_hash(str(task.get("canonical_url") or "").strip())
-    ):
-        raise RuntimeError("bilibili_shadow_authority_changed")
-    cookie_header = credential_to_cookie_header(await load_account_credential(account_id))
-    if not cookie_header:
-        raise RuntimeError(f"Account {account_id} has no usable Bilibili Cookie")
-    preflight = await run_readonly_api_preflight(
-        cookie_header=cookie_header,
-        dynamic_id=dynamic_id,
-        required_actions=plan.required_actions,
-        execution_revision=execution_revision,
-        config_hash=config_hash,
-        expected_follow_handle=(
-            plan.follow_target_handle if "followed" in plan.required_actions else None
-        ),
-    )
-    observation_json = json.dumps(
-        preflight.observation,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    async with database.transaction():
-        current = await database.fetch_one(
-            """SELECT tr.status, tr.worker_id, tr.account_id, tr.lottery_id,
-                      tr.execution_path_id, tr.target_hash, tr.rule_hash,
-                      tr.action_plan_hash, tr.config_hash,
-                      tr.account_lease_id, tr.account_lease_generation,
-                      a.execution_revision,
-                       CASE WHEN lease.expires_at > NOW() THEN 1 ELSE 0 END AS lease_active,
-                       CASE WHEN lease.released_at IS NULL THEN 1 ELSE 0 END AS lease_unreleased,
-                       CASE WHEN lease.generation = (
-                         SELECT MAX(newest.generation)
-                         FROM account_operation_leases newest
-                         WHERE newest.account_id = tr.account_id
-                       ) THEN 1 ELSE 0 END AS lease_latest_generation,
-                       (SELECT COUNT(*) FROM account_operation_leases live
-                        WHERE live.account_id = tr.account_id
-                          AND live.released_at IS NULL
-                          AND live.expires_at > NOW()) AS active_account_lease_count,
-                       lease.operation_kind, lease.owner_id, lease.task_id AS lease_task_id
-               FROM task_runs tr
-               JOIN accounts a ON a.id = tr.account_id
-               JOIN account_operation_leases lease
-                 ON lease.lease_id = tr.account_lease_id
-                AND lease.account_id = tr.account_id
-                AND lease.generation = tr.account_lease_generation
-               WHERE tr.task_id = :task_id
-               FOR UPDATE""",
-            {"task_id": task_id},
-        )
-        if (
-            not current
-            or str(row_get(current, "status") or "").strip().lower() != "running"
-            or str(row_get(current, "worker_id") or "").strip() != WORKER_ID
-            or int(row_get(current, "account_id") or 0) != account_id
-            or int(row_get(current, "lottery_id") or 0) != lottery_id
-            or str(row_get(current, "execution_path_id") or "").strip()
-            != BILIBILI_API_EXECUTION_PATH
-            or str(row_get(current, "target_hash") or "").strip()
-            != str(task.get("target_hash") or "").strip()
-            or str(row_get(current, "rule_hash") or "").strip() != plan.rule_hash
-            or str(row_get(current, "action_plan_hash") or "").strip() != plan.plan_hash
-            or str(row_get(current, "config_hash") or "").strip() != config_hash
-            or int(row_get(current, "execution_revision") or 0) != execution_revision
-            or str(row_get(current, "account_lease_id") or "").strip()
-            != str(task.get("account_lease_id") or "").strip()
-            or int(row_get(current, "account_lease_generation") or 0)
-            != _claim_positive_int(
-                task.get("account_lease_generation"),
-                "bilibili_shadow_account_lease_binding_invalid",
-            )
-            or str(row_get(current, "operation_kind") or "").strip().lower()
-            != "shadow_run"
-            or str(row_get(current, "owner_id") or "").strip() != task_id
-            or str(row_get(current, "lease_task_id") or "").strip() != task_id
-            or int(row_get(current, "lease_active", 0) or 0) != 1
-            or int(row_get(current, "lease_unreleased", 0) or 0) != 1
-            or int(row_get(current, "lease_latest_generation", 0) or 0) != 1
-            or int(row_get(current, "active_account_lease_count", 0) or 0) != 1
-        ):
-            raise TaskOwnershipLost("bilibili_shadow_binding_changed")
-        await database.execute(
-            """UPDATE task_runs
-               SET preflight_observation = :observation,
-                   preflight_observation_kind = :kind,
-                   preflight_observation_hash = :observation_hash
-               WHERE task_id = :task_id AND status = 'running'
-                 AND worker_id = :worker_id""",
-            {
-                "task_id": task_id,
-                "worker_id": WORKER_ID,
-                "observation": observation_json,
-                "kind": API_PREFLIGHT_KIND,
-                "observation_hash": preflight.observation_hash,
-            },
-        )
-        persisted = await database.fetch_one(
-            """SELECT preflight_observation, preflight_observation_kind,
-                      preflight_observation_hash
-               FROM task_runs WHERE task_id = :task_id""",
-            {"task_id": task_id},
-        )
-        if (
-            not persisted
-            or str(row_get(persisted, "preflight_observation_kind") or "").strip()
-            != API_PREFLIGHT_KIND
-            or str(row_get(persisted, "preflight_observation_hash") or "").strip()
-            != preflight.observation_hash
-            or parse_json_field(row_get(persisted, "preflight_observation"))
-            != preflight.observation
-        ):
-            raise RuntimeError("bilibili_shadow_observation_persistence_failed")
-    event_id = await record_event(
-        aggregate="task",
-        aggregate_id=task_id,
-        event_type="TaskApiShadowPreflightObserved",
-        payload={
-            "account_id": account_id,
-            "lottery_id": lottery_id,
-            "probe_kind": API_PREFLIGHT_KIND,
-            "observation_hash": preflight.observation_hash,
-            "target_identity": preflight.observation["target_identity"],
-            "required_actions": list(plan.required_actions),
-            "side_effects": False,
-        },
-        correlation_id=task_id,
-    )
-    if not event_id:
-        raise RuntimeError("bilibili_shadow_observation_event_persistence_failed")
-    await save_phase(task_id, account_id, lottery_id, "completed")
 
 
 async def execute_shadow_run(task: dict, adapter, pool):
+    """Route a read-only run through the selected platform-owned handler."""
+
+    platform = str(task.get("platform") or "bilibili").strip().lower()
+    try:
+        platform_module = get_platform_module(platform)
+        execution_path, _ = platform_module.route(
+            "shadow_run",
+            task.get("action_plan"),
+        )
+    except PlatformRoutingError as exc:
+        raise RuntimeError(exc.code) from exc
+    return await execution_path.execute(
+        "shadow_run",
+        task,
+        adapter,
+        pool,
+        runtime=_task_execution_services(),
+    )
+
+
+async def execute_browser_observation_shadow(task: dict, adapter, pool):
+    """Shared browser-observation infrastructure selected by platform paths."""
+
     task_id = task.get("task_id")
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
     lottery_url = task.get("raw_url") or task.get("canonical_url")
-    platform = task.get("platform", "bilibili")
-    if str(platform or "").strip().lower() == "bilibili":
-        await execute_bilibili_api_shadow(task)
-        return None
+    platform = str(task.get("platform") or "bilibili").strip().lower()
+    try:
+        platform_module = get_platform_module(platform)
+        execution_path, _ = platform_module.route(
+            "shadow_run", task.get("action_plan")
+        )
+    except PlatformRoutingError as exc:
+        raise RuntimeError(exc.code) from exc
     canonical_uri = validated_platform_canonical_uri(platform, task.get("canonical_url"))
     profile_dir = f"/profiles/{platform}/account_{account_id}"
     proxy = None
     phases = requested_phases(task, require_plan=False)
-    ctx = await pool.get_account_context(account_id, profile_dir, proxy)
+    ctx = await pool.get_account_context(
+        account_id,
+        profile_dir,
+        proxy,
+        platform=platform,
+    )
     await prepare_account_login(ctx, account_id, platform)
     page = await ctx.new_page()
     try:
@@ -1413,21 +1615,43 @@ async def execute_shadow_run(task: dict, adapter, pool):
         selector_observation_complete = (
             bool(phases) and not missing_phases and bool(screenshot_path)
         )
+        setattr(
+            adapter,
+            "_last_shadow_observation_context",
+            {
+                "capability_checks": {
+                    phase: phase_readiness.get(phase) is True
+                    for phase in phases
+                },
+                "account_authenticated": selector_observation_complete,
+                "target_identity_verified": True,
+                "selector_observation_complete": (
+                    selector_observation_complete
+                ),
+            },
+        )
+        path_supports_real_run = "real_run" in execution_path.supported_modes
         manual_confirmation_required = bool(
             getattr(adapter, "MANUAL_CONFIRMATION_REQUIRED", False)
+            and not path_supports_real_run
         )
         capability_block_reason = (
-            (
-                "weibo_selector_observation_only"
-                if str(platform or "").strip().lower() == "weibo"
-                else platform_real_run_block_reason(platform)
-            )
+            getattr(adapter, "CAPABILITY_BLOCK_REASON", None)
+            or platform_module.capability_block_reason
+            or platform_real_run_block_reason(platform)
             if manual_confirmation_required
             else None
         )
+        supports_actions = getattr(adapter, "supports_actions", None)
+        adapter_supports_phases = (
+            supports_actions(phases)
+            if callable(supports_actions)
+            else bool(getattr(adapter, "REAL_ACTIONS", False))
+        )
         real_run_capable = (
             capability_block_reason is None
-            and bool(getattr(adapter, "REAL_ACTIONS", False))
+            and path_supports_real_run
+            and adapter_supports_phases
         )
         qualified = selector_observation_complete and real_run_capable
         observation_event_id = await record_event(
@@ -1694,25 +1918,110 @@ async def execute_real_task(task: dict, adapter, pool):
     account_id = int(task.get("account_id"))
     lottery_id = int(task.get("lottery_id"))
     lottery_url = task.get("raw_url") or task.get("canonical_url")
+    platform = str(task.get("platform") or "bilibili").strip().lower()
+    try:
+        platform_module = get_platform_module(platform)
+    except PlatformRoutingError as exc:
+        raise RuntimeError(exc.code) from exc
+    phase_order = list(platform_module.action_order)
     phases = requested_phases(task, require_plan=True)
+    durable_intents_required = bool(
+        getattr(adapter, "DURABLE_INTENTS_REQUIRED", False)
+    )
+    intent_plan = None
+    if durable_intents_required:
+        try:
+            intent_plan = validate_action_plan_v2(
+                task.get("action_plan"),
+                require_executable=True,
+                reject_media=True,
+            )
+        except ActionPlanV2Error as exc:
+            raise RuntimeError(exc.code) from exc
+        if intent_plan.required_actions != tuple(phases):
+            raise RuntimeError("browser_action_intent_plan_mismatch")
     current_phase = await get_latest_phase(task_id) or "init"
     if current_phase == "completed":
         return
-    if current_phase not in PHASE_ORDER and current_phase != "init":
+    if current_phase not in phase_order and current_phase != "init":
         raise RuntimeError(f"task_phase_invalid:{current_phase}")
     phase_fn = {
         "followed": adapter._follow,
         "liked": adapter._like,
         "commented": adapter._comment,
+        "favorited": getattr(adapter, "_favorite", None),
         "reposted": adapter._repost,
     }
-    platform = task.get("platform", "bilibili")
     canonical_uri = validated_platform_canonical_uri(platform, task.get("canonical_url"))
     profile_dir = f"/profiles/{platform}/account_{account_id}"
     proxy = None
-    ctx = await pool.get_account_context(account_id, profile_dir, proxy)
+    ctx = await pool.get_account_context(
+        account_id,
+        profile_dir,
+        proxy,
+        platform=platform,
+    )
     await prepare_account_login(ctx, account_id, platform)
     page = await ctx.new_page()
+    active_gate_binding = None
+    active_execution_intent_kind = None
+
+    def durable_gate_binding(snapshot):
+        try:
+            execution_plan = gate_execution_action_plan(snapshot)
+            return (
+                execution_plan.plan_hash,
+                gate_requested_actions(snapshot),
+                snapshot.execution_evidence_id,
+                int(snapshot.execution_revision),
+                snapshot.execution_intent_kind,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RealRunGateBlocked(
+                "browser_real_run_gate_binding_invalid"
+            ) from exc
+
+    async def mark_intent_unknown(intent, phase_name: str, cause: BaseException):
+        if intent is None:
+            return
+        try:
+            await await_safety_settlement(
+                mark_action_intent_unknown(
+                    db=database,
+                    intent=intent,
+                    reason=(
+                        f"{type(cause).__name__}: browser action outcome not proven"
+                    ),
+                )
+            )
+        except BaseException as intent_exc:
+            structured_log(
+                "error",
+                "browser_action_intent_unknown_write_failed",
+                task_id=task_id,
+                action=phase_name,
+                exception=intent_exc,
+            )
+
+    async def settle_intent_no_effect(
+        intent,
+        phase_name: str,
+        cause: BaseException,
+    ):
+        if intent is None:
+            return
+        await await_safety_settlement(
+            settle_action_intent(
+                db=database,
+                intent=intent,
+                succeeded=False,
+                outcome="rejected",
+                error_message=(
+                    f"browser_pre_mutation_failure:{type(cause).__name__}"
+                ),
+            )
+        )
+
     try:
         lottery_url = validated_platform_navigation_url(platform, lottery_url)
         await install_main_frame_navigation_guard(page, platform)
@@ -1730,8 +2039,40 @@ async def execute_real_task(task: dict, adapter, pool):
             # authoritative task gate immediately before every such click, not
             # merely once at the beginning of the phase.
             try:
-                await enforce_task_real_run_gate(task, require_running=True)
+                current_gate = await enforce_task_real_run_gate(
+                    task, require_running=True
+                )
                 await refresh_task_lease(task_id)
+                if durable_intents_required:
+                    if (
+                        active_gate_binding is None
+                        or not active_execution_intent_kind
+                    ):
+                        raise RealRunGateBlocked(
+                            "browser_action_intent_missing"
+                        )
+                    await renew_account_operation_lease(
+                        db=database,
+                        task_id=task_id,
+                        account_id=account_id,
+                        lottery_id=lottery_id,
+                        worker_id=WORKER_ID,
+                        execution_intent_kind=(
+                            active_execution_intent_kind
+                        ),
+                    )
+                    renewed_gate = await enforce_task_real_run_gate(
+                        task, require_running=True
+                    )
+                    if (
+                        durable_gate_binding(current_gate)
+                        != active_gate_binding
+                        or durable_gate_binding(renewed_gate)
+                        != active_gate_binding
+                    ):
+                        raise RealRunGateBlocked(
+                            "browser_real_run_binding_changed"
+                        )
                 validated_platform_content_url(platform, page.url, canonical_uri)
                 await detect_page_risk(page, account_id, platform)
                 validated_platform_content_url(platform, page.url, canonical_uri)
@@ -1744,10 +2085,14 @@ async def execute_real_task(task: dict, adapter, pool):
         if current_phase == "init":
             remaining_phases = phases
         else:
-            completed_index = PHASE_ORDER.index(current_phase)
-            remaining_phases = [phase for phase in phases if PHASE_ORDER.index(phase) > completed_index]
+            completed_index = phase_order.index(current_phase)
+            remaining_phases = [
+                phase for phase in phases if phase_order.index(phase) > completed_index
+            ]
         for phase_name in remaining_phases:
-            await enforce_task_real_run_gate(task, require_running=True)
+            gate_snapshot = await enforce_task_real_run_gate(
+                task, require_running=True
+            )
             await refresh_task_lease(task_id)
             validated_platform_content_url(platform, page.url, canonical_uri)
             await detect_page_risk(page, account_id, platform)
@@ -1755,18 +2100,104 @@ async def execute_real_task(task: dict, adapter, pool):
             reset_mutation_tracking = getattr(adapter, "reset_mutation_tracking", None)
             if callable(reset_mutation_tracking):
                 reset_mutation_tracking()
+            active_intent = None
+            active_gate_binding = None
+            active_execution_intent_kind = None
+            if durable_intents_required:
+                initial_binding = durable_gate_binding(gate_snapshot)
+                if (
+                    intent_plan is None
+                    or initial_binding[0] != intent_plan.plan_hash
+                    or initial_binding[1] != intent_plan.required_actions
+                ):
+                    raise RealRunGateBlocked(
+                        "browser_action_intent_plan_changed"
+                    )
+                active_execution_intent_kind = initial_binding[4]
+                await renew_account_operation_lease(
+                    db=database,
+                    task_id=task_id,
+                    account_id=account_id,
+                    lottery_id=lottery_id,
+                    worker_id=WORKER_ID,
+                    execution_intent_kind=active_execution_intent_kind,
+                )
+                renewed_gate = await enforce_task_real_run_gate(
+                    task, require_running=True
+                )
+                active_gate_binding = durable_gate_binding(renewed_gate)
+                if active_gate_binding != initial_binding:
+                    raise RealRunGateBlocked(
+                        "browser_real_run_binding_changed"
+                    )
+                active_intent = await prepare_and_start_action_intent(
+                    db=database,
+                    task_id=task_id,
+                    account_id=account_id,
+                    lottery_id=lottery_id,
+                    worker_id=WORKER_ID,
+                    execution_intent_kind=active_execution_intent_kind,
+                    action=phase_name,
+                    payload={
+                        "platform": platform,
+                        "execution_path_id": intent_plan.execution_path_id,
+                        "execution_evidence_id": active_gate_binding[2],
+                        "execution_revision": active_gate_binding[3],
+                        "target_hash": str(task.get("target_hash") or ""),
+                        "config_hash": str(task.get("config_hash") or ""),
+                        "action_payload": intent_plan.payload_for(phase_name),
+                    },
+                )
             try:
-                await phase_fn[phase_name](page)
+                phase_handler = phase_fn.get(phase_name)
+                if not callable(phase_handler):
+                    raise RuntimeError(f"platform_action_not_implemented:{phase_name}")
+                await phase_handler(page)
+                if active_intent is not None:
+                    try:
+                        await settle_action_intent(
+                            db=database,
+                            intent=active_intent,
+                            succeeded=True,
+                            outcome="ok",
+                        )
+                    except BaseException as exc:
+                        await mark_intent_unknown(
+                            active_intent,
+                            phase_name,
+                            exc,
+                        )
+                        await await_safety_settlement(
+                            quarantine_external_action_outcome(
+                                task_id=task_id,
+                                account_id=account_id,
+                                platform=platform,
+                                action=phase_name,
+                                cause=exc,
+                            )
+                        )
+                        raise ExternalActionOutcomeUnknown(
+                            platform, phase_name, exc
+                        ) from exc
+                    active_intent = None
                 validated_platform_content_url(platform, page.url, canonical_uri)
                 await detect_page_risk(page, account_id, platform)
                 await save_phase(task_id, account_id, lottery_id, phase_name)
+            except ExternalActionOutcomeUnknown:
+                raise
             except SelectorMutationPreconditionFailed as exc:
                 # The guard proves only that the *current* click did not start.
                 # A multi-click phase (for example repost + confirm) may already
                 # have issued an earlier mutation-capable click, in which case
                 # the phase outcome is unknown and must be quarantined.
                 if getattr(adapter, "mutation_started", None) is not True:
+                    await settle_intent_no_effect(
+                        active_intent,
+                        phase_name,
+                        exc,
+                    )
                     raise
+                await mark_intent_unknown(active_intent, phase_name, exc)
                 unknown = ExternalActionOutcomeUnknown(platform, phase_name, exc)
                 await await_safety_settlement(
                     quarantine_external_action_outcome(
@@ -1782,7 +2213,13 @@ async def execute_real_task(task: dict, adapter, pool):
                 if getattr(adapter, "mutation_started", None) is False:
                     # Cancellation while reading selectors, delaying, typing or
                     # running the guard occurred before any mutation click.
+                    await settle_intent_no_effect(
+                        active_intent,
+                        phase_name,
+                        exc,
+                    )
                     raise
+                await mark_intent_unknown(active_intent, phase_name, exc)
                 await await_safety_settlement(
                     quarantine_external_action_outcome(
                         task_id=task_id,
@@ -1795,7 +2232,13 @@ async def execute_real_task(task: dict, adapter, pool):
                 raise
             except Exception as exc:
                 if getattr(adapter, "mutation_started", None) is False:
+                    await settle_intent_no_effect(
+                        active_intent,
+                        phase_name,
+                        exc,
+                    )
                     raise SelectorMutationPreconditionFailed(phase_name, exc) from exc
+                await mark_intent_unknown(active_intent, phase_name, exc)
                 unknown = ExternalActionOutcomeUnknown(platform, phase_name, exc)
                 await await_safety_settlement(
                     quarantine_external_action_outcome(
@@ -1835,380 +2278,28 @@ async def execute_real_task(task: dict, adapter, pool):
             structured_log("warning", "task_page_close_failed", task_id=task_id, exception=exc)
 
 
-def uses_bilibili_api_real_task(task: dict) -> bool:
-    return str(task.get("platform") or "").lower() == "bilibili"
+def real_executor_for_task(task: dict) -> str | None:
+    """Compatibility introspection only; execution uses the path callable."""
 
-
-def uses_weibo_oauth_real_task(task: dict) -> bool:
-    # The real-run gate independently requires the exact OAuth execution path;
-    # this predicate only selects the platform executor after that proof.
-    return str(task.get("platform") or "").strip().lower() == "weibo"
+    try:
+        module = get_platform_module(task.get("platform"))
+        _, executor = module.route("real_run", task.get("action_plan"))
+    except PlatformRoutingError:
+        return None
+    return executor
 
 
 async def execute_bilibili_api_real_task(task: dict):
-    task_id = task.get("task_id")
-    account_id = int(task.get("account_id"))
-    lottery_id = int(task.get("lottery_id"))
-    try:
-        validated_plan = validate_action_plan_v2(task.get("action_plan"), reject_media=True)
-    except ActionPlanV2Error as exc:
-        raise RuntimeError(f"bilibili_{exc.code}") from exc
-    phases = list(validated_plan.required_actions)
-    dynamic_id = extract_bilibili_dynamic_id(task.get("raw_url"), task.get("canonical_url"))
-    current_phase = await get_latest_phase(task_id) or "init"
-    if current_phase == "completed":
-        return
-    if current_phase not in PHASE_ORDER and current_phase != "init":
-        raise RuntimeError(f"task_phase_invalid:{current_phase}")
-    completed_phases = await get_completed_bilibili_phases(
-        task_id,
-        account_id=account_id,
-        lottery_id=lottery_id,
-        dynamic_id=dynamic_id,
+    """Compatibility facade into Bilibili-owned mutation control flow."""
+
+    from app.platform_modules.bilibili import (
+        _execute_bilibili_api_real_owned as owned_real,
     )
-    if current_phase != "init" and not completed_phases:
-        # Before the per-action ledger existed, the API executor used a
-        # different comment/repost order than task_phases. Inferring completed
-        # work from that single marker can either skip a required action or
-        # repeat a remote mutation, so legacy in-flight work needs explicit
-        # reconciliation instead of automatic resume.
-        raise RuntimeError("bilibili_legacy_phase_requires_reconciliation")
-    remaining_phases = [phase for phase in phases if phase not in completed_phases]
-    if not remaining_phases:
-        await save_phase(task_id, account_id, lottery_id, "completed")
-        return
 
-    actions = dpms_phases_to_api_actions(remaining_phases)
-    cookie_header = credential_to_cookie_header(await load_account_credential(account_id))
-    if not cookie_header:
-        raise RuntimeError(f"Account {account_id} has no usable Bilibili Cookie")
-
-    async with BilibiliApiClient(cookie_header, config=BiliEngineConfig()) as client:
-        if not await client.check_login():
-            await set_account_status(account_id, "login_required", "bilibili_cookie_invalid")
-            raise RuntimeError("Bilibili account Cookie is invalid or expired")
-
-        detail = await client.get_dynamic_detail(dynamic_id)
-        if int(detail.get("code", -1)) != 0:
-            raise RuntimeError(f"Bilibili dynamic detail failed: code={detail.get('code')}")
-        card = parse_detail_card(detail, dynamic_id)
-        if card.type == 1:
-            # The reviewed URL identifies the wrapper dynamic, while the old
-            # executor silently changed follow/comment/repost to ``origin``.
-            # Until Action Plan v2 binds the origin id, author and rule hash,
-            # any forwarded wrapper must remain fail-closed before mutation.
-            raise BilibiliForwardedTargetRequiresReview(
-                "bilibili_forwarded_origin_requires_review"
-            )
-        validate_card_for_actions(card, actions)
-        if "followed" in validated_plan.required_actions:
-            if bilibili_author_handle(card.uname) != validated_plan.follow_target_handle:
-                raise RuntimeError("bilibili_real_follow_target_mismatch")
-
-        current_intents: dict[str, StartedActionIntent] = {}
-
-        async def before_action(action: str) -> None:
-            snapshot = await enforce_task_real_run_gate(task, require_running=True)
-            if snapshot.action_plan.plan_hash != validated_plan.plan_hash:
-                raise RealRunGateBlocked("action_plan_changed_during_execution")
-            await refresh_task_lease(task_id)
-            await renew_account_operation_lease(
-                db=database,
-                task_id=task_id,
-                account_id=account_id,
-                lottery_id=lottery_id,
-                worker_id=WORKER_ID,
-            )
-            # Re-read every authoritative binding after both lease renewals and
-            # immediately before the intent transaction. No external request
-            # has started at this point.
-            await enforce_task_real_run_gate(task, require_running=True)
-            dpms_action = API_TO_DPMS_PHASE.get(action)
-            if not dpms_action:
-                raise RuntimeError("bilibili_action_intent_action_invalid")
-            intent = await prepare_and_start_action_intent(
-                db=database,
-                task_id=task_id,
-                account_id=account_id,
-                lottery_id=lottery_id,
-                worker_id=WORKER_ID,
-                action=action,
-                payload=validated_plan.payload_for(dpms_action),
-            )
-            current_intents[action] = intent
-
-        async def after_attempt(action: str, action_result) -> None:
-            intent = current_intents.get(action)
-            if intent is None:
-                raise BilibiliActionSettlementFailed(
-                    action,
-                    action_result,
-                    RuntimeError("bilibili_action_intent_missing"),
-                )
-            try:
-                await settle_action_intent(
-                    db=database,
-                    intent=intent,
-                    succeeded=action_result.ok,
-                    outcome=action_result.outcome.value,
-                    error_message=None if action_result.ok else action_result.message,
-                )
-            except BaseException as exc:
-                raise BilibiliActionSettlementFailed(action, action_result, exc) from exc
-            current_intents.pop(action, None)
-
-        async def on_attempt_error(action: str, exc: BaseException) -> None:
-            intent = current_intents.get(action)
-            if intent is None:
-                return
-            try:
-                await await_safety_settlement(
-                    mark_action_intent_unknown(
-                        db=database,
-                        intent=intent,
-                        reason=f"{type(exc).__name__}: remote outcome not proven",
-                    )
-                )
-            except Exception as intent_exc:
-                # The platform breaker/emergency barrier below is still the
-                # last-resort global fence when the intent settlement itself is
-                # unavailable. Do not replace the original network exception.
-                structured_log(
-                    "error",
-                    "external_action_intent_unknown_write_failed",
-                    task_id=task_id,
-                    action=action,
-                    exception=intent_exc,
-                )
-
-        executed_dynamic_id = card.dynamic_id
-
-        async def after_action(action: str, action_result) -> None:
-            try:
-                await persist_bilibili_action_result(
-                    task_id=task_id,
-                    account_id=account_id,
-                    lottery_id=lottery_id,
-                    dynamic_id=executed_dynamic_id,
-                    action=action,
-                    action_result=action_result,
-                )
-            except asyncio.CancelledError as exc:
-                # The remote response is already classified, so cancellation
-                # here means local settlement is incomplete rather than that no
-                # action happened. Convert it to the same durable quarantine
-                # path as every other confirmed-result persistence failure.
-                raise BilibiliActionSettlementFailed(action, action_result, exc) from exc
-            except Exception as exc:
-                raise BilibiliActionSettlementFailed(action, action_result, exc) from exc
-
-        try:
-            result = await BilibiliApiExecutor(
-                client,
-                client.config,
-                before_action=before_action,
-                after_attempt=after_attempt,
-                on_attempt_error=on_attempt_error,
-                after_action=after_action,
-            ).participate(card, actions, validated_plan.action_payloads)
-        except (BilibiliApiActionOutcomeUnknown, BilibiliActionSettlementFailed) as exc:
-            settlement_failed = isinstance(exc, BilibiliActionSettlementFailed)
-            reason = (
-                f"bilibili_{exc.action}_settlement_failed"
-                if settlement_failed
-                else f"bilibili_{exc.action}_outcome_unknown"
-            )
-            quarantine_errors: list[str] = []
-            breaker_opened = False
-            breaker_failure: Exception | None = None
-            emergency_failure: Exception | None = None
-            emergency_barrier: str | None = None
-            unknown_ledger_recorded = False
-            active_intent = current_intents.get(exc.action)
-            if active_intent is not None:
-                try:
-                    await await_safety_settlement(
-                        mark_action_intent_unknown(
-                            db=database,
-                            intent=active_intent,
-                            reason=reason,
-                        )
-                    )
-                except Exception as quarantine_exc:
-                    quarantine_errors.append(
-                        f"intent:{type(quarantine_exc).__name__}"
-                    )
-            try:
-                await await_safety_settlement(
-                    open_unknown_outcome_breaker(
-                        db=database,
-                        platform="bilibili",
-                        action=exc.action,
-                    )
-                )
-                breaker_opened = True
-            except Exception as quarantine_exc:
-                breaker_failure = quarantine_exc
-                quarantine_errors.append(f"breaker:{type(quarantine_exc).__name__}")
-                structured_log(
-                    "error",
-                    "unknown_outcome_breaker_failed",
-                    task_id=task_id,
-                    action=exc.action,
-                    exception=quarantine_exc,
-                )
-                try:
-                    emergency_barrier = await await_safety_settlement(
-                        emergency_stop_real_runs_and_revoke_lease(
-                            task_id=task_id,
-                            platform="bilibili",
-                            action=exc.action,
-                        )
-                    )
-                except Exception as emergency_exc:
-                    emergency_failure = emergency_exc
-                    quarantine_errors.append(f"emergency:{type(emergency_exc).__name__}")
-            try:
-                known_result = exc.action_result if settlement_failed else None
-                await await_safety_settlement(
-                    save_bilibili_action_ledger(
-                        task_id=task_id,
-                        account_id=account_id,
-                        lottery_id=lottery_id,
-                        dynamic_id=executed_dynamic_id,
-                        action=exc.action,
-                        phase=API_TO_DPMS_PHASE.get(exc.action),
-                        code=known_result.code if known_result is not None else None,
-                        outcome=known_result.outcome.value if known_result is not None else "unknown",
-                        message=(
-                            f"{known_result.message}; local settlement failed"
-                            if known_result is not None
-                            else exc.reason
-                        ),
-                        ok=known_result.ok if known_result is not None else False,
-                    )
-                )
-                unknown_ledger_recorded = True
-            except Exception as quarantine_exc:
-                quarantine_errors.append(f"ledger:{type(quarantine_exc).__name__}")
-            try:
-                quarantine_event_id = await await_safety_settlement(
-                    record_event(
-                        aggregate="task",
-                        aggregate_id=task_id,
-                        event_type=(
-                            "BilibiliApiActionSettlementFailed"
-                            if settlement_failed
-                            else "BilibiliApiActionOutcomeUnknown"
-                        ),
-                        payload={
-                            "account_id": account_id,
-                            "lottery_id": lottery_id,
-                            "dynamic_id": executed_dynamic_id,
-                            "action": exc.action,
-                            "reason": exc.reason,
-                            "remote_outcome": (
-                                exc.action_result.outcome.value if settlement_failed else "unknown"
-                            ),
-                            "remote_code": exc.action_result.code if settlement_failed else None,
-                            "platform_breaker_opened": breaker_opened,
-                            "emergency_barrier": emergency_barrier,
-                            "unknown_ledger_recorded": unknown_ledger_recorded,
-                            "quarantine_errors": quarantine_errors,
-                        },
-                        correlation_id=task_id,
-                    )
-                )
-                if not quarantine_event_id:
-                    quarantine_errors.append("event:persistence_failed")
-            except Exception as quarantine_exc:
-                quarantine_errors.append(f"event:{type(quarantine_exc).__name__}")
-                structured_log(
-                    "error",
-                    "unknown_outcome_event_failed",
-                    task_id=task_id,
-                    action=exc.action,
-                    exception=quarantine_exc,
-                )
-            try:
-                status_change = (
-                    account_status_for_results({exc.action: exc.action_result})
-                    if settlement_failed
-                    else None
-                )
-                if status_change:
-                    await await_safety_settlement(
-                        set_account_status(account_id, status_change[0], status_change[1])
-                    )
-                else:
-                    await await_safety_settlement(
-                        set_account_status(account_id, "cooling", reason)
-                    )
-            except AccountStatusPersistenceFailed:
-                # Do not downgrade an uncommitted canonical risk settlement to
-                # the generic task-failure cleanup below. Keeping the claim and
-                # account in their current state lets Recovery apply the same
-                # fail-closed path used by direct risk-settlement failures.
-                raise
-            except Exception as quarantine_exc:
-                quarantine_errors.append(f"account:{type(quarantine_exc).__name__}")
-                structured_log(
-                    "error",
-                    "unknown_outcome_account_quarantine_failed",
-                    task_id=task_id,
-                    account_id=account_id,
-                    action=exc.action,
-                    exception=quarantine_exc,
-                )
-            if not breaker_opened:
-                raise TaskSettlementUnconfirmed(
-                    task_id,
-                    emergency_failure or breaker_failure or exc,
-                ) from exc
-            raise
-
-        status_change = account_status_for_results(result.actions)
-        if status_change:
-            status, reason = status_change
-            await set_account_status(account_id, status, reason)
-
-        try:
-            completion_event_id = await record_event(
-                aggregate="task",
-                aggregate_id=task_id,
-                event_type="BilibiliApiRealRunExecuted",
-                payload={
-                    "account_id": account_id,
-                    "lottery_id": lottery_id,
-                    "requested_dynamic_id": dynamic_id,
-                    "executed_dynamic_id": result.dynamic_id,
-                    "actions": list(result.actions.keys()),
-                    "success": result.success,
-                    "aborted": result.aborted,
-                    "abort_reason": result.abort_reason,
-                },
-                correlation_id=task_id,
-            )
-            if not completion_event_id:
-                raise RuntimeError("bilibili_completion_event_persistence_failed")
-        except asyncio.CancelledError as exc:
-            raise TaskSettlementUnconfirmed(task_id, exc) from exc
-        except Exception as exc:
-            raise TaskSettlementUnconfirmed(task_id, exc) from exc
-
-        if not result.success:
-            details = "; ".join(
-                f"{name}={res.outcome.value}(code={res.code})" for name, res in result.actions.items()
-            )
-            raise RuntimeError(result.abort_reason or f"bilibili_api_real_run_failed: {details}")
-        try:
-            await save_phase(task_id, account_id, lottery_id, "completed")
-        except asyncio.CancelledError as exc:
-            raise TaskSettlementUnconfirmed(task_id, exc) from exc
-        except TaskSettlementUnconfirmed:
-            raise
-        except Exception as exc:
-            raise TaskSettlementUnconfirmed(task_id, exc) from exc
+    return await owned_real(
+        task,
+        runtime=_task_execution_services(),
+    )
 
 
 async def load_weibo_oauth_credential(
@@ -2217,39 +2308,28 @@ async def load_weibo_oauth_credential(
     expected_uid: str,
     expected_execution_revision: int,
 ):
-    """Decrypt and bind the exact OAuth credential selected by the gate."""
+    """Compatibility facade into Weibo-owned credential binding."""
 
-    row = await database.fetch_one(
-        """SELECT platform, encrypted_credential, execution_revision
-             FROM accounts
-            WHERE id = :account_id AND deleted_at IS NULL""",
-        {"account_id": account_id},
+    from app.platform_modules.weibo import (
+        _load_weibo_oauth_credential_owned as owned_loader,
     )
-    if not row or str(row_get(row, "platform") or "").strip().lower() != "weibo":
-        raise WeiboOAuthCredentialError("weibo_oauth_account_binding_invalid")
-    try:
-        revision = int(row_get(row, "execution_revision"))
-    except (TypeError, ValueError) as exc:
-        raise WeiboOAuthCredentialError(
-            "weibo_oauth_execution_revision_mismatch"
-        ) from exc
-    if revision != expected_execution_revision:
-        raise WeiboOAuthCredentialError("weibo_oauth_execution_revision_mismatch")
-    encrypted = row_get(row, "encrypted_credential")
-    if not encrypted:
-        raise WeiboOAuthCredentialError("weibo_oauth_credential_required")
-    try:
-        decrypted = cookie_vault.decrypt(encrypted, aad=CREDENTIAL_AAD)
-    except Exception as exc:
-        # OAuth secrets never use the legacy plaintext cookie fallback.
-        raise WeiboOAuthCredentialError(
-            "weibo_oauth_credential_decryption_failed"
-        ) from exc
-    return parse_weibo_oauth_credential(decrypted, expected_uid=expected_uid)
+
+    return await owned_loader(
+        account_id,
+        expected_uid=expected_uid,
+        expected_execution_revision=expected_execution_revision,
+        runtime=_task_execution_services(),
+    )
 
 
 def _weibo_handle_identity_key(value: str) -> str:
-    return unicodedata.normalize("NFKC", value).casefold()
+    """Compatibility facade for Weibo-owned handle normalization."""
+
+    from app.platform_modules.weibo import (
+        _weibo_handle_identity_key as owned_identity_key,
+    )
+
+    return owned_identity_key(value)
 
 
 async def preflight_weibo_friend_mentions(
@@ -2259,454 +2339,31 @@ async def preflight_weibo_friend_mentions(
     pre_resolved: dict[str, str] | None = None,
     on_progress=None,
 ) -> dict[str, str]:
-    """Resolve every constrained mention and enforce friend counts by UID.
+    """Compatibility facade into Weibo-owned mention preflight."""
 
-    This runs before any durable intent or mutation. Source mentions and follow
-    targets are excluded by both normalized handle identity and resolved UID so
-    aliases cannot be counted as distinct friends or disguise a brand account.
-    """
-
-    constraints = dict(plan.friend_mention_requirements or {})
-    cache: dict[str, str] = {
-        _weibo_handle_identity_key(handle): uid
-        for handle, uid in dict(pre_resolved or {}).items()
-    }
-
-    async def resolve(handle: str) -> str:
-        key = _weibo_handle_identity_key(handle)
-        if key not in cache:
-            cache[key] = await client.resolve_user_uid(handle)
-            if on_progress is not None:
-                await on_progress()
-        return cache[key]
-
-    source = dict(plan.source_content_requirements or {})
-    bound = dict(plan.content_requirements or {})
-    excluded_handles = list(source.get("follow_targets") or []) + list(
-        bound.get("follow_targets") or []
+    from app.platform_modules.weibo import (
+        _preflight_weibo_friend_mentions_owned as owned_preflight,
     )
-    all_handles = list(excluded_handles)
-    for action in ("commented", "reposted"):
-        source_action = source.get(action, {})
-        if isinstance(source_action, dict):
-            all_handles.extend(source_action.get("mentions") or [])
-        all_handles.extend(plan.payload_for(action).get("mentions") or [])
-    unique_handle_keys = {
-        _weibo_handle_identity_key(handle) for handle in all_handles
-    }
-    if len(unique_handle_keys) > WEIBO_MAX_UNIQUE_HANDLES:
-        raise RuntimeError("weibo_preflight_unique_handle_limit_exceeded")
-    excluded_keys = {
-        _weibo_handle_identity_key(handle) for handle in excluded_handles
-    }
-    excluded_uids = {await resolve(handle) for handle in excluded_handles}
 
-    # Mention validity is an independent precondition, not merely an input to
-    # the optional friend-count rule.  Resolve every user identity referenced
-    # by an executable text action before any durable intent/POST is created.
-    # Otherwise a misspelled/non-existent brand mention could be accepted as
-    # plain comment text and later recorded as a successful requirement.
-    for action in ("commented", "reposted"):
-        source_action = source.get(action, {})
-        source_mentions = list(
-            source_action.get("mentions") or []
-            if isinstance(source_action, dict)
-            else []
-        )
-        source_keys = {
-            _weibo_handle_identity_key(handle) for handle in source_mentions
-        }
-        source_uids = {await resolve(handle) for handle in source_mentions}
-        payload_mentions = list(plan.payload_for(action).get("mentions") or [])
-        resolved_payload = [
-            (handle, await resolve(handle)) for handle in payload_mentions
-        ]
-        constraint = constraints.get(action)
-        if constraint is None:
-            continue
-        friend_uids = {
-            uid
-            for handle, uid in resolved_payload
-            if _weibo_handle_identity_key(handle)
-            not in source_keys | excluded_keys
-            and uid not in source_uids | excluded_uids
-        }
-        expected = int(constraint["count"])
-        satisfied = (
-            len(friend_uids) == expected
-            if constraint["mode"] == "exact"
-            else len(friend_uids) >= expected
-        )
-        if not satisfied:
-            raise RuntimeError(
-                f"weibo_friend_identity_count_mismatch:{action}"
-            )
-    return dict(cache)
+    return await owned_preflight(
+        client,
+        plan,
+        pre_resolved=pre_resolved,
+        on_progress=on_progress,
+    )
 
 
 async def execute_weibo_oauth_real_task(task: dict) -> None:
-    """Execute one immutable official Weibo OAuth plan with durable fencing."""
+    """Compatibility facade into Weibo-owned mutation control flow."""
 
-    task_id = str(task.get("task_id") or "").strip()
-    if "weibo_rip" in task:
-        raise RuntimeError("weibo_rip_plaintext_forbidden")
-    account_id = int(task.get("account_id"))
-    lottery_id = int(task.get("lottery_id"))
-    try:
-        validated_plan = validate_action_plan_v2(
-            task.get("action_plan"), reject_media=True
-        )
-    except ActionPlanV2Error as exc:
-        raise RuntimeError(exc.code) from exc
-    if validated_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
-        raise RuntimeError("weibo_execution_path_not_supported")
-
-    current_phase = await get_latest_phase(task_id) or "init"
-    if current_phase == "completed":
-        return
-    if current_phase != "init":
-        # Weibo actions are journaled only in external_action_intents; the
-        # task_phases ENUM is not an action ledger (and may not contain favorite).
-        raise RuntimeError("weibo_task_phase_requires_reconciliation")
-
-    gate = await enforce_task_real_run_gate(task, require_running=True)
-    if (
-        gate.platform != "weibo"
-        or gate.execution_evidence_id
-        != str(task.get("execution_evidence_id") or "").strip()
-        or gate.oauth_capabilities is None
-        or not gate.weibo_uid
-    ):
-        raise RealRunGateBlocked("weibo_oauth_execution_binding_invalid")
-    credential = await load_weibo_oauth_credential(
-        account_id,
-        expected_uid=gate.weibo_uid,
-        expected_execution_revision=gate.execution_revision,
-    )
-    rip = decrypt_weibo_rip(
-        task.get("weibo_rip_encrypted"),
-        required=weibo_rip_required(validated_plan.required_actions),
-    )
-    canonical_identifier = status_identifier_from_canonical_uri(
-        task.get("canonical_url")
+    from app.platform_modules.weibo import (
+        _execute_weibo_oauth_real_owned as owned_real,
     )
 
-    client = WeiboApiClient(
-        credential.access_token,
-        capability_attestation=gate.oauth_capabilities,
-        calibration_id=gate.execution_evidence_id,
-        account_id=account_id,
-        execution_revision=gate.execution_revision,
-        runtime_capability_requirements=(
-            validated_plan.runtime_capability_requirements
-        ),
+    await owned_real(
+        task,
+        runtime=_task_execution_services(),
     )
-    current_intents: dict[str, StartedActionIntent] = {}
-    expected_mutations = {}
-
-    async def renew_preflight_leases() -> None:
-        await refresh_task_lease(task_id)
-        await renew_account_operation_lease(
-            db=database,
-            task_id=task_id,
-            account_id=account_id,
-            lottery_id=lottery_id,
-            worker_id=WORKER_ID,
-        )
-
-    async def quarantine_unknown(action: str, cause: BaseException) -> None:
-        intent = current_intents.get(action)
-        if intent is not None:
-            try:
-                await await_safety_settlement(
-                    mark_action_intent_unknown(
-                        db=database,
-                        intent=intent,
-                        reason=f"weibo_{action}_outcome_unknown",
-                    )
-                )
-            except Exception as intent_exc:
-                structured_log(
-                    "error",
-                    "external_action_intent_unknown_write_failed",
-                    task_id=task_id,
-                    action=action,
-                    exception=intent_exc,
-                )
-        await await_safety_settlement(
-            quarantine_external_action_outcome(
-                task_id=task_id,
-                account_id=account_id,
-                platform="weibo",
-                action=action,
-                cause=cause,
-            )
-        )
-
-    async def run_readonly_weibo_preflight():
-        status_id = await client.resolve_status_id(canonical_identifier)
-        await renew_preflight_leases()
-        await client.preflight_status(status_id)
-        await renew_preflight_leases()
-        follow_target_uid = None
-        if "followed" in validated_plan.required_actions:
-            follow_target_uid = await client.resolve_user_uid(
-                validated_plan.follow_target_handle
-            )
-            await renew_preflight_leases()
-        await preflight_weibo_friend_mentions(
-            client,
-            validated_plan,
-            pre_resolved=(
-                {validated_plan.follow_target_handle: follow_target_uid}
-                if follow_target_uid
-                else None
-            ),
-            on_progress=renew_preflight_leases,
-        )
-        return status_id, follow_target_uid
-
-    try:
-        await renew_preflight_leases()
-        try:
-            status_id, follow_target_uid = await asyncio.wait_for(
-                run_readonly_weibo_preflight(),
-                timeout=WEIBO_PREFLIGHT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("weibo_preflight_deadline_exceeded") from exc
-
-        # Lease renewal is liveness only. Re-read every authorization binding
-        # after the potentially long read-only preflight and before the first
-        # intent can be created.
-        post_preflight_gate = await enforce_task_real_run_gate(
-            task, require_running=True
-        )
-        credential.require_fresh(
-            min_remaining_seconds=(
-                len(validated_plan.required_actions)
-                * WEIBO_ACTION_HTTP_BUDGET_SECONDS
-                + WEIBO_ACTION_SETTLEMENT_BUFFER_SECONDS
-            )
-        )
-        if (
-            post_preflight_gate.action_plan.plan_hash != validated_plan.plan_hash
-            or post_preflight_gate.execution_evidence_id
-            != gate.execution_evidence_id
-            or post_preflight_gate.execution_revision != gate.execution_revision
-            or post_preflight_gate.weibo_uid != gate.weibo_uid
-            or post_preflight_gate.oauth_capabilities != gate.oauth_capabilities
-        ):
-            raise RealRunGateBlocked(
-                "weibo_oauth_binding_changed_during_preflight"
-            )
-
-        async def before_action(action: str) -> None:
-            action_index = validated_plan.required_actions.index(action)
-            remaining_actions = len(validated_plan.required_actions) - action_index
-            credential.require_fresh(
-                min_remaining_seconds=(
-                    remaining_actions * WEIBO_ACTION_HTTP_BUDGET_SECONDS
-                    + WEIBO_ACTION_SETTLEMENT_BUFFER_SECONDS
-                )
-            )
-            current_gate = await enforce_task_real_run_gate(
-                task, require_running=True
-            )
-            if (
-                current_gate.action_plan.plan_hash != validated_plan.plan_hash
-                or current_gate.execution_evidence_id != gate.execution_evidence_id
-                or current_gate.execution_revision != gate.execution_revision
-                or current_gate.weibo_uid != gate.weibo_uid
-                or current_gate.oauth_capabilities != gate.oauth_capabilities
-            ):
-                raise RealRunGateBlocked(
-                    "weibo_oauth_binding_changed_during_execution"
-                )
-            await refresh_task_lease(task_id)
-            await renew_account_operation_lease(
-                db=database,
-                task_id=task_id,
-                account_id=account_id,
-                lottery_id=lottery_id,
-                worker_id=WORKER_ID,
-            )
-            # Renewals are not authority. Re-read the entire gate immediately
-            # before the transaction that marks the external intent started.
-            renewed_gate = await enforce_task_real_run_gate(
-                task, require_running=True
-            )
-            if (
-                renewed_gate.action_plan.plan_hash != validated_plan.plan_hash
-                or renewed_gate.execution_evidence_id != gate.execution_evidence_id
-                or renewed_gate.execution_revision != gate.execution_revision
-                or renewed_gate.weibo_uid != gate.weibo_uid
-                or renewed_gate.oauth_capabilities != gate.oauth_capabilities
-            ):
-                raise RealRunGateBlocked(
-                    "weibo_oauth_binding_changed_during_execution"
-                )
-            intent_payload = {
-                "platform": "weibo",
-                "execution_path_id": WEIBO_OAUTH_EXECUTION_PATH,
-                "calibration_id": gate.execution_evidence_id,
-                "execution_revision": gate.execution_revision,
-                "status_id": status_id,
-                "action_payload": validated_plan.payload_for(action),
-            }
-            mutation_target = (
-                follow_target_uid if action == "followed" else status_id
-            )
-            expected_mutation = build_weibo_mutation_request(
-                action,
-                mutation_target,
-                payload=validated_plan.payload_for(action),
-                rip=(
-                    rip
-                    if action in {"followed", "commented", "reposted"}
-                    else ""
-                ),
-            )
-            expected_mutations[action] = expected_mutation
-            intent_payload["mutation_spec"] = expected_mutation.audit_spec
-            if action == "followed":
-                intent_payload["follow_target_handle"] = (
-                    validated_plan.follow_target_handle
-                )
-                intent_payload["follow_target_uid"] = follow_target_uid
-            current_intents[action] = await prepare_and_start_action_intent(
-                db=database,
-                task_id=task_id,
-                account_id=account_id,
-                lottery_id=lottery_id,
-                worker_id=WORKER_ID,
-                action=action,
-                payload=intent_payload,
-            )
-
-        async def operation_key_for(action: str) -> str:
-            intent = current_intents.get(action)
-            if intent is None:
-                raise RuntimeError("weibo_action_intent_missing")
-            return f"{intent.intent_id}:{intent.attempt_no}"
-
-        async def after_receipt(action: str, receipt) -> None:
-            intent = current_intents.get(action)
-            if intent is None:
-                raise RuntimeError("weibo_action_intent_missing")
-            expected = expected_mutations.get(action)
-            if (
-                expected is None
-                or receipt.action != action
-                or receipt.target_id != expected.target_id
-                or receipt.operation_key
-                != f"{intent.intent_id}:{intent.attempt_no}"
-                or receipt.request_payload_hash != expected.audit_spec_hash
-            ):
-                raise RuntimeError("weibo_action_receipt_binding_invalid")
-            await settle_action_intent(
-                db=database,
-                intent=intent,
-                succeeded=True,
-                outcome="ok",
-                remote_ref=receipt.remote_id,
-            )
-            current_intents.pop(action, None)
-            expected_mutations.pop(action, None)
-
-        try:
-            result = await WeiboOAuthExecutor(
-                client,
-                operation_key_for=operation_key_for,
-                before_action=before_action,
-                after_receipt=after_receipt,
-            ).execute(
-                validated_plan,
-                status_id=status_id,
-                follow_target_uid=follow_target_uid,
-                rip=rip,
-            )
-        except WeiboApiRejected as exc:
-            if not exc.confirmed_no_effect:
-                await quarantine_unknown(exc.action, exc)
-                raise ExternalActionOutcomeUnknown(
-                    "weibo", exc.action, exc
-                ) from exc
-            intent = current_intents.get(exc.action)
-            if intent is None:
-                raise
-            try:
-                await await_safety_settlement(
-                    settle_action_intent(
-                        db=database,
-                        intent=intent,
-                        succeeded=False,
-                        outcome="rejected",
-                        error_message=f"weibo_api_rejected:{exc.error_code}",
-                    )
-                )
-                current_intents.pop(exc.action, None)
-            except BaseException as settlement_exc:
-                await quarantine_unknown(exc.action, settlement_exc)
-                raise ExternalActionOutcomeUnknown(
-                    "weibo", exc.action, settlement_exc
-                ) from settlement_exc
-            raise
-        except (WeiboApiActionOutcomeUnknown, WeiboExecutionOutcomeUnknown) as exc:
-            await quarantine_unknown(exc.action, exc)
-            raise ExternalActionOutcomeUnknown("weibo", exc.action, exc) from exc
-        except asyncio.CancelledError as exc:
-            if current_intents:
-                action = next(reversed(current_intents))
-                await quarantine_unknown(action, exc)
-            raise
-        except BaseException as exc:
-            if current_intents:
-                action = next(reversed(current_intents))
-                await quarantine_unknown(action, exc)
-                raise ExternalActionOutcomeUnknown("weibo", action, exc) from exc
-            raise
-
-        try:
-            completion_event_id = await record_event(
-                aggregate="task",
-                aggregate_id=task_id,
-                event_type="WeiboOAuthRealRunExecuted",
-                payload={
-                    "account_id": account_id,
-                    "lottery_id": lottery_id,
-                    "calibration_id": gate.execution_evidence_id,
-                    "actions": list(result.receipts),
-                    "success": result.success,
-                },
-                correlation_id=task_id,
-            )
-            if not completion_event_id:
-                raise RuntimeError("weibo_completion_event_persistence_failed")
-        except BaseException as exc:
-            await quarantine_unknown("task_completion", exc)
-            raise ExternalActionOutcomeUnknown(
-                "weibo", "task_completion", exc
-            ) from exc
-        try:
-            await save_phase(task_id, account_id, lottery_id, "completed")
-        except BaseException as exc:
-            await quarantine_unknown("task_completion", exc)
-            raise ExternalActionOutcomeUnknown(
-                "weibo", "task_completion", exc
-            ) from exc
-    finally:
-        try:
-            await client.aclose()
-        except Exception as exc:
-            # Closing a socket cannot undo a durably settled remote result and
-            # must not manufacture an unknown external outcome.
-            structured_log(
-                "warning",
-                "weibo_http_client_close_failed",
-                task_id=task_id,
-                exception=exc,
-            )
 
 
 async def capture_failure_screenshot(page, task_id: str) -> str | None:
@@ -3052,10 +2709,15 @@ def write_evidence_file_exclusive(
     fd = -1
     created_identity = None
     try:
-        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        # Platform Workers and Core use different non-root UIDs but share the
+        # dedicated artifact GID. Parent directories are setgid; group-read is
+        # therefore the minimum permission that lets Core serve this evidence.
+        fd = os.open(path.name, flags, 0o640, dir_fd=directory_fd)
         created = os.fstat(fd)
         if not stat.S_ISREG(created.st_mode):
             raise RuntimeError("evidence_screenshot_not_regular")
+        os.fchmod(fd, 0o640)
+        created = os.fstat(fd)
         created_identity = (
             directory_identity[0],
             directory_identity[1],
@@ -3185,10 +2847,15 @@ async def load_account_credential(account_id: int) -> str:
     if not row or not row["encrypted_credential"]:
         raise ValueError(f"Account {account_id} has no imported login Cookie")
     credential_blob = row["encrypted_credential"]
+    if isinstance(credential_blob, memoryview):
+        credential_blob = credential_blob.tobytes()
     try:
         return cookie_vault.decrypt(credential_blob, aad=CREDENTIAL_AAD)
-    except Exception:
-        return credential_blob.decode("utf-8") if isinstance(credential_blob, bytes) else str(credential_blob)
+    except Exception as exc:
+        # CookieVault.decrypt already supports the historical no-AAD encrypted
+        # format. Treating an undecryptable database blob as plaintext would
+        # both hide corruption and risk sending ciphertext as a Cookie header.
+        raise ValueError("account_credential_decryption_failed") from exc
 
 
 async def prepare_account_login(ctx, account_id: int, platform: str):
@@ -3201,13 +2868,13 @@ def _require_int(task: dict, field: str) -> int:
     try:
         return int(value)
     except Exception as exc:
-        raise InvalidTaskMessage(f"{field} must be an integer") from exc
+        raise InvalidTaskMessage(f"{field}_invalid") from exc
 
 
 def validate_task_message(task: dict) -> dict:
     task_id = str(task.get("task_id") or "").strip()
     if not task_id:
-        raise InvalidTaskMessage("task_id is required")
+        raise InvalidTaskMessage("task_id_required")
     account_id = _require_int(task, "account_id")
     lottery_id = _require_int(task, "lottery_id")
     platform = str(task.get("platform") or "bilibili").strip() or "bilibili"
@@ -3215,29 +2882,24 @@ def validate_task_message(task: dict) -> dict:
     task["task_id"] = task_id
     task["account_id"] = str(account_id)
     task["lottery_id"] = str(lottery_id)
-    task["platform"] = platform
-    task["mode"] = mode
     normalized_platform = platform.lower()
-    if mode == "dry_run" and normalized_platform in {
-        "douyin",
-        "xiaohongshu",
-    }:
-        raise InvalidTaskMessage(f"{normalized_platform}_manual_shadow_only")
-    if mode == "dry_run" and normalized_platform == "weibo":
+    task["platform"] = normalized_platform
+    task["mode"] = mode
+    try:
+        platform_module = get_platform_module(normalized_platform)
+        execution_path, _ = platform_module.route(mode, task.get("action_plan"))
+    except PlatformRoutingError as exc:
+        raise InvalidTaskMessage(exc.code) from exc
+    if mode == "dry_run" and execution_path.dry_run_requires_executable_plan:
         try:
-            preliminary_plan = validate_action_plan_v2(
-                task.get("action_plan"),
-                require_executable=False,
-                reject_media=True,
-            )
-            if preliminary_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
-                raise InvalidTaskMessage("weibo_manual_shadow_only")
-            oauth_dry_plan = validate_action_plan_v2(
+            dry_plan = validate_action_plan_v2(
                 task.get("action_plan"),
                 reject_media=True,
             )
-            if oauth_dry_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
-                raise InvalidTaskMessage("weibo_execution_path_not_supported")
+            if dry_plan.execution_path_id != execution_path.path_id:
+                raise InvalidTaskMessage(
+                    f"{normalized_platform}_execution_path_not_supported"
+                )
         except ActionPlanV2Error as exc:
             raise InvalidTaskMessage(exc.code) from exc
     if "weibo_rip" in task:
@@ -3245,18 +2907,47 @@ def validate_task_message(task: dict) -> dict:
         task.pop("weibo_rip", None)
         raise InvalidTaskMessage("weibo_rip_plaintext_forbidden")
     encrypted_rip = task.get("weibo_rip_encrypted")
-    if normalized_platform == "weibo" and mode == "real_run":
+    if execution_path.credential_kind == "weibo_oauth" and mode == "real_run":
+        weibo_rip_required = _platform_runtime_symbol("weibo_rip_required")
+
         try:
             plan = validate_action_plan_v2(task.get("action_plan"), reject_media=True)
-            if plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH:
-                raise InvalidTaskMessage("weibo_execution_path_not_supported")
-            rip_required = weibo_rip_required(plan.required_actions)
-            if rip_required and not isinstance(encrypted_rip, str):
-                raise InvalidTaskMessage("weibo_rip_encrypted_required")
-            if rip_required and not encrypted_rip:
-                raise InvalidTaskMessage("weibo_rip_encrypted_required")
-            if not rip_required and encrypted_rip is not None and encrypted_rip != "":
-                raise InvalidTaskMessage("weibo_rip_encrypted_not_applicable")
+            if plan.execution_path_id != execution_path.path_id:
+                raise InvalidTaskMessage(
+                    f"{normalized_platform}_execution_path_not_supported"
+                )
+            execution_intent_kind = str(
+                task.get("execution_intent_kind") or ""
+            ).strip()
+            if execution_intent_kind == "repair":
+                # The queue keeps the evidence-bound full plan. Only the
+                # durable DB binding can authorize the repair subset, so this
+                # untrusted structural precheck must not infer RIP scope from
+                # the full plan. The real-run gate enforces required/not
+                # applicable after validating the binding.
+                if encrypted_rip is not None and not isinstance(
+                    encrypted_rip,
+                    str,
+                ):
+                    raise InvalidTaskMessage(
+                        "weibo_rip_encrypted_invalid"
+                    )
+            else:
+                rip_required = weibo_rip_required(
+                    plan.required_actions
+                )
+                if rip_required and not isinstance(encrypted_rip, str):
+                    raise InvalidTaskMessage("weibo_rip_encrypted_required")
+                if rip_required and not encrypted_rip:
+                    raise InvalidTaskMessage("weibo_rip_encrypted_required")
+                if (
+                    not rip_required
+                    and encrypted_rip is not None
+                    and encrypted_rip != ""
+                ):
+                    raise InvalidTaskMessage(
+                        "weibo_rip_encrypted_not_applicable"
+                    )
             task["weibo_rip_encrypted"] = encrypted_rip or ""
         except ActionPlanV2Error as exc:
             raise InvalidTaskMessage(exc.code) from exc
@@ -3267,26 +2958,52 @@ def validate_task_message(task: dict) -> dict:
     return task
 
 
-async def dead_letter_message(msg_id: str, task: dict, reason: str):
-    task_id = str(task.get("task_id") or "") or None
-    sanitized_task = dict(task)
-    sanitized_task.pop("weibo_rip", None)
+async def dead_letter_message(
+    msg_id: str,
+    task: dict,
+    reason: str,
+    *,
+    stream_key: str = STREAM_KEY,
+):
+    task_id = _canonical_task_uuid(task)
+    safe_reason = _safe_invalid_task_reason(reason)
+    # Redis envelopes are untrusted.  Persisting the whole rejected mapping
+    # would turn the dead-letter store into a credential/token sink whenever
+    # a malformed producer injected an unexpected field.  Diagnostics need
+    # only the finite transport identity; the authoritative plan remains in
+    # MySQL and can be joined by task_id.
+    # Even fields with apparently harmless names are attacker-controlled at
+    # this boundary; a credential copied into ``platform`` or ``mode`` must
+    # not become durable merely because the field name is allowlisted.  The
+    # canonical task UUID is sufficient to join every authoritative diagnostic
+    # field from MySQL.  Invalid UUIDs retain no envelope content at all.
+    sanitized_task = {"task_id": task_id} if task_id is not None else {}
     payload = json.dumps(sanitized_task, ensure_ascii=False)
     try:
         await database.execute(
             """INSERT INTO failed_task_messages (stream_key, message_id, task_id, reason, payload)
                VALUES (:stream_key, :message_id, :task_id, :reason, :payload)""",
-            {"stream_key": STREAM_KEY, "message_id": str(msg_id), "task_id": task_id, "reason": reason[:255], "payload": payload},
+            {"stream_key": stream_key, "message_id": str(msg_id), "task_id": task_id, "reason": safe_reason, "payload": payload},
         )
     except Exception as exc:
         structured_log("error", "dead_letter_db_failed", message_id=msg_id, task_id=task_id, error=str(exc))
     try:
         await redis.xadd(
             "failed_task_messages",
-            {"stream_key": STREAM_KEY, "message_id": str(msg_id), "task_id": task_id or "", "reason": reason[:255], "payload": payload},
+            {"stream_key": stream_key, "message_id": str(msg_id), "task_id": task_id or "", "reason": safe_reason, "payload": payload},
         )
     except Exception as exc:
         structured_log("error", "dead_letter_stream_failed", message_id=msg_id, task_id=task_id, error=str(exc))
+
+
+def _safe_invalid_task_reason(reason: object) -> str:
+    """Keep only a finite diagnostic code, never an untrusted suffix/value."""
+
+    candidate = str(reason or "").strip().casefold()
+    prefix = candidate.partition(":")[0]
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,127}", prefix):
+        return prefix
+    return "invalid_task_message"
 
 
 def _canonical_task_uuid(task: dict) -> str | None:
@@ -3335,7 +3052,14 @@ async def invalid_task_requires_authoritative_recovery(task: dict) -> bool:
     )
 
 
-async def handle_invalid_task_message(msg_id: str, task: dict, reason: str) -> bool:
+async def handle_invalid_task_message(
+    msg_id: str,
+    task: dict,
+    reason: str,
+    *,
+    stream_key: str = STREAM_KEY,
+    group_name: str = GROUP_NAME,
+) -> bool:
     """Dead-letter an invalid entry and ack only when no active task needs it.
 
     Returns ``True`` when the message was acknowledged.  Database lookup
@@ -3344,14 +3068,25 @@ async def handle_invalid_task_message(msg_id: str, task: dict, reason: str) -> b
     trigger while authoritative state is unavailable.
     """
 
-    await dead_letter_message(msg_id, task, reason)
+    if stream_key == STREAM_KEY:
+        # Preserve the historical call shape for operational wrappers/tests
+        # that patch this legacy helper without the newer lane keyword.
+        await dead_letter_message(msg_id, task, reason)
+    else:
+        await dead_letter_message(
+            msg_id,
+            task,
+            reason,
+            stream_key=stream_key,
+        )
     if await invalid_task_requires_authoritative_recovery(task):
+        safe_reason = _safe_invalid_task_reason(reason)
         structured_log(
             "warning",
             "invalid_task_message_retained_for_authoritative_recovery",
             message_id=msg_id,
             task_id=_canonical_task_uuid(task),
-            reason=reason,
+            reason=safe_reason,
         )
         return False
     if reason == "weibo_rip_plaintext_forbidden":
@@ -3363,8 +3098,20 @@ async def handle_invalid_task_message(msg_id: str, task: dict, reason: str) -> b
         # after deletion, recovery can safely acknowledge the PEL tombstone.
         # Active tasks take the retained branch above and must not be deleted
         # until Core recovery has rebuilt or terminally settled them.
-        await redis.xdel(STREAM_KEY, msg_id)
-    await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
+        await redis.xdel(stream_key, msg_id)
+    if stream_key == LEGACY_TASK_STREAM_KEY:
+        # The compatibility stream remains the provenance source for Core
+        # fan-out/recovery.  Retire only its PEL reference; platform lanes own
+        # bounded terminal-entry retention.
+        await redis.xack(stream_key, group_name, str(msg_id))
+    else:
+        await redis.eval(
+            SAFE_TERMINAL_TASK_ACK_DELETE_LUA,
+            1,
+            stream_key,
+            group_name,
+            str(msg_id),
+        )
     return True
 
 
@@ -3377,35 +3124,30 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
     claimed = False
     try:
         normalized_platform = str(task.get("platform") or "").strip().lower()
-        if task_mode == "dry_run" and normalized_platform in {
-            "douyin",
-            "xiaohongshu",
-        }:
-            raise RuntimeError(f"{normalized_platform}_manual_shadow_only")
-        if task_mode == "dry_run" and normalized_platform == "weibo":
+        try:
+            platform_module = get_platform_module(normalized_platform)
+            execution_path, _ = platform_module.route(
+                task_mode, task.get("action_plan")
+            )
+        except PlatformRoutingError as exc:
+            raise RuntimeError(exc.code) from exc
+        if task_mode == "dry_run" and execution_path.dry_run_requires_executable_plan:
             try:
                 dry_plan = validate_action_plan_v2(
                     task.get("action_plan"),
-                    require_executable=False,
                     reject_media=True,
                 )
             except ActionPlanV2Error as exc:
                 raise RuntimeError(exc.code) from exc
-            if dry_plan.execution_path_id == WEIBO_MANUAL_EXECUTION_PATH:
-                raise RuntimeError("weibo_manual_shadow_only")
             if (
-                dry_plan.execution_path_id != WEIBO_OAUTH_EXECUTION_PATH
+                dry_plan.execution_path_id != execution_path.path_id
                 or dry_plan.plan.get("executable") is not True
             ):
-                raise RuntimeError("weibo_execution_path_not_supported")
+                raise RuntimeError(
+                    f"{normalized_platform}_execution_path_not_supported"
+                )
         if task_mode == "real_run":
             await enforce_task_real_run_gate(task)
-            if (
-                not uses_bilibili_api_real_task(task)
-                and not uses_weibo_oauth_real_task(task)
-                and not getattr(adapter, "REAL_ACTIONS", False)
-            ):
-                raise RuntimeError(f"Real actions for {adapter.PLATFORM} are not implemented")
             await ensure_account_can_run(account_id, task.get("platform", "bilibili"))
         binding = await mark_task_started(
             task_id,
@@ -3429,13 +3171,21 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
                 action_plan=task.get("action_plan"),
             )
         elif task_mode == "shadow_run":
-            completion_screenshot_path = await execute_shadow_run(task, adapter, pool)
-        elif uses_bilibili_api_real_task(task):
-            await execute_bilibili_api_real_task(task)
-        elif uses_weibo_oauth_real_task(task):
-            await execute_weibo_oauth_real_task(task)
+            completion_screenshot_path = await execution_path.execute(
+                task_mode,
+                task,
+                adapter,
+                pool,
+                runtime=_task_execution_services(),
+            )
         else:
-            await execute_real_task(task, adapter, pool)
+            await execution_path.execute(
+                task_mode,
+                task,
+                adapter,
+                pool,
+                runtime=_task_execution_services(),
+            )
         try:
             finished = await mark_task_finished(task_id, True, screenshot_path=completion_screenshot_path)
         except Exception as exc:
@@ -3464,6 +3214,9 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
         if task_mode == "shadow_run" and finished is True:
             # The materializer requires the exact shadow lease to have reached
             # its released terminal state, so it must run after settlement.
+            materialize_for_shadow_task = _platform_runtime_symbol(
+                "materialize_for_shadow_task"
+            )
             await materialize_for_shadow_task(db=database, task_id=task_id)
         return True
     except TaskSettlementUnconfirmed:
@@ -3518,17 +3271,10 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
                 False,
                 str(e),
                 screenshot_row["screenshot_path"] if screenshot_row else None,
-                quarantine_account=isinstance(
-                    e,
-                    (
-                        ExternalActionOutcomeUnknown,
-                        BilibiliApiActionOutcomeUnknown,
-                        BilibiliActionSettlementFailed,
-                    ),
+                quarantine_account=bool(
+                    getattr(e, "quarantine_account", False)
                 ),
-                account_failure_status=(
-                    e.account_status if isinstance(e, WeiboApiRejected) else None
-                ),
+                account_failure_status=getattr(e, "account_status", None),
             )
             if settled is False:
                 structured_log(
@@ -3563,45 +3309,484 @@ async def execute_task_with_phases(task: dict, adapter, pool, stream_message_id:
         return False
 
 
-async def task_loop(pool: BrowserPool, shutdown_event: asyncio.Event):
+@dataclass
+class _DispatchedTaskMessage:
+    message_id: str
+    task: dict
+    stream_key: str
+    group_name: str
+    waiting_for_platform: bool = True
+
+
+def _legacy_fanout_marker_key(source_message_id: str) -> str:
+    marker_digest = hashlib.sha256(
+        (
+            f"{LEGACY_TASK_STREAM_KEY}:{str(source_message_id)}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"legacy_task_fanout:{marker_digest}"
+
+
+def _legacy_fanout_marker_member(
+    stream_key: str,
+    message_id: str,
+    task_id: str,
+) -> str:
+    return (
+        f"{str(stream_key)}|{str(task_id).strip()}|"
+        f"{str(message_id)}"
+    )
+
+
+def _has_valid_legacy_fanout_source(task: dict) -> bool:
+    source_stream = str(
+        task.get(LEGACY_SOURCE_STREAM_FIELD) or ""
+    ).strip()
+    source_message_id = str(
+        task.get(LEGACY_SOURCE_MESSAGE_ID_FIELD) or ""
+    ).strip()
+    return bool(
+        source_stream == LEGACY_TASK_STREAM_KEY
+        and _REDIS_STREAM_ID_RE.fullmatch(source_message_id)
+    )
+
+
+async def _ack_settled_dispatched_message(
+    dispatched: _DispatchedTaskMessage,
+) -> None:
+    """ACK a terminal delivery and retire its legacy provenance atomically."""
+
+    task = dispatched.task
+    if _has_valid_legacy_fanout_source(task):
+        source_message_id = str(
+            task[LEGACY_SOURCE_MESSAGE_ID_FIELD]
+        ).strip()
+        await redis.eval(
+            SAFE_TERMINAL_FANOUT_ACK_DELETE_LUA,
+            2,
+            dispatched.stream_key,
+            _legacy_fanout_marker_key(source_message_id),
+            dispatched.group_name,
+            dispatched.message_id,
+            _legacy_fanout_marker_member(
+                dispatched.stream_key,
+                dispatched.message_id,
+                str(task.get("task_id") or ""),
+            ),
+        )
+        return
+    await redis.eval(
+        SAFE_TERMINAL_TASK_ACK_DELETE_LUA,
+        1,
+        dispatched.stream_key,
+        dispatched.group_name,
+        dispatched.message_id,
+    )
+
+
+async def _execute_dispatched_task(
+    dispatched: _DispatchedTaskMessage,
+    platform_lock: asyncio.Lock,
+    pool: BrowserPool,
+) -> None:
+    """Run one validated entry and acknowledge only after safe settlement.
+
+    The lock is per platform, not global: execution is serial for a platform
+    but concurrent across platforms.  ``CancelledError`` is intentionally not
+    converted to a normal failure and XACK is intentionally not in ``finally``;
+    shutdown therefore leaves an interrupted entry pending for Core recovery.
+    """
+
+    task = dispatched.task
+    msg_id = dispatched.message_id
+    platform = str(task.get("platform") or "").strip().lower()
     try:
-        await redis.xgroup_create(STREAM_KEY, GROUP_NAME, id="0", mkstream=True)
-    except Exception:
-        pass
+        async with platform_lock:
+            # From this point the existing DB claim/lease and recovery contract
+            # is authoritative.  The PEL refresher must no longer hide an
+            # expired running lease from Core recovery.
+            dispatched.waiting_for_platform = False
+            selector_config = parse_json_field(task.get("selector_config")) or {}
+            success = await execute_task_with_phases(
+                task,
+                get_adapter(platform, selector_config),
+                pool,
+                str(msg_id),
+            )
+            await _ack_settled_dispatched_message(dispatched)
+            if not success:
+                structured_log(
+                    "error",
+                    "task_failed",
+                    task_id=task.get("task_id"),
+                    platform=platform,
+                )
+    except asyncio.CancelledError:
+        structured_log(
+            "info",
+            "platform_task_cancelled_pending_recovery",
+            task_id=task.get("task_id"),
+            platform=platform,
+            message_id=msg_id,
+        )
+        raise
+    except Exception as exc:
+        # execute_task_with_phases deliberately raises when authoritative
+        # settlement is unconfirmed.  Isolate that entry/platform without
+        # acknowledging it or terminating sibling platform lanes.
+        structured_log(
+            "error",
+            "platform_task_dispatch_error",
+            task_id=task.get("task_id"),
+            platform=platform,
+            message_id=msg_id,
+            exception=exc,
+        )
+
+
+async def _refresh_waiting_pending_entries(
+    inflight: dict[asyncio.Task, _DispatchedTaskMessage],
+    shutdown_event: asyncio.Event,
+    *,
+    stream_key: str = STREAM_KEY,
+    group_name: str = GROUP_NAME,
+) -> None:
+    """Keep locally queued (but not running) PEL entries from false recovery."""
+
     while not shutdown_event.is_set():
         try:
-            msgs = await asyncio.wait_for(redis.xreadgroup(GROUP_NAME, CONSUMER_NAME, {STREAM_KEY: ">"}, count=1, block=5000), timeout=1)
-            if not msgs:
-                continue
-            for msg_id, data in msgs[0][1]:
-                task = {k: v for k, v in data.items()}
-                structured_log("info", "task_received", task_id=task.get("task_id"), message_id=msg_id)
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=TASK_PENDING_REFRESH_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        message_ids = [
+            dispatched.message_id
+            for task, dispatched in tuple(inflight.items())
+            if not task.done() and dispatched.waiting_for_platform
+        ]
+        if not message_ids:
+            continue
+        try:
+            # JUSTID avoids returning/re-decoding payloads and, in Redis, does
+            # not increment the delivery retry counter.  If the worker/event
+            # loop dies this refresh stops and the normal 120s recovery path
+            # becomes eligible again.
+            await redis.xclaim(
+                stream_key,
+                group_name,
+                CONSUMER_NAME,
+                min_idle_time=0,
+                message_ids=message_ids,
+                justid=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A refresh failure must not make a valid task execute twice or be
+            # acknowledged.  DB claim ownership remains the final arbiter if
+            # recovery races this local waiter.
+            structured_log(
+                "warning",
+                "waiting_task_pending_refresh_failed",
+                stream=stream_key,
+                group=group_name,
+                message_count=len(message_ids),
+                exception=exc,
+            )
+
+
+async def _wait_for_dispatch_capacity(
+    binding: TaskStreamBinding,
+    inflight: dict[asyncio.Task, _DispatchedTaskMessage],
+    shutdown_event: asyncio.Event,
+) -> bool:
+    """Wait for one bounded slot while publishing bounded liveness evidence."""
+
+    while len(inflight) >= TASK_DISPATCH_MAX_INFLIGHT:
+        _record_task_lane_loop_progress(
+            binding,
+            "capacity_wait",
+            inflight_count=len(inflight),
+        )
+        shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (*tuple(inflight), shutdown_waiter),
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=TASK_LANE_HEALTH_PROGRESS_INTERVAL_SECONDS,
+            )
+        finally:
+            if not shutdown_waiter.done():
+                shutdown_waiter.cancel()
+                await asyncio.gather(shutdown_waiter, return_exceptions=True)
+        for completed in done:
+            if completed is not shutdown_waiter:
+                inflight.pop(completed, None)
+        if shutdown_event.is_set():
+            _record_task_lane_loop_progress(
+                binding,
+                "shutdown",
+                inflight_count=len(inflight),
+            )
+            return False
+    _record_task_lane_loop_progress(
+        binding,
+        "capacity_available",
+        inflight_count=len(inflight),
+    )
+    return not shutdown_event.is_set()
+
+
+async def _ensure_task_stream_group(binding: TaskStreamBinding) -> None:
+    await verify_redis_consumer_group(
+        redis,
+        stream_key=binding.stream_key,
+        group_name=binding.group_name,
+    )
+
+
+def _validate_task_stream_envelope(
+    binding: TaskStreamBinding,
+    task: dict,
+) -> None:
+    try:
+        validate_task_stream_message(binding, task)
+    except ValueError as exc:
+        raise InvalidTaskMessage(str(exc)) from exc
+
+
+async def _task_stream_loop(
+    binding: TaskStreamBinding,
+    pool: BrowserPool,
+    shutdown_event: asyncio.Event,
+    platform_locks: dict[str, asyncio.Lock],
+) -> None:
+    """Consume one durable task lane with independent capacity and recovery."""
+
+    inflight: dict[asyncio.Task, _DispatchedTaskMessage] = {}
+    pending_refresh_task = asyncio.create_task(
+        _refresh_waiting_pending_entries(
+            inflight,
+            shutdown_event,
+            stream_key=binding.stream_key,
+            group_name=binding.group_name,
+        )
+    )
+    group_ready = False
+    try:
+        while not shutdown_event.is_set():
+            if not group_ready:
                 try:
-                    task = validate_task_message(task)
-                except InvalidTaskMessage as exc:
-                    acknowledged = await handle_invalid_task_message(
-                        msg_id, task, str(exc)
+                    await _ensure_task_stream_group(binding)
+                    group_ready = True
+                    _record_task_lane_success(
+                        binding,
+                        "consumer_group_verify",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _record_task_lane_failure(
+                        binding,
+                        "consumer_group_verify",
+                        exc,
                     )
                     structured_log(
                         "error",
-                        "task_message_dead_lettered",
-                        message_id=msg_id,
-                        reason=str(exc),
-                        acknowledged=acknowledged,
+                        "task_stream_group_verify_failed",
+                        stream=binding.stream_key,
+                        group=binding.group_name,
+                        exception=exc,
                     )
+                    try:
+                        await asyncio.wait_for(
+                            shutdown_event.wait(),
+                            timeout=5,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                     continue
-                selector_config = parse_json_field(task.get("selector_config")) or {}
-                success = await execute_task_with_phases(task, get_adapter(task.get("platform", "bilibili"), selector_config), pool, str(msg_id))
-                await redis.xack(STREAM_KEY, GROUP_NAME, msg_id)
-                if not success:
-                    structured_log("error", "task_failed", task_id=task.get("task_id"))
-        except asyncio.TimeoutError:
-            continue
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            structured_log("error", "task_loop_error", exception=e)
-            await asyncio.sleep(5)
+            if not await _wait_for_dispatch_capacity(
+                binding,
+                inflight,
+                shutdown_event,
+            ):
+                break
+            available = TASK_DISPATCH_MAX_INFLIGHT - len(inflight)
+            read_count = min(TASK_STREAM_READ_COUNT, available)
+            lane_operation = "xreadgroup"
+            try:
+                msgs = await redis.xreadgroup(
+                    binding.group_name,
+                    CONSUMER_NAME,
+                    {binding.stream_key: ">"},
+                    count=read_count,
+                    block=1000,
+                )
+                _record_task_lane_success(
+                    binding,
+                    "xreadgroup",
+                )
+                if not msgs:
+                    continue
+                lane_operation = "dispatch"
+                for stream_name, entries in msgs:
+                    if str(stream_name) != binding.stream_key:
+                        structured_log(
+                            "error",
+                            "task_stream_read_mismatch",
+                            expected_stream=binding.stream_key,
+                            actual_stream=str(stream_name),
+                        )
+                        continue
+                    for msg_id, data in entries:
+                        task = {k: v for k, v in data.items()}
+                        structured_log(
+                            "info",
+                            "task_received",
+                            task_id=task.get("task_id"),
+                            message_id=msg_id,
+                            stream=binding.stream_key,
+                        )
+                        try:
+                            # Reject cross-protocol entries before parsing a
+                            # full action plan or touching platform routing.
+                            _validate_task_stream_envelope(binding, task)
+                            # All queue input still crosses the existing
+                            # untrusted-message boundary before dispatch.
+                            task = validate_task_message(task)
+                            _validate_task_stream_envelope(binding, task)
+                        except InvalidTaskMessage as exc:
+                            acknowledged = await handle_invalid_task_message(
+                                msg_id,
+                                task,
+                                str(exc),
+                                stream_key=binding.stream_key,
+                                group_name=binding.group_name,
+                            )
+                            structured_log(
+                                "error",
+                                "task_message_dead_lettered",
+                                message_id=msg_id,
+                                reason=str(exc),
+                                acknowledged=acknowledged,
+                                stream=binding.stream_key,
+                            )
+                            continue
+
+                        platform = task["platform"]
+                        dispatched = _DispatchedTaskMessage(
+                            message_id=str(msg_id),
+                            task=task,
+                            stream_key=binding.stream_key,
+                            group_name=binding.group_name,
+                        )
+                        execution_task = asyncio.create_task(
+                            _execute_dispatched_task(
+                                dispatched,
+                                platform_locks[platform],
+                                pool,
+                            )
+                        )
+                        inflight[execution_task] = dispatched
+
+                        def discard_completed(completed: asyncio.Task) -> None:
+                            inflight.pop(completed, None)
+
+                        execution_task.add_done_callback(discard_completed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _record_task_lane_failure(
+                    binding,
+                    lane_operation,
+                    exc,
+                )
+                # Redis may be recreated while this process stays alive. Any
+                # lane error revalidates its exact bootstrap-owned group before
+                # the next read; a missing group keeps this lane fail-closed.
+                group_ready = False
+                structured_log(
+                    "error",
+                    "task_stream_loop_error",
+                    stream=binding.stream_key,
+                    group=binding.group_name,
+                    exception=exc,
+                )
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+    except asyncio.CancelledError:
+        # Main cancels this coroutine during shutdown.  Cleanup below cancels
+        # every active/waiting entry and deliberately leaves it unacknowledged.
+        pass
+    finally:
+        pending_refresh_task.cancel()
+        execution_tasks = tuple(inflight)
+        for execution_task in execution_tasks:
+            execution_task.cancel()
+        await asyncio.gather(
+            pending_refresh_task, *execution_tasks, return_exceptions=True
+        )
+
+
+async def task_loop(
+    pool: BrowserPool,
+    shutdown_event: asyncio.Event,
+    *,
+    platforms=None,
+):
+    selected_platforms = normalize_platform_scope(
+        "all" if platforms is None else platforms
+    )
+    registered = tuple(
+        platform
+        for platform in registered_platforms()
+        if platform in selected_platforms
+    )
+    bindings = tuple(
+        binding
+        for binding in task_stream_bindings(include_legacy=False)
+        if binding.platform in selected_platforms
+    )
+    topology_platforms = {
+        binding.platform
+        for binding in bindings
+        if binding.platform is not None
+    }
+    if set(registered) != topology_platforms:
+        raise RuntimeError(
+            "task_stream_platform_registry_mismatch:"
+            + ",".join(sorted(set(registered) ^ topology_platforms))
+        )
+    platform_locks = {platform: asyncio.Lock() for platform in registered}
+
+    lane_tasks = tuple(
+        asyncio.create_task(
+            _task_stream_loop(
+                binding,
+                pool,
+                shutdown_event,
+                platform_locks,
+            ),
+            name=f"task-stream:{binding.stream_key}",
+        )
+        for binding in bindings
+    )
+    try:
+        await asyncio.gather(*lane_tasks)
+    except asyncio.CancelledError:
+        # Each lane owns its local PEL tasks and will leave interrupted entries
+        # pending when cancelled. Cleanup below waits for that contract.
+        pass
+    finally:
+        for lane_task in lane_tasks:
+            lane_task.cancel()
+        await asyncio.gather(*lane_tasks, return_exceptions=True)
 
 
 def parse_json_field(value):
@@ -3627,24 +3812,15 @@ def requested_phases(task: dict, require_plan: bool) -> list[str]:
     plan = parse_json_field(task.get("action_plan"))
     if not isinstance(plan, dict):
         plan = {}
-    actions = plan.get("required_actions")
     normalized_platform = str(task.get("platform") or "").strip().lower()
-    if normalized_platform == "xiaohongshu":
-        phase_order = XIAOHONGSHU_PHASE_ORDER
-    elif normalized_platform == "douyin":
-        phase_order = DOUYIN_PHASE_ORDER
-    elif normalized_platform == "weibo":
-        phase_order = WEIBO_PHASE_ORDER
-    else:
-        phase_order = PHASE_ORDER
-    phases = [
-        phase
-        for phase in phase_order
-        if isinstance(actions, list) and phase in actions
-    ]
+    try:
+        platform_module = get_platform_module(normalized_platform or "bilibili")
+    except PlatformRoutingError as exc:
+        raise RuntimeError(exc.code) from exc
+    selected_phases = platform_module.selected_phases(plan)
     if require_plan:
         if plan.get("review_required"):
             raise RuntimeError("Lottery rule requires review before real-run")
-        if not phases:
+        if not selected_phases:
             raise RuntimeError("Lottery action plan is missing required actions")
-    return phases or list(phase_order)
+    return selected_phases or list(platform_module.action_order)

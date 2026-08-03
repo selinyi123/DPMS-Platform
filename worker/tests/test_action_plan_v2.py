@@ -99,6 +99,12 @@ class ActionPlanV2Tests(unittest.TestCase):
             {"required_actions": ["commented"], "review_required": False},
         )
 
+    def test_unknown_platform_cannot_inherit_bilibili_plan_semantics(self):
+        self.assert_code(
+            "action_plan_platform_unsupported",
+            plan_v2(platform="unknown"),
+        )
+
     def test_false_review_flag_without_operator_attestation_is_rejected(self):
         for field, value in (
             ("reviewed_by", None),
@@ -113,6 +119,18 @@ class ActionPlanV2Tests(unittest.TestCase):
                 plan[field] = value
                 plan["plan_hash"] = compute_action_plan_hash(plan)
                 self.assert_code("action_plan_review_attestation_invalid", plan)
+
+    def test_lone_surrogate_reviewer_is_rejected_without_encoder_error(self):
+        plan = plan_v2()
+        plan["reviewed_by"] = "\ud800"
+
+        self.assert_code("action_plan_review_attestation_invalid", plan)
+
+    def test_bilibili_rejects_foreign_execution_path(self):
+        self.assert_code(
+            "bilibili_execution_path_not_supported",
+            plan_v2(execution_path_id="weibo_oauth_v1"),
+        )
 
     def test_follow_target_is_required_and_exact(self):
         for payload, code in (

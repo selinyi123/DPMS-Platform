@@ -1,10 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-import { authenticatedApiPath, fetchJSON, postJSON, putJSON } from '../api';
+import { fetchJSON, postJSON, putJSON } from '../api';
+import { settleRequestSlicesIndependently } from '../asyncSlices';
 import StatusBadge from '../components/StatusBadge';
+import AuthenticatedAssetLink from '../components/AuthenticatedAssetLink';
 import { formatText } from '../i18n/format';
+import { lotteryPagePlatformModuleDemand } from '../platformModuleDemand';
 import {
-  actionTextContainsRequiredToken,
+  actionRequirementValues,
+  authoritativeRuleText,
+  automaticFollowTarget,
+  defaultRepostText,
+  lotteryTargetIdentity,
+  ruleEditorSaveBlockers,
+  sourceRequires,
+  validLotteryHandle,
+  visibleRuleSnapshotParts,
+} from '../lotteryRuleEditor';
+import {
   actionPlanHasMediaRequirement,
   actionPlanV2Blockers,
   actionPlanV2Ready,
@@ -12,14 +25,19 @@ import {
   actionPlanV2ReviewReady,
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
+  evidenceResponseMatchesAccountScope,
+  exactActionPayloadErrors,
   executionEvidencePresentation,
   isFixedManualActionPlatform,
   isManualAssistedPlan,
   isManualAssistedPlatform,
   lotteryActionsForPlatform,
   manualAssistedChecklist,
+  manualParticipationCanSubmit,
+  manualParticipationConfirmationEnabled,
+  manualParticipationIsFinalized,
+  manualParticipationResultNote,
   manualShadowObservation,
-  mentionIdentityKey,
   platformDispatchBlocker,
   platformExecutionPathId,
   realRunEvidencePath,
@@ -27,19 +45,32 @@ import {
   targetTransportCompatibilityIssue,
   targetValidationErrorCode,
   unresolvedRuleRequirements,
-  WEIBO_MANUAL_EXECUTION_PATH_ID,
-  WEIBO_MAX_UNIQUE_HANDLES,
-  WEIBO_OAUTH_EXECUTION_PATH_ID,
 } from '../lotteryCompatibility';
 import { useUi } from '../uiContext';
 import {
-  DOUYIN_IMPORT_MAX_BYTES,
-  WEIBO_IMPORT_MAX_BYTES,
-  XIAOHONGSHU_IMPORT_MAX_BYTES,
-  TARGET_IMPORT_PASSTHROUGH_MAX_BYTES,
+  accountMatchesPlatformDispatch,
+  buildPlatformAccountCredentialIndex,
+  hasEligibleAccountForPlatformDispatch,
+  normalizePlatformTargetImport,
+  normalizedAccountCredentialKind,
+  platformDiscoverySourceTypes,
+  platformExecutionPathPresentation,
+  platformExecutionPaths,
+  platformRealTargetKinds,
+  platformSupportsDiscoverySource,
+  platformSupportsExecutionPath,
+  platformSupportsStructuredTargetImport,
+  readTargetImportFile,
+  TARGET_IMPORT_FILE_MAX_BYTES,
   TargetImportError,
-  normalizeTargetImportForPlatform,
-} from '../xiaohongshuImport';
+} from '../platforms';
+import {
+  targetImportCanSubmit,
+  targetImportInvalidErrorCode,
+  targetImportNotificationLevel,
+  targetImportOperationIsCurrent,
+  targetOperationErrorCode,
+} from '../targetImportOperation';
 
 function probePhaseTotal(summary, platform) {
   return Array.isArray(summary?.required_phases) && summary.required_phases.length
@@ -55,14 +86,29 @@ const API_ACTION_PHASES = {
   repost: 'reposted',
 };
 const REAL_RUN_EVIDENCE_TTL_MS = 65000;
+const MANUAL_DISCOVERY_SCAN_TIMEOUT_MS = 145_000;
 
-export default function Lotteries() {
+export default function Lotteries({
+  platformModuleStates = {},
+  requestPlatformModules = null,
+}) {
   const { notify, t } = useUi();
   const loadInFlightRef = useRef(false);
   const evidenceRefreshPendingRef = useRef(false);
   const evidenceExpiryTimerRef = useRef(null);
+  const evidenceRequestGenerationRef = useRef(0);
   const selectedAccountRef = useRef('');
   const targetFileReadIdRef = useRef(0);
+  const targetImportGenerationRef = useRef(0);
+  const targetImportOperationRef = useRef(0);
+  const targetImportBusyRef = useRef(false);
+  // Keep large imported text out of React's reconciliation graph. The
+  // textarea and this ref are the single draft owner; platform/score changes
+  // still use the small targetImport state object.
+  const targetImportContentRef = useRef('');
+  const targetImportTextareaRef = useRef(null);
+  const targetFileBusyRef = useRef(false);
+  const loadErrorSignatureRef = useRef('');
   const mountedRef = useRef(true);
   const [lotteries, setLotteries] = useState([]);
   const [runs, setRuns] = useState([]);
@@ -75,18 +121,31 @@ export default function Lotteries() {
   const [readiness, setReadiness] = useState(null);
   const [realRunEvidence, setRealRunEvidence] = useState([]);
   const [error, setError] = useState('');
+  const [activityFormError, setActivityFormError] = useState('');
+  const [targetImportError, setTargetImportError] = useState('');
   const [discoveryMessage, setDiscoveryMessage] = useState('');
   const [dispatchMode, setDispatchMode] = useState('dry_run');
   const [selectedAccount, setSelectedAccount] = useState('');
   const [form, setForm] = useState({ platform: 'bilibili', raw_url: '', value_score: 50 });
-  const [targetImport, setTargetImport] = useState({ platform: 'bilibili', content: '', value_score: 50 });
+  const [targetImport, setTargetImport] = useState({ platform: 'bilibili', value_score: 50 });
   const [targetImportResult, setTargetImportResult] = useState(null);
+  const [targetImportBusy, setTargetImportBusy] = useState(false);
+  const [targetFileBusy, setTargetFileBusy] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [sourceForm, setSourceForm] = useState({
     platform: 'bilibili',
     source_type: 'url_list',
     source_value: '',
     scan_interval_minutes: 30,
   });
+
+  const sourcePlatformModuleReady = (
+    platformModuleStates[sourceForm.platform] === 'ready'
+  );
+  const sourceTypeOptions = useMemo(
+    () => platformDiscoverySourceTypes(sourceForm.platform),
+    [sourceForm.platform, sourcePlatformModuleReady],
+  );
 
   const adapterById = useMemo(
     () => Object.fromEntries(adapters.map(adapter => [adapter.platform, adapter])),
@@ -107,15 +166,107 @@ export default function Lotteries() {
     () => accounts.filter(account => account.status === 'ready' && account.credential_ready && account.latest_calibration?.status === 'succeeded'),
     [accounts],
   );
+  const safeAccountCredentialIndex = useMemo(
+    () => buildPlatformAccountCredentialIndex(safeAccounts),
+    [safeAccounts],
+  );
 
   const realRunEnabled = Boolean(realRunEvidence[0]?.real_run_enabled);
   const safeAccountCount = platformId => safeAccounts.filter(account => account.platform === platformId).length;
   const selectedSafeAccount = safeAccounts.find(account => String(account.id) === String(selectedAccount));
+  const executionPathForLottery = lottery => lottery?.action_plan?.execution_path_id || '';
+  const hasEligibleSafeAccountFor = (lottery, mode) => hasEligibleAccountForPlatformDispatch(
+    safeAccountCredentialIndex,
+    lottery?.platform,
+    mode,
+    executionPathForLottery(lottery),
+  );
+  const selectedAccountMatchesPlatform = lottery => Boolean(
+    lottery
+    && selectedSafeAccount
+    && selectedSafeAccount.platform === lottery.platform
+  );
+  const selectedAccountMatchesDispatch = (lottery, mode) => accountMatchesPlatformDispatch(
+    selectedSafeAccount,
+    lottery?.platform,
+    mode,
+    executionPathForLottery(lottery),
+  );
   const manualTargetIssue = targetTransportCompatibilityIssue(form.platform, form.raw_url);
+  const targetImportModuleReady = platformModuleStates[targetImport.platform] === 'ready';
+  const platformModuleDemand = useMemo(
+    () => lotteryPagePlatformModuleDemand({
+      createPlatform: form.platform,
+      importPlatform: targetImport.platform,
+      sourcePlatform: sourceForm.platform,
+      lotteries,
+      strategyQueue,
+    }),
+    [
+      form.platform,
+      lotteries,
+      sourceForm.platform,
+      strategyQueue,
+      targetImport.platform,
+    ],
+  );
+
+  const updateTargetImportDraft = (update) => {
+    targetImportGenerationRef.current += 1;
+    targetFileReadIdRef.current += 1;
+    if (targetFileBusyRef.current) {
+      targetFileBusyRef.current = false;
+      setTargetFileBusy(false);
+    }
+    setTargetImportError('');
+    setTargetImportResult(null);
+    setTargetImport(previous => (
+      typeof update === 'function' ? update(previous) : update
+    ));
+  };
+
+  const setTargetImportContent = (content) => {
+    const nextContent = String(content || '');
+    targetImportContentRef.current = nextContent;
+    if (
+      targetImportTextareaRef.current
+      && targetImportTextareaRef.current.value !== nextContent
+    ) {
+      targetImportTextareaRef.current.value = nextContent;
+    }
+  };
+
+  useEffect(() => {
+    if (typeof requestPlatformModules === 'function') {
+      requestPlatformModules(platformModuleDemand);
+    }
+  }, [platformModuleDemand, requestPlatformModules]);
+
+  useEffect(() => {
+    if (!sourcePlatformModuleReady || !sourceTypeOptions.length) return;
+    setSourceForm((previous) => {
+      if (
+        previous.platform !== sourceForm.platform
+        || sourceTypeOptions.includes(previous.source_type)
+      ) return previous;
+      return { ...previous, source_type: sourceTypeOptions[0] };
+    });
+  }, [
+    sourceForm.platform,
+    sourcePlatformModuleReady,
+    sourceTypeOptions,
+  ]);
 
   const load = async (includeRealRunEvidence = true) => {
     if (!mountedRef.current) return;
+    const evidenceAccountId = includeRealRunEvidence
+      ? String(selectedAccountRef.current || '')
+      : '';
+    const evidenceGeneration = includeRealRunEvidence
+      ? evidenceRequestGenerationRef.current + 1
+      : evidenceRequestGenerationRef.current;
     if (includeRealRunEvidence) {
+      evidenceRequestGenerationRef.current = evidenceGeneration;
       window.clearTimeout(evidenceExpiryTimerRef.current);
       setRealRunEvidence([]);
     }
@@ -125,45 +276,118 @@ export default function Lotteries() {
     }
     loadInFlightRef.current = true;
     try {
-      const [lotteryRows, runRows, probeRows, sourceRows, strategyRows, accountRows, platformRows, adapterRows] = await Promise.all([
-        fetchJSON('/lotteries/'),
-        fetchJSON('/lotteries/tasks/runs'),
-        fetchJSON('/lotteries/probes'),
-        fetchJSON('/lotteries/sources'),
-        fetchJSON('/lotteries/strategy/queue'),
-        fetchJSON('/accounts/'),
-        fetchJSON('/accounts/platforms'),
-        fetchJSON('/lotteries/adapters'),
+      const applyWhileMounted = apply => (value) => {
+        if (mountedRef.current) apply(value);
+      };
+      const handles = settleRequestSlicesIndependently([
+        {
+          key: 'lotteries',
+          request: fetchJSON('/lotteries/'),
+          onFulfilled: applyWhileMounted(setLotteries),
+        },
+        {
+          key: 'runs',
+          request: fetchJSON('/lotteries/tasks/runs'),
+          onFulfilled: applyWhileMounted(setRuns),
+        },
+        {
+          key: 'probes',
+          request: fetchJSON('/lotteries/probes'),
+          onFulfilled: applyWhileMounted(setProbes),
+        },
+        {
+          key: 'sources',
+          request: fetchJSON('/lotteries/sources'),
+          onFulfilled: applyWhileMounted(setSources),
+        },
+        {
+          key: 'strategy',
+          // Account-scoped readiness performs authoritative evidence checks.
+          // Refresh it with the one-minute evidence cadence rather than every
+          // lightweight 15-second status poll.
+          request: includeRealRunEvidence
+            ? fetchJSON('/lotteries/strategy/queue')
+            : Promise.resolve(null),
+          onFulfilled: applyWhileMounted((value) => {
+            if (value) setStrategyQueue(value.items || []);
+          }),
+        },
+        {
+          key: 'accounts',
+          request: fetchJSON('/accounts/'),
+          onFulfilled: applyWhileMounted(setAccounts),
+        },
+        {
+          key: 'platforms',
+          request: fetchJSON('/accounts/platforms'),
+          onFulfilled: applyWhileMounted(setPlatforms),
+        },
+        {
+          key: 'adapters',
+          request: fetchJSON('/lotteries/adapters'),
+          onFulfilled: applyWhileMounted(setAdapters),
+        },
+        {
+          key: 'readiness',
+          request: fetchJSON('/metrics/readiness'),
+          onFulfilled: applyWhileMounted(setReadiness),
+        },
+        {
+          key: 'evidence',
+          request: includeRealRunEvidence
+            ? fetchJSON(realRunEvidencePath(evidenceAccountId))
+            : Promise.resolve(null),
+          onFulfilled: applyWhileMounted((value) => {
+            if (!value) return;
+            if (
+              evidenceRequestGenerationRef.current !== evidenceGeneration
+              || String(selectedAccountRef.current || '') !== evidenceAccountId
+              || !evidenceResponseMatchesAccountScope(value, evidenceAccountId)
+            ) return;
+            setRealRunEvidence(value.items || []);
+            window.clearTimeout(evidenceExpiryTimerRef.current);
+            evidenceExpiryTimerRef.current = window.setTimeout(() => {
+              if (mountedRef.current) setRealRunEvidence([]);
+            }, REAL_RUN_EVIDENCE_TTL_MS);
+          }),
+        },
       ]);
-      const [readinessRows, evidenceRows] = await Promise.all([
-        fetchJSON('/metrics/readiness'),
-        includeRealRunEvidence
-          ? fetchJSON(realRunEvidencePath(selectedAccountRef.current))
-          : Promise.resolve(null),
-      ]);
+      const results = await Promise.all(handles);
       if (!mountedRef.current) return;
-      setLotteries(lotteryRows);
-      setRuns(runRows);
-      setProbes(probeRows);
-      setSources(sourceRows);
-      setStrategyQueue(strategyRows.items || []);
-      setAccounts(accountRows);
-      setPlatforms(platformRows);
-      setAdapters(adapterRows);
-      setReadiness(readinessRows);
-      if (evidenceRows) {
-        setRealRunEvidence(evidenceRows.items || []);
-        window.clearTimeout(evidenceExpiryTimerRef.current);
-        evidenceExpiryTimerRef.current = window.setTimeout(() => {
-          if (mountedRef.current) setRealRunEvidence([]);
-        }, REAL_RUN_EVIDENCE_TTL_MS);
+
+      const failures = results
+        .filter(result => (
+          result.status === 'rejected'
+          && (
+            result.key !== 'evidence'
+            || (
+              includeRealRunEvidence
+              && evidenceRequestGenerationRef.current === evidenceGeneration
+              && String(selectedAccountRef.current || '') === evidenceAccountId
+            )
+          )
+        ));
+      if (failures.length) {
+        const firstReason = failures[0].error;
+        const firstMessage = firstReason instanceof Error
+          ? firstReason.message
+          : String(firstReason || 'request_failed');
+        const message = targetValidationErrorText(firstMessage, t);
+        const signature = failures.map(result => result.key).join(',');
+        setLoadError(message);
+        if (loadErrorSignatureRef.current !== signature) notify(message, 'error');
+        loadErrorSignatureRef.current = signature;
+      } else {
+        setLoadError('');
+        loadErrorSignatureRef.current = '';
       }
     } catch (err) {
       if (!mountedRef.current) return;
       if (includeRealRunEvidence) setRealRunEvidence([]);
       const message = targetValidationErrorText(err.message, t);
-      setError(message);
-      notify(message, 'error');
+      setLoadError(message);
+      if (loadErrorSignatureRef.current !== message) notify(message, 'error');
+      loadErrorSignatureRef.current = message;
     } finally {
       loadInFlightRef.current = false;
       if (mountedRef.current && evidenceRefreshPendingRef.current) {
@@ -196,7 +420,7 @@ export default function Lotteries() {
 
   const createLottery = async (e) => {
     e.preventDefault();
-    setError('');
+    setActivityFormError('');
     try {
       await postJSON('/lotteries/', {
         platform: form.platform,
@@ -208,21 +432,44 @@ export default function Lotteries() {
       notify(t('lotteries.activityCreated'), 'success');
       await load();
     } catch (err) {
-      const message = targetValidationErrorText(err.message, t);
-      setError(message);
+      const message = targetImportErrorText(err, t);
+      setActivityFormError(message);
       notify(message, 'error');
     }
   };
 
   const importTargets = async (e) => {
     e.preventDefault();
-    setError('');
+    if (!targetImportCanSubmit({
+      content: targetImportContentRef.current,
+      fileBusy: targetFileBusyRef.current,
+      importBusy: targetImportBusyRef.current,
+      moduleReady: targetImportModuleReady,
+    })) return;
+    targetImportBusyRef.current = true;
+    setTargetImportBusy(true);
+    targetFileReadIdRef.current += 1;
+    const operationId = targetImportOperationRef.current + 1;
+    targetImportOperationRef.current = operationId;
+    const generation = targetImportGenerationRef.current;
+    const snapshot = {
+      ...targetImport,
+      content: targetImportContentRef.current,
+    };
+    const isCurrent = () => targetImportOperationIsCurrent({
+      mounted: mountedRef.current,
+      expectedGeneration: generation,
+      currentGeneration: targetImportGenerationRef.current,
+      expectedOperationId: operationId,
+      currentOperationId: targetImportOperationRef.current,
+    });
+    setTargetImportError('');
     setTargetImportResult(null);
     try {
-      const normalizedImport = normalizeTargetImport(targetImport, platforms);
+      const normalizedImport = await normalizeTargetImport(snapshot);
+      if (!isCurrent()) return;
       if (normalizedImport.converted) {
-        setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
-        const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+        const messageKey = targetImportSanitizedMessageKey(snapshot.platform);
         notify(formatText(t(messageKey), {
           count: normalizedImport.targetCount,
           discarded: normalizedImport.discardedSensitiveFields,
@@ -230,58 +477,82 @@ export default function Lotteries() {
         }), 'warning');
       }
       const result = await postJSON('/lotteries/targets/import', {
-        platform: targetImport.platform,
+        platform: snapshot.platform,
         content: normalizedImport.content,
-        value_score: Number(targetImport.value_score || 0),
+        value_score: Number(snapshot.value_score || 0),
       }, {
         timeoutMs: targetImportTimeout(normalizedImport),
       });
+      if (!isCurrent()) return;
+      if (normalizedImport.converted) {
+        // Keep the original draft recoverable until Core has durably accepted
+        // the normalized rows. This matters for partial mixed-platform
+        // rejections and for retrying a failed request.
+        if (isCurrent()) setTargetImportContent(normalizedImport.content);
+      }
       const displayedResult = {
         ...result,
         local_skipped_count: normalizedImport.discardedRows || 0,
       };
       setTargetImportResult(displayedResult);
       const message = formatText(t('lotteries.targetsImported'), result);
-      notify(message, result.invalid_count ? 'warning' : 'success');
+      notify(message, targetImportNotificationLevel(result, normalizedImport));
       await load();
+      if (!isCurrent()) return;
     } catch (err) {
+      if (!isCurrent()) return;
       const message = targetImportErrorText(err, t);
-      setError(message);
+      setTargetImportError(message);
       notify(message, 'error');
+    } finally {
+      if (targetImportOperationRef.current === operationId) {
+        targetImportBusyRef.current = false;
+        if (mountedRef.current) setTargetImportBusy(false);
+      }
     }
   };
 
   const readTargetFile = async (e) => {
+    if (targetImportBusyRef.current) return;
     const file = e.target.files?.[0];
     if (!file) return;
+    const input = e.currentTarget;
     const readId = targetFileReadIdRef.current + 1;
     targetFileReadIdRef.current = readId;
-    setError('');
+    const generation = targetImportGenerationRef.current + 1;
+    targetImportGenerationRef.current = generation;
+    const snapshot = { ...targetImport, content: '' };
+    const isCurrent = () => targetImportOperationIsCurrent({
+      mounted: mountedRef.current,
+      expectedGeneration: generation,
+      currentGeneration: targetImportGenerationRef.current,
+      expectedOperationId: readId,
+      currentOperationId: targetFileReadIdRef.current,
+    });
+    targetFileBusyRef.current = true;
+    setTargetFileBusy(true);
+    setTargetImportError('');
     setTargetImportResult(null);
-    setTargetImport(prev => ({ ...prev, content: '' }));
+    setTargetImport(snapshot);
+    setTargetImportContent('');
     try {
-      const importPlatform = String(targetImport.platform || '').trim().toLowerCase();
-      const maxBytes = importPlatform === 'xiaohongshu'
-        ? XIAOHONGSHU_IMPORT_MAX_BYTES
-        : (importPlatform === 'douyin'
-            ? DOUYIN_IMPORT_MAX_BYTES
-            : (importPlatform === 'weibo' ? WEIBO_IMPORT_MAX_BYTES : TARGET_IMPORT_PASSTHROUGH_MAX_BYTES));
-      if (file.size > maxBytes) {
-        const code = importPlatform === 'xiaohongshu'
-          ? 'xiaohongshu_import_too_large'
-          : (importPlatform === 'douyin'
-              ? 'douyin_import_too_large'
-              : (importPlatform === 'weibo' ? 'weibo_import_too_large' : 'target_import_content_too_large'));
-        throw new TargetImportError(code);
+      // This is only the shared browser-memory ceiling. The normalizer assigns
+      // delimited rows to their declared platforms and enforces each owning
+      // policy's byte limit after reading the bounded file.
+      if (file.size > TARGET_IMPORT_FILE_MAX_BYTES) {
+        throw new TargetImportError('target_import_too_large', {
+          byteLength: file.size,
+          maxBytes: TARGET_IMPORT_FILE_MAX_BYTES,
+        });
       }
-      const text = await file.text();
-      if (readId !== targetFileReadIdRef.current) return;
-      const normalizedImport = normalizeTargetImport(
-        { ...targetImport, content: text },
-        platforms,
+      const content = await readTargetImportFile(file);
+      if (!isCurrent()) return;
+      const normalizedImport = await normalizeTargetImport(
+        { ...snapshot, content },
       );
-      setTargetImport(prev => ({ ...prev, content: normalizedImport.content }));
-      const messageKey = targetImportSanitizedMessageKey(targetImport.platform);
+      if (!isCurrent()) return;
+      if (isCurrent()) setTargetImportContent(normalizedImport.content);
+      const messageKey = targetImportSanitizedMessageKey(snapshot.platform);
       const message = normalizedImport.converted
         ? formatText(t(messageKey), {
             count: normalizedImport.targetCount,
@@ -291,12 +562,16 @@ export default function Lotteries() {
         : formatText(t('lotteries.targetFileLoaded'), { name: file.name });
       notify(message, normalizedImport.converted ? 'warning' : 'success');
     } catch (err) {
-      if (readId !== targetFileReadIdRef.current) return;
+      if (!isCurrent()) return;
       const message = targetImportErrorText(err, t);
-      setError(message);
+      setTargetImportError(message);
       notify(message, 'error');
     } finally {
-      e.target.value = '';
+      input.value = '';
+      if (readId === targetFileReadIdRef.current) {
+        targetFileBusyRef.current = false;
+        if (mountedRef.current) setTargetFileBusy(false);
+      }
     }
   };
 
@@ -305,6 +580,9 @@ export default function Lotteries() {
     setError('');
     setDiscoveryMessage('');
     try {
+      if (!platformSupportsDiscoverySource(sourceForm.platform, sourceForm.source_type)) {
+        throw new Error(t('lotteries.discoverySourceUnsupported'));
+      }
       await postJSON('/lotteries/sources', {
         ...sourceForm,
         scan_interval_minutes: Number(sourceForm.scan_interval_minutes || 30),
@@ -322,7 +600,9 @@ export default function Lotteries() {
     setError('');
     setDiscoveryMessage('');
     try {
-      const result = await postJSON('/lotteries/sources/scan', {});
+      const result = await postJSON('/lotteries/sources/scan', {}, {
+        timeoutMs: MANUAL_DISCOVERY_SCAN_TIMEOUT_MS,
+      });
       const message = formatText(t('lotteries.scanComplete'), result);
       setDiscoveryMessage(message);
       notify(message, result.failed ? 'error' : 'success');
@@ -364,13 +644,17 @@ export default function Lotteries() {
     lottery,
     mode,
     gate: lottery ? gateByLotteryId[lottery.id] : null,
-    safeAccountAvailable: Boolean(lottery && safeAccountCount(lottery.platform)),
-    accountScopeBound: Boolean(
-      lottery
-      && selectedSafeAccount
-      && selectedSafeAccount.platform === lottery.platform
-    ),
+    safeAccountAvailable: hasEligibleSafeAccountFor(lottery, mode),
+    accountScopeBound: selectedAccountMatchesPlatform(lottery),
+    accountScopeCompatible: selectedAccountMatchesDispatch(lottery, mode),
   });
+
+  const accountScopeBlockerFor = (lottery, mode) => {
+    if (!hasEligibleSafeAccountFor(lottery, mode)) return 'no_safe_account';
+    if (!selectedAccountMatchesPlatform(lottery)) return 'account_scope_required';
+    if (!selectedAccountMatchesDispatch(lottery, mode)) return 'account_credential_kind_mismatch';
+    return null;
+  };
 
   const dispatchBlockerMessage = (blocker, lottery) => {
     if (blocker === 'xiaohongshu_manual_only') return t('lotteries.xiaohongshuManualOnlyHint');
@@ -381,7 +665,12 @@ export default function Lotteries() {
     if (blocker === 'weibo_manual_shadow_only') return t('lotteries.weiboManualShadowOnlyHint');
     if (blocker === 'legacy_http_target') return t('lotteries.legacyHttpTargetHint');
     if (blocker === 'no_safe_account') return t('lotteries.noSafeAccount');
+    if (blocker === 'account_credential_kind_mismatch') return t('lotteries.accountCredentialKindMismatch');
     if (blocker === 'account_scope_required') return t('lotteries.accountScopeRequired');
+    if (blocker === 'mode_blocked') return gateTitle(gateByLotteryId[lottery?.id], t);
+    if (blocker === 'execution_path_mismatch') {
+      return t('lotteries.actionPlanBlockers.execution_path_mismatch');
+    }
     if (blocker === 'action_plan_v2') return t('lotteries.actionPlanV2Required');
     if (blocker === 'real_run_gate') return gateTitle(gateByLotteryId[lottery?.id], t);
     return t('lotteries.gateUnknown');
@@ -399,7 +688,7 @@ export default function Lotteries() {
         notify(message, 'warning');
         return;
       }
-      const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
+      const selectedMatches = selectedAccountMatchesDispatch(lottery, mode);
       await postJSON(`/lotteries/${id}/dispatch`, {
         mode,
         dry_run: mode !== 'real_run',
@@ -418,7 +707,14 @@ export default function Lotteries() {
     setError('');
     try {
       const lottery = lotteries.find(item => item.id === id);
-      const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
+      const accountBlocker = accountScopeBlockerFor(lottery, 'real_run');
+      if (accountBlocker) {
+        const message = dispatchBlockerMessage(accountBlocker, lottery);
+        setError(message);
+        notify(message, 'warning');
+        return;
+      }
+      const selectedMatches = selectedAccountMatchesDispatch(lottery, 'real_run');
       await postJSON(`/lotteries/${id}/repair-dispatch`, {
         confirm: true,
         account_id: selectedMatches ? Number(selectedAccount) : null,
@@ -435,7 +731,14 @@ export default function Lotteries() {
     setError('');
     try {
       const lottery = lotteries.find(item => item.id === id);
-      const selectedMatches = selectedSafeAccount && lottery && selectedSafeAccount.platform === lottery.platform;
+      const accountBlocker = accountScopeBlockerFor(lottery, 'shadow_run');
+      if (accountBlocker) {
+        const message = dispatchBlockerMessage(accountBlocker, lottery);
+        setError(message);
+        notify(message, 'warning');
+        return;
+      }
+      const selectedMatches = selectedAccountMatchesDispatch(lottery, 'shadow_run');
       await postJSON(`/lotteries/${id}/probe`, { account_id: selectedMatches ? Number(selectedAccount) : null });
       notify(t('lotteries.probeQueued'), 'success');
       await load();
@@ -468,10 +771,11 @@ export default function Lotteries() {
     return summary.ready_for_real_actions === true;
   };
 
-  const markResult = async (id, status) => {
+  const markResult = async (id, status, note = '') => {
     setError('');
     try {
-      await putJSON(`/lotteries/${id}/result`, { status, note: `Manual result set to ${status}` });
+      const resultNote = String(note || '').trim() || `Manual result set to ${status}`;
+      await putJSON(`/lotteries/${id}/result`, { status, note: resultNote });
       notify(t('lotteries.resultUpdated'), 'success');
       await load();
     } catch (err) {
@@ -499,7 +803,11 @@ export default function Lotteries() {
             }}
           >
             <option value="">{t('lotteries.autoPick')}</option>
-            {safeAccounts.map(account => <option value={account.id} key={account.id}>A{account.id} / {account.platform} / {t('lotteries.calibrated')}</option>)}
+            {safeAccounts.map(account => (
+              <option value={account.id} key={account.id}>
+                A{account.id} / {account.platform} / {normalizedAccountCredentialKind(account)} / {t('lotteries.calibrated')}
+              </option>
+            ))}
           </select>
           <div className="segmented">
             <button className={dispatchMode === 'dry_run' ? 'active' : ''} onClick={() => setDispatchMode('dry_run')}>{t('lotteries.dryRun')}</button>
@@ -517,6 +825,16 @@ export default function Lotteries() {
           <div className="panel platform-card" key={platform.id}>
             {(() => {
               const ready = readinessById[platform.id];
+              const moduleReady = platformModuleStates[platform.id] === 'ready';
+              const realTargetKinds = moduleReady
+                ? platformRealTargetKinds(platform.id)
+                : [];
+              const selectorPhaseTotal = Array.isArray(ready?.latest_probe?.required_phases)
+                && ready.latest_probe.required_phases.length
+                ? ready.latest_probe.required_phases.length
+                : moduleReady
+                  ? lotteryActionsForPlatform(platform.id).length
+                  : null;
               return (
                 <>
             <div className="panel-kicker">{platform.id}</div>
@@ -527,9 +845,17 @@ export default function Lotteries() {
               <span>{t('lotteries.realActions')}</span>
               <StatusBadge status={ready?.ready_for_real_run ? 'ready' : platform.action_adapter ? 'gray' : 'pending'} />
             </div>
+            <div className="capability-row">
+              <span>{t('lotteries.realTargetKinds')}</span>
+              <span className="mono small-text">
+                {moduleReady
+                  ? (realTargetKinds.length ? realTargetKinds.join(', ') : t('common.none'))
+                  : '-'}
+              </span>
+            </div>
             <div className="capability-row"><span>{t('lotteries.adapter')}</span><span className="mono small-text">{platform.adapter_status || 'planned'}</span></div>
             <div className="capability-row"><span>{t('lotteries.safeAccounts')}</span><span className="mono small-text">{safeAccountCount(platform.id)}</span></div>
-            <div className="capability-row"><span>{t('lotteries.selectorObservation')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/${lotteryActionsForPlatform(platform.id).length}` : '-'}</span></div>
+            <div className="capability-row"><span>{t('lotteries.selectorObservation')}</span><span className="mono small-text">{ready?.latest_probe ? `${ready.latest_probe.ready_phase_count || 0}/${selectorPhaseTotal ?? '-'}` : '-'}</span></div>
             <p className="muted-text tight-text">{adapterById[platform.id]?.notes || t('lotteries.adapterLoading')}</p>
             {!!ready?.blocker_codes?.length && (
               <div className="blocker-list compact-blockers">
@@ -565,9 +891,14 @@ export default function Lotteries() {
             <tbody>
               {strategyQueue.map(item => {
                 const lottery = lotteries.find(candidate => candidate.id === item.lottery_id);
+                const strategyGate = gateByLotteryId[item.lottery_id];
                 const strategyBlocker = item.recommended_mode === 'blocked'
                   ? 'mode_blocked'
                   : dispatchBlockerFor(lottery, item.recommended_mode);
+                const strategyNextAction = strategyGate?.next_action
+                  || (!actionPlanV2Ready(lottery?.action_plan, lottery?.platform)
+                    ? 'review_rule'
+                    : 'blocked');
                 return (
                 <tr key={item.lottery_id}>
                   <td className="mono">#{item.rank}</td>
@@ -601,9 +932,16 @@ export default function Lotteries() {
                     </div>
                   </td>
                   <td>
-                    <div className="blocker-list">
-                      {item.blockers?.map(reason => <span className="badge badge-danger" key={reason}>{reason}</span>)}
-                      {item.reason_codes?.map(code => <span className="badge badge-muted" key={code}>{reasonText(code, t)}</span>)}
+                    {item.recommended_mode === 'blocked' && (
+                      <strong className="small-text">{t('lotteries.strategyBlockReasons')}</strong>
+                    )}
+                    <div className="blocker-list compact-blockers">
+                      {item.blockers?.map(reason => (
+                        <span className="badge badge-danger" key={reason}>{gateBlockerText(reason, t)}</span>
+                      ))}
+                      {item.reason_codes?.map(code => (
+                        <span className="badge badge-muted" key={code}>{reasonText(code, t)}</span>
+                      ))}
                     </div>
                   </td>
                   <td>
@@ -615,6 +953,12 @@ export default function Lotteries() {
                     >
                       {t('lotteries.dispatchRecommended')}
                     </button>
+                    {strategyBlocker && (
+                      <div className="strategy-next-step small-text warning-text">
+                        <strong>{t('lotteries.strategyNextStep')}:</strong>{' '}
+                        {nextActionText(strategyNextAction, t)}
+                      </div>
+                    )}
                   </td>
                 </tr>
                 );
@@ -631,13 +975,19 @@ export default function Lotteries() {
           <form onSubmit={createLottery} className="form-grid lottery-form">
             <label>
               <span>{t('lotteries.platform')}</span>
-              <select className="input" value={form.platform} onChange={e => setForm({ ...form, platform: e.target.value })}>
+              <select className="input" value={form.platform} onChange={e => {
+                setActivityFormError('');
+                setForm({ ...form, platform: e.target.value });
+              }}>
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
               </select>
             </label>
             <label className="url-field">
               <span>{t('lotteries.activityUrl')}</span>
-              <input className="input" value={form.raw_url} onChange={e => setForm({ ...form, raw_url: e.target.value })} />
+              <input className="input" maxLength={512} value={form.raw_url} onChange={e => {
+                setActivityFormError('');
+                setForm({ ...form, raw_url: e.target.value });
+              }} />
               {manualTargetIssue && (
                 <span className="small-text warning-text" role="note">
                   {t('lotteries.targetErrors.https_required')}
@@ -646,9 +996,13 @@ export default function Lotteries() {
             </label>
             <label>
               <span>{t('lotteries.score')}</span>
-              <input className="input" type="number" value={form.value_score} onChange={e => setForm({ ...form, value_score: e.target.value })} />
+              <input className="input" type="number" value={form.value_score} onChange={e => {
+                setActivityFormError('');
+                setForm({ ...form, value_score: e.target.value });
+              }} />
             </label>
             <button className="btn-primary" type="submit">{t('lotteries.create')}</button>
+            {activityFormError && <div className="alert-danger form-error" role="alert">{activityFormError}</div>}
           </form>
           <form onSubmit={importTargets} className="form-grid target-import-form">
             <label>
@@ -656,9 +1010,12 @@ export default function Lotteries() {
               <select
                 className="input"
                 value={targetImport.platform}
+                disabled={targetImportBusy}
                 onChange={(e) => {
-                  targetFileReadIdRef.current += 1;
-                  setTargetImport({ ...targetImport, platform: e.target.value });
+                  updateTargetImportDraft(previous => ({
+                    ...previous,
+                    platform: e.target.value,
+                  }));
                 }}
               >
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
@@ -666,15 +1023,25 @@ export default function Lotteries() {
             </label>
             <label>
               <span>{t('lotteries.defaultScore')}</span>
-              <input className="input" type="number" value={targetImport.value_score} onChange={e => setTargetImport({ ...targetImport, value_score: e.target.value })} />
+              <input
+                className="input"
+                type="number"
+                value={targetImport.value_score}
+                disabled={targetImportBusy}
+                onChange={e => updateTargetImportDraft(previous => ({
+                  ...previous,
+                  value_score: e.target.value,
+                }))}
+              />
             </label>
             <label className="btn-ghost file-button target-file-button">
               {t('lotteries.uploadTargets')}
               <input
                 type="file"
-                accept={['douyin', 'weibo', 'xiaohongshu'].includes(String(targetImport.platform).toLowerCase())
+                accept={platformSupportsStructuredTargetImport(targetImport.platform)
                   ? '.txt,.csv,.json,.jsonl,text/plain,text/csv,application/json'
                   : '.txt,.csv,text/plain,text/csv'}
+                disabled={targetImportBusy || !targetImportModuleReady}
                 onChange={readTargetFile}
                 hidden
               />
@@ -683,15 +1050,32 @@ export default function Lotteries() {
               <span>{t('lotteries.targetList')}</span>
               <textarea
                 className="input textarea"
-                value={targetImport.content}
+                ref={targetImportTextareaRef}
+                defaultValue=""
+                disabled={targetImportBusy}
                 onChange={(e) => {
-                  targetFileReadIdRef.current += 1;
-                  setTargetImport({ ...targetImport, content: e.target.value });
+                  setTargetImportContent(e.target.value);
+                  updateTargetImportDraft(previous => ({
+                    ...previous,
+                  }));
                 }}
                 placeholder={t('lotteries.targetPlaceholder')}
               />
+              <span className="muted-text small-text">{t('lotteries.targetPlaceholderHint')}</span>
             </label>
-            <button className="btn-primary" type="submit">{t('lotteries.importTargets')}</button>
+            <button
+              className="btn-primary"
+              type="submit"
+              disabled={!targetImportCanSubmit({
+                content: targetImportContentRef.current,
+                fileBusy: targetFileBusy,
+                importBusy: targetImportBusy,
+                moduleReady: targetImportModuleReady,
+              })}
+            >
+              {t('lotteries.importTargets')}
+            </button>
+            {targetImportError && <div className="alert-danger form-error" role="alert">{targetImportError}</div>}
           </form>
         </div>
         {targetImportResult && (
@@ -701,12 +1085,19 @@ export default function Lotteries() {
               <div className="small-text">
                 {targetImportResult.invalid
                   .slice(0, 3)
-                  .map(item => `#${item.line}: ${targetValidationErrorText(item.error, t)}`)
+                  .map(item => (
+                    `#${item.line}${item.platform ? ` [${item.platform}]` : ''}: `
+                    + targetValidationErrorText(
+                      targetImportInvalidErrorCode(item) || item.error,
+                      t,
+                    )
+                  ))
                   .join(' / ')}
               </div>
             )}
           </div>
         )}
+        {loadError && <div className="alert-danger">{loadError}</div>}
         {error && <div className="alert-danger">{error}</div>}
       </div>
 
@@ -715,16 +1106,23 @@ export default function Lotteries() {
         <form onSubmit={createSource} className="form-grid discovery-form">
           <label>
             <span>{t('lotteries.platform')}</span>
-            <select className="input" value={sourceForm.platform} onChange={e => setSourceForm({ ...sourceForm, platform: e.target.value })}>
+            <select
+              className="input"
+              value={sourceForm.platform}
+              onChange={(e) => {
+                const platform = e.target.value;
+                setSourceForm({ ...sourceForm, platform, source_type: '' });
+              }}
+            >
               {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
             </select>
           </label>
           <label>
             <span>{t('lotteries.type')}</span>
             <select className="input" value={sourceForm.source_type} onChange={e => setSourceForm({ ...sourceForm, source_type: e.target.value })}>
-              <option value="url_list">URL list</option>
-              <option value="keyword">Keyword</option>
-              <option value="up">Creator</option>
+              {sourceTypeOptions.map(sourceType => (
+                <option value={sourceType} key={sourceType}>{discoverySourceTypeLabel(sourceType)}</option>
+              ))}
             </select>
           </label>
           <label>
@@ -736,12 +1134,13 @@ export default function Lotteries() {
             <textarea
               className="input textarea"
               value={sourceForm.source_value}
+              maxLength={256}
               onChange={e => setSourceForm({ ...sourceForm, source_value: e.target.value })}
               placeholder={sourceForm.source_type === 'up' ? t('lotteries.upUidPlaceholder') : t('lotteries.sourceValuePlaceholder')}
             />
           </label>
           <div className="toolbar form-actions">
-            <button className="btn-primary" type="submit">{t('lotteries.saveSource')}</button>
+            <button className="btn-primary" type="submit" disabled={!sourceTypeOptions.length}>{t('lotteries.saveSource')}</button>
             <button className="btn-ghost" type="button" onClick={scanSources}>{t('lotteries.scanNow')}</button>
           </div>
         </form>
@@ -759,7 +1158,18 @@ export default function Lotteries() {
                   <td>{source.source_type}</td>
                   <td>{source.scan_interval_minutes}m</td>
                   <td className="small-text">{source.last_scan_at || '-'}</td>
-                  <td><StatusBadge status={source.active ? 'ready' : 'pending'} /></td>
+                  <td title={source.validation_error || ''}>
+                    <StatusBadge status={
+                      source.active && source.effective_active === false
+                        ? 'failed'
+                        : (source.effective_active ?? Boolean(source.active))
+                          ? 'ready'
+                          : 'pending'
+                    } />
+                    {source.validation_error && (
+                      <div className="small-text mono">{source.validation_error}</div>
+                    )}
+                  </td>
                 </tr>
               ))}
               {!sources.length && <tr><td className="empty-cell" colSpan="6">{t('lotteries.noSources')}</td></tr>}
@@ -788,11 +1198,15 @@ export default function Lotteries() {
                 );
                 const targetIssue = targetTransportCompatibilityIssue(lottery.platform, lottery.raw_url);
                 const transportBlocksSelectedMode = Boolean(targetIssue && dispatchMode !== 'dry_run');
-                const safeAccountAvailable = safeAccountCount(lottery.platform) > 0;
-                const accountScopeReady = Boolean(
-                  selectedSafeAccount && selectedSafeAccount.platform === lottery.platform
-                );
+                const safeAccountAvailable = hasEligibleSafeAccountFor(lottery, dispatchMode);
+                const accountScopeBound = selectedAccountMatchesPlatform(lottery);
+                const accountScopeReady = selectedAccountMatchesDispatch(lottery, dispatchMode);
                 const accountScopeBlocked = dispatchMode !== 'dry_run' && !accountScopeReady;
+                const accountCredentialKindBlocked = accountScopeBound && !accountScopeReady;
+                const probeSafeAccountAvailable = hasEligibleSafeAccountFor(lottery, 'shadow_run');
+                const probeAccountScopeReady = selectedAccountMatchesDispatch(lottery, 'shadow_run');
+                const repairSafeAccountAvailable = hasEligibleSafeAccountFor(lottery, 'real_run');
+                const repairAccountScopeReady = selectedAccountMatchesDispatch(lottery, 'real_run');
                 const actionPlanReady = manualAssisted
                   ? actionPlanV2ReviewReady(lottery.action_plan, lottery.platform)
                   : actionPlanV2Ready(lottery.action_plan, lottery.platform);
@@ -803,6 +1217,12 @@ export default function Lotteries() {
                   && !platformModeBlocker
                   && !actionPlanBlocked
                   && ['probe', 'shadow_run', 'real_run'].includes(gate?.next_action);
+                const gateNextActionMode = gate?.next_action === 'probe'
+                  ? 'shadow_run'
+                  : gate?.next_action;
+                const gateNextAccountBlocker = gateCanRunNext
+                  ? accountScopeBlockerFor(lottery, gateNextActionMode)
+                  : null;
                 const repairAvailable = Boolean(repairPlan?.executable);
                 const repairUnavailable = Boolean(
                   repairPlan?.eligible && !repairPlan?.executable,
@@ -812,34 +1232,53 @@ export default function Lotteries() {
                   || Boolean(platformModeBlocker)
                   || Boolean(targetIssue)
                   || !gate?.allowed
-                  || !safeAccountAvailable
-                  || !accountScopeReady
+                  || !repairSafeAccountAvailable
+                  || !repairAccountScopeReady
                   || !actionPlanReady
                 );
                 const repairBlockReason = manualAssisted
                   ? t(manualOnlyHintKey(lottery.platform))
                   : (targetIssue ? t('lotteries.legacyHttpTargetHint')
-                  : (!accountScopeReady
-                    ? t('lotteries.accountScopeRequired')
+                  : (!repairAccountScopeReady
+                    ? (selectedAccountMatchesPlatform(lottery)
+                      ? t('lotteries.accountCredentialKindMismatch')
+                      : t('lotteries.accountScopeRequired'))
                     : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : (repairBlocked ? gateTitle(gate, t) : ''))));
                 const dispatchDisabled = Boolean(platformModeBlocker)
                   || transportBlocksSelectedMode
                   || !safeAccountAvailable
+                  || accountCredentialKindBlocked
                   || accountScopeBlocked
                   || actionPlanBlocked
+                  || Boolean(gateNextAccountBlocker)
                   || (gateBlocked && !gateCanRunNext);
                 let dispatchTitle = '';
                 if (platformModeBlocker) dispatchTitle = dispatchBlockerMessage(platformModeBlocker, lottery);
                 else if (transportBlocksSelectedMode) dispatchTitle = t('lotteries.legacyHttpTargetHint');
+                else if (!safeAccountAvailable) dispatchTitle = t('lotteries.noSafeAccount');
+                else if (accountCredentialKindBlocked) dispatchTitle = t('lotteries.accountCredentialKindMismatch');
+                else if (accountScopeBlocked) dispatchTitle = t('lotteries.accountScopeRequired');
                 else if (actionPlanBlocked) dispatchTitle = t('lotteries.actionPlanV2Required');
+                else if (gateNextAccountBlocker) dispatchTitle = dispatchBlockerMessage(gateNextAccountBlocker, lottery);
                 else if (gateBlocked) dispatchTitle = gateTitle(gate, t);
                 let dispatchLabel = t(`lotteries.dispatch_${dispatchMode}`);
                 if (platformModeBlocker) dispatchLabel = t('lotteries.manualAssistedOnly');
                 else if (transportBlocksSelectedMode) dispatchLabel = t('lotteries.compatibilityBlocked');
                 else if (!safeAccountAvailable) dispatchLabel = t('lotteries.noSafeAccount');
+                else if (accountCredentialKindBlocked) dispatchLabel = t('lotteries.selectAccount');
                 else if (accountScopeBlocked) dispatchLabel = t('lotteries.selectAccount');
                 else if (actionPlanBlocked) dispatchLabel = t('lotteries.nextActions.review_rule');
-                else if (gateBlocked) dispatchLabel = t(`lotteries.nextActions.${gate?.next_action || 'blocked'}`);
+                else if (gateNextAccountBlocker) dispatchLabel = t('lotteries.selectAccount');
+                else if (gateBlocked) dispatchLabel = nextActionText(gate?.next_action || 'blocked', t);
+                const probeBlockReason = targetIssue
+                  ? t('lotteries.legacyHttpTargetHint')
+                  : (!probeSafeAccountAvailable
+                    ? t('lotteries.noSafeAccount')
+                    : (!probeAccountScopeReady
+                      ? (selectedAccountMatchesPlatform(lottery)
+                        ? t('lotteries.accountCredentialKindMismatch')
+                        : t('lotteries.accountScopeRequired'))
+                      : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : '')));
                 return (
                   <tr key={lottery.id}>
                   <td className="mono">L{lottery.id}</td>
@@ -849,8 +1288,20 @@ export default function Lotteries() {
                     <div className="small-text">{lottery.raw_url}</div>
                     {targetIssue && <span className="badge badge-danger">{t('lotteries.legacyHttpTarget')}</span>}
                   </td>
-                  <td><RulePlanEditor lottery={lottery} gate={gate} onSave={saveActionPlan} t={t} /></td>
-                  <td><StatusBadge status={lottery.status} /></td>
+                  <td>
+                    <RulePlanEditor
+                      key={`${lottery.id}:${platformModuleStates[lottery.platform] === 'ready' ? 'ready' : 'pending'}`}
+                      lottery={lottery}
+                      gate={gate}
+                      onSave={saveActionPlan}
+                      onMarkResult={markResult}
+                      platformModuleReady={
+                        platformModuleStates[lottery.platform] === 'ready'
+                      }
+                      t={t}
+                    />
+                  </td>
+                  <td><LotteryStatusCell lottery={lottery} gate={gate} t={t} /></td>
                   <td>{lottery.value_score}</td>
                   <td>
                     <RealGateCell
@@ -875,12 +1326,8 @@ export default function Lotteries() {
                     <button onClick={() => markResult(lottery.id, 'lost')} className="btn-ghost">{t('lotteries.lost')}</button>
                     <button
                       onClick={() => probe(lottery.id)}
-                      disabled={Boolean(targetIssue) || !safeAccountAvailable || !accountScopeReady || !actionPlanReady}
-                      title={targetIssue
-                        ? t('lotteries.legacyHttpTargetHint')
-                        : (!accountScopeReady
-                          ? t('lotteries.accountScopeRequired')
-                          : (!actionPlanReady ? t('lotteries.actionPlanV2Required') : ''))}
+                      disabled={Boolean(targetIssue) || !probeSafeAccountAvailable || !probeAccountScopeReady || !actionPlanReady}
+                      title={probeBlockReason}
                       className="btn-ghost"
                     >
                       {t('lotteries.probe')}
@@ -946,14 +1393,16 @@ export default function Lotteries() {
                     </td>
                     <td className="small-text">
                       {item.screenshot_path ? (
-                        <a
+                        <AuthenticatedAssetLink
                           className="badge badge-warn evidence-link"
-                          href={authenticatedApiPath(`/lotteries/probes/${item.probe_id}/screenshot`)}
-                          target="_blank"
-                          rel="noreferrer"
+                          path={`/lotteries/probes/${item.probe_id}/screenshot`}
+                          onError={(assetError) => {
+                            setError(assetError.message);
+                            notify(assetError.message, 'error');
+                          }}
                         >
                           {t('lotteries.openProbe')}
-                        </a>
+                        </AuthenticatedAssetLink>
                       ) : (item.error_message || '-')}
                     </td>
                   </tr>
@@ -982,14 +1431,16 @@ export default function Lotteries() {
                   <td>{modeLabel(run, t)}</td>
                   <td className="small-text">
                     {run.screenshot_path ? (
-                      <a
+                      <AuthenticatedAssetLink
                         className="badge badge-warn evidence-link"
-                        href={authenticatedApiPath(`/lotteries/tasks/runs/${run.task_id}/screenshot`)}
-                        target="_blank"
-                        rel="noreferrer"
+                        path={`/lotteries/tasks/runs/${run.task_id}/screenshot`}
+                        onError={(assetError) => {
+                          setError(assetError.message);
+                          notify(assetError.message, 'error');
+                        }}
                       >
                         {t('lotteries.openEvidence')}
-                      </a>
+                      </AuthenticatedAssetLink>
                     ) : (run.error_message || '-')}
                   </td>
                 </tr>
@@ -1024,18 +1475,52 @@ function modeText(mode, t) {
 
 function reasonText(code, t) {
   const label = t(`lotteries.strategyReasons.${code}`);
-  return label === `lotteries.strategyReasons.${code}` ? code : label;
+  if (label !== `lotteries.strategyReasons.${code}`) return label;
+  return formatText(t('lotteries.unknownBlockerCode'), { code: String(code || '') });
+}
+
+function nextActionText(code, t) {
+  const normalized = String(code || 'blocked');
+  const key = `lotteries.nextActions.${normalized}`;
+  const label = t(key);
+  if (label !== key) return label;
+  return formatText(t('lotteries.unknownNextAction'), { code: normalized });
 }
 
 function gateBlockerText(code, t) {
+  if (String(code || '').startsWith('global=')) {
+    return t('lotteries.globalCircuitBreakerReason');
+  }
   const label = t(`lotteries.realGateBlockers.${code}`);
   if (label !== `lotteries.realGateBlockers.${code}`) return label;
+  const legacyKey = `dashboard.blockersMap.${code}`;
+  const legacyLabel = t(legacyKey);
+  if (legacyLabel !== legacyKey) return legacyLabel;
   return actionPlanBlockerText(code, t);
 }
 
 function actionPlanBlockerText(code, t) {
   const label = t(`lotteries.actionPlanBlockers.${code}`);
-  return label === `lotteries.actionPlanBlockers.${code}` ? code : label;
+  if (label !== `lotteries.actionPlanBlockers.${code}`) return label;
+  const value = String(code || '');
+  return /^[a-z0-9_]+$/i.test(value)
+    ? formatText(t('lotteries.unknownBlockerCode'), { code: value })
+    : value;
+}
+
+function ruleSaveBlockerText(code, t) {
+  const value = String(code || '');
+  if (value.startsWith('payload:')) {
+    return actionPlanBlockerText(value.slice('payload:'.length), t);
+  }
+  if (value.startsWith('requirement:')) {
+    const requirement = value.slice('requirement:'.length);
+    const label = t(`lotteries.unsupportedActions.${requirement}`);
+    return label === `lotteries.unsupportedActions.${requirement}` ? requirement : label;
+  }
+  const key = `lotteries.ruleSaveBlockers.${value}`;
+  const translated = t(key);
+  return translated === key ? value : translated;
 }
 
 function shortIdentity(value) {
@@ -1062,17 +1547,24 @@ function actionSummary(actions = [], t) {
 }
 
 function targetValidationErrorText(value, t) {
-  const code = targetValidationErrorCode(value);
+  const code = targetOperationErrorCode(value) || targetValidationErrorCode(value);
   if (!code) return value;
   const key = `lotteries.targetErrors.${code}`;
   const translated = t(key);
-  return translated === key ? value : translated;
+  if (translated !== key) return translated;
+  const importKey = `lotteries.targetImportErrors.${code}`;
+  const importTranslated = t(importKey);
+  return importTranslated === importKey ? value : importTranslated;
 }
 
-function normalizeTargetImport(targetImport, platforms = []) {
-  return normalizeTargetImportForPlatform(targetImport?.platform, targetImport?.content, {
-    allowedPlatformIds: platforms.map(platform => platform.id),
-  });
+async function normalizeTargetImport(targetImport) {
+  return normalizePlatformTargetImport(targetImport?.platform, targetImport?.content);
+}
+
+function discoverySourceTypeLabel(sourceType) {
+  if (sourceType === 'keyword') return 'Keyword';
+  if (sourceType === 'up') return 'Creator';
+  return 'URL list';
 }
 
 function targetImportSanitizedMessageKey(platform) {
@@ -1106,10 +1598,10 @@ function targetImportTimeout(normalizedImport) {
 }
 
 function targetImportErrorText(error, t) {
-  const code = String(error?.code || error?.message || '');
+  const code = targetOperationErrorCode(error);
   const key = `lotteries.targetImportErrors.${code}`;
   const translated = t(key);
-  return translated === key ? (error?.message || code) : translated;
+  return translated === key ? (error?.message || code || t('lotteries.targetImportErrors.unknown')) : translated;
 }
 
 function displayTime(value) {
@@ -1122,11 +1614,46 @@ function displayTime(value) {
 function riskCooldownText(gate, t) {
   const risk = gate?.account_risk;
   if (!risk?.has_recent_risk) return '';
-  const account = risk.latest_event?.account_id ? `A${risk.latest_event.account_id}` : t('lotteries.account');
+  const controllingEvent = risk.controlling_event || risk.latest_event;
+  const account = controllingEvent?.account_id ? `A${controllingEvent.account_id}` : t('lotteries.account');
   return formatText(t('lotteries.riskCooldownUntil'), {
     account,
     time: displayTime(risk.cooldown_until),
   });
+}
+
+function LotteryStatusCell({ lottery, gate, t }) {
+  const status = String(lottery?.status || '').trim().toLowerCase();
+  const directReason = String(
+    lottery?.blocked_reason || lottery?.status_reason || lottery?.error_message || '',
+  ).trim();
+  const directBlockers = Array.isArray(lottery?.blockers) ? lottery.blockers : [];
+  const gateBlockers = Array.isArray(gate?.blockers) ? gate.blockers : [];
+  const blockers = [...new Set([...directBlockers, ...gateBlockers].filter(Boolean))];
+  const showReason = status === 'blocked' || Boolean(directReason);
+  return (
+    <div className="gate-cell">
+      <StatusBadge status={lottery?.status} />
+      {showReason && (
+        <div className="status-reason-panel">
+          <strong className="small-text">{t('lotteries.statusBlockReason')}</strong>
+          {directReason && (
+            <div className="small-text warning-text">{gateBlockerText(directReason, t)}</div>
+          )}
+          {!!blockers.length && (
+            <div className="blocker-list compact-blockers">
+              {blockers.map(code => (
+                <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+              ))}
+            </div>
+          )}
+          {!directReason && !blockers.length && (
+            <div className="small-text warning-text">{t('lotteries.statusBlockReasonUnavailable')}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
@@ -1136,10 +1663,13 @@ function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
         <span className="badge badge-danger">{t('lotteries.compatibilityBlocked')}</span>
         <div className="small-text warning-text">{t('lotteries.legacyHttpTargetHint')}</div>
         {!!gate?.blockers?.length && (
-          <div className="blocker-list compact-blockers">
-            {gate.blockers.slice(0, 3).map(code => (
-              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
-            ))}
+          <div className="gate-block-reasons">
+            <strong className="small-text">{t('lotteries.gateBlockReasons')}</strong>
+            <div className="blocker-list compact-blockers">
+              {gate.blockers.map(code => (
+                <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -1160,10 +1690,13 @@ function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
           </span>
         </div>
         {!!gate?.blockers?.length && (
-          <div className="blocker-list compact-blockers">
-            {gate.blockers.slice(0, 4).map(code => (
-              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
-            ))}
+          <div className="gate-block-reasons">
+            <strong className="small-text">{t('lotteries.gateBlockReasons')}</strong>
+            <div className="blocker-list compact-blockers">
+              {gate.blockers.map(code => (
+                <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+              ))}
+            </div>
           </div>
         )}
         {!!shadowObservation.taskId && (
@@ -1186,9 +1719,16 @@ function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
           runnable: gate.risk_clear_accounts ?? gate.safe_accounts ?? 0,
         })}
       </div>
-      <div className="blocker-list compact-blockers">
-        {gate.blockers?.slice(0, 3).map(code => <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>)}
-      </div>
+      {!!gate.blockers?.length && (
+        <div className="gate-block-reasons">
+          <strong className="small-text">{t('lotteries.gateBlockReasons')}</strong>
+          <div className="blocker-list compact-blockers">
+            {gate.blockers.map(code => (
+              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+            ))}
+          </div>
+        </div>
+      )}
       {riskText && <div className="small-text warning-text">{riskText}</div>}
       <ExecutionEvidenceDetails gate={gate} t={t} />
       {!!(repairPlan?.completed_actions?.length || repairPlan?.missing_actions?.length) && (
@@ -1213,6 +1753,9 @@ function RealGateCell({ gate, platform, executionPathId, targetIssue, t }) {
 
 function ExecutionEvidenceDetails({ gate, t }) {
   const evidence = executionEvidencePresentation(gate);
+  const missingReasons = evidence.reasons.length
+    ? evidence.reasons
+    : (evidence.bound ? [] : ['execution_evidence_required']);
   return (
     <div className="action-ledger-summary">
       <div className="capability-row">
@@ -1240,11 +1783,14 @@ function ExecutionEvidenceDetails({ gate, t }) {
       {!!evidence.expiresAt && (
         <div className="small-text muted-text">{t('lotteries.evidenceExpiresAt')}: {displayTime(evidence.expiresAt)}</div>
       )}
-      {!evidence.bound && !!evidence.reasons.length && (
-        <div className="blocker-list compact-blockers">
-          {evidence.reasons.slice(0, 4).map(code => (
-            <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
-          ))}
+      {!evidence.bound && !!missingReasons.length && (
+        <div className="gate-block-reasons">
+          <strong className="small-text">{t('lotteries.evidenceMissingItems')}</strong>
+          <div className="blocker-list compact-blockers">
+            {missingReasons.map(code => (
+              <span className="badge badge-muted" key={code}>{gateBlockerText(code, t)}</span>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -1298,11 +1844,20 @@ function ledgerOutcomeClass(row) {
   return 'badge-muted';
 }
 
-function RulePlanEditor({ lottery, gate, onSave, t }) {
+function RulePlanEditor({
+  lottery,
+  gate,
+  onSave,
+  onMarkResult,
+  platformModuleReady,
+  t,
+}) {
   const { notify } = useUi();
   const plan = lottery.action_plan || {};
+  const initialFollowTarget = automaticFollowTarget(lottery, plan);
   const fixedManualActions = isFixedManualActionPlatform(lottery.platform);
   const availableActions = lotteryActionsForPlatform(lottery.platform);
+  const availableExecutionPaths = platformExecutionPaths(lottery.platform);
   const savedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
   const savedExecutionPathId = platformExecutionPathId(
     lottery.platform,
@@ -1319,8 +1874,13 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   const initialPayloads = actionPayloadDraft(
     initialActions,
     plan.action_payloads,
-    null,
+    plan.content_requirements,
     lottery.platform,
+    {
+      followTargetFallback: initialFollowTarget,
+      rulePlan: plan,
+      prepareForEditing: true,
+    },
   );
   const planSignature = JSON.stringify({
     actions: savedActions,
@@ -1334,12 +1894,21 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   });
   const [actions, setActions] = useState(initialActions);
   const [payloads, setPayloads] = useState(initialPayloads);
-  const [ruleText, setRuleText] = useState(lottery.rule_text || '');
+  const [ruleText, setRuleText] = useState(authoritativeRuleText(lottery));
   const [executionPathId, setExecutionPathId] = useState(savedExecutionPathId);
   const [ruleCompleteConfirmed, setRuleCompleteConfirmed] = useState(false);
   const [reviewedConfirmed, setReviewedConfirmed] = useState(false);
   const [suggestion, setSuggestion] = useState(null);
   const [suggesting, setSuggesting] = useState(false);
+  const [hydration, setHydration] = useState(null);
+  const [hydrating, setHydrating] = useState(false);
+  const [hydrationError, setHydrationError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const hydrationAttemptedRef = useRef(false);
+  const operatorEditedRef = useRef(false);
+  const effectiveLottery = hydration ? { ...lottery, ...hydration } : lottery;
+  const targetIdentity = lotteryTargetIdentity(effectiveLottery);
+  const ruleSnapshotParts = visibleRuleSnapshotParts(effectiveLottery);
   const suggestionActions = Array.isArray(suggestion?.required_actions) ? suggestion.required_actions : [];
   const draftPayloads = actionPayloadDraft(actions, payloads, null, lottery.platform);
   const semanticSource = suggestion || plan;
@@ -1349,7 +1918,8 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   ) ? semanticSource.friend_mention_requirements : {};
   const manualAssisted = isManualAssistedPlatform(lottery.platform, executionPathId);
   const unresolvedRequirements = unresolvedRuleRequirements(semanticSource, draftPayloads);
-  const payloadErrors = exactPayloadErrors(actions, draftPayloads, lottery.platform);
+  const payloadErrors = exactActionPayloadErrors(actions, draftPayloads, lottery.platform);
+  const executionPathValid = platformSupportsExecutionPath(lottery.platform, executionPathId);
   const persistedPlanBlockers = savedManualAssisted
     ? actionPlanV2ReviewBlockers(plan, lottery.platform)
     : [
@@ -1367,7 +1937,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
     || JSON.stringify(draftPayloads) !== JSON.stringify(savedPayloads)
     || executionPathId !== savedExecutionPathId;
   const missingSuggestedActions = suggestionActions.filter(action => !savedActions.includes(action));
-  const sourceRuleLocked = Boolean(String(lottery.rule_text || '').trim());
+  const sourceRuleLocked = Boolean(authoritativeRuleText(effectiveLottery));
   const discoveryManagedSource = sourceRuleCorrectionPath(lottery.platform, lottery.source_type) === 'discovery_refresh';
   const sourceRuleHelpId = `lottery-${lottery.id}-source-rule-help`;
   const mediaRequired = actionPlanHasMediaRequirement({ action_payloads: draftPayloads });
@@ -1376,30 +1946,59 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
     : 'lotteries.mediaRuleStoredButUnsupported');
   const requiredActionSetComplete = !fixedManualActions
     || (actions.length === availableActions.length && sameActionSet(actions, availableActions));
-  const saveDisabled = !actions.length
-    || !ruleText.trim()
-    || !executionPathId
-    || !ruleCompleteConfirmed
-    || !reviewedConfirmed
-    || !requiredActionSetComplete
-    || unresolvedRequirements.length > 0
-    || payloadErrors.length > 0;
+  const saveBlockers = ruleEditorSaveBlockers({
+    actions,
+    ruleText,
+    executionPathId,
+    executionPathValid,
+    ruleCompleteConfirmed,
+    reviewedConfirmed,
+    requiredActionSetComplete,
+    unresolvedRequirements,
+    payloadErrors,
+  });
+  if (hydrating) saveBlockers.push('rule_hydration_pending');
+  const saveDisabled = saveBlockers.length > 0;
+  const saveBlockerLabels = saveBlockers.map(code => ruleSaveBlockerText(code, t));
 
   useEffect(() => {
     const persistedActions = Array.isArray(plan.required_actions) ? plan.required_actions : [];
     const nextActions = isFixedManualActionPlatform(lottery.platform)
       ? lotteryActionsForPlatform(lottery.platform)
       : persistedActions;
+    const followTargetFallback = automaticFollowTarget(lottery, plan);
     setActions(nextActions);
-    setPayloads(actionPayloadDraft(nextActions, plan.action_payloads, null, lottery.platform));
-    setRuleText(lottery.rule_text || '');
+    setPayloads(actionPayloadDraft(
+      nextActions,
+      plan.action_payloads,
+      plan.content_requirements,
+      lottery.platform,
+      {
+        followTargetFallback,
+        rulePlan: plan,
+        prepareForEditing: true,
+      },
+    ));
+    setRuleText(authoritativeRuleText(lottery));
     setExecutionPathId(platformExecutionPathId(lottery.platform, plan.execution_path_id));
     setRuleCompleteConfirmed(false);
     setReviewedConfirmed(false);
     setSuggestion(null);
-  }, [lottery.id, lottery.platform, lottery.rule_text, planSignature]);
+    setHydration(null);
+    setHydrationError('');
+    setSaving(false);
+    hydrationAttemptedRef.current = false;
+    operatorEditedRef.current = false;
+  }, [
+    lottery.id,
+    lottery.platform,
+    lottery.rule_text,
+    planSignature,
+    platformModuleReady,
+  ]);
 
   const toggle = action => {
+    operatorEditedRef.current = true;
     setActions(current => availableActions.filter(candidate => (
       candidate === action ? !current.includes(candidate) : current.includes(candidate)
     )));
@@ -1416,6 +2015,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   };
 
   const updateTextPayload = (action, field, value) => {
+    operatorEditedRef.current = true;
     setPayloads(current => ({
       ...current,
       [action]: {
@@ -1430,6 +2030,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
   };
 
   const updateFollowTarget = value => {
+    operatorEditedRef.current = true;
     setPayloads(current => ({
       ...current,
       followed: { target_handle: value },
@@ -1438,36 +2039,126 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
     setReviewedConfirmed(false);
   };
 
-  const requestSuggestion = async () => {
+  const requestSuggestion = async ({
+    sourceText = ruleText,
+    automatic = false,
+    identitySource = effectiveLottery,
+  } = {}) => {
+    const normalizedRuleText = String(sourceText || '').trim();
+    if (!normalizedRuleText) return;
     setSuggesting(true);
     try {
-      const response = await fetchJSON(`/lotteries/${lottery.id}/action-plan/suggest?rule_text=${encodeURIComponent(ruleText)}`);
+      const response = await fetchJSON(`/lotteries/${lottery.id}/action-plan/suggest?rule_text=${encodeURIComponent(normalizedRuleText)}`);
       const suggested = response.suggested_action_plan || {};
       const suggestedActions = Array.isArray(suggested.required_actions)
         ? suggested.required_actions
         : [];
-      const nextActions = fixedManualActions
-        ? availableActions
-        : availableActions.filter(action => suggestedActions.includes(action));
-      setActions(nextActions);
-      setPayloads(current => actionPayloadDraft(
-        nextActions,
-        current,
-        suggested.content_requirements,
-        lottery.platform,
-      ));
-      setRuleCompleteConfirmed(false);
-      setReviewedConfirmed(false);
       setSuggestion(suggested);
+      if (!automatic || !operatorEditedRef.current) {
+        const suggestedSelection = availableActions.filter(action => suggestedActions.includes(action));
+        const nextActions = fixedManualActions
+          ? availableActions
+          : (automatic && actions.length ? actions : suggestedSelection);
+        const followTargetFallback = automaticFollowTarget(identitySource, suggested);
+        setActions(nextActions);
+        setPayloads(current => actionPayloadDraft(
+          nextActions,
+          current,
+          suggested.content_requirements,
+          lottery.platform,
+          {
+            followTargetFallback,
+            rulePlan: suggested,
+            prepareForEditing: true,
+          },
+        ));
+        setRuleCompleteConfirmed(false);
+        setReviewedConfirmed(false);
+      }
     } catch (err) {
-      notify(err.message, 'error');
+      if (!automatic) notify(err.message, 'error');
     } finally {
       setSuggesting(false);
     }
   };
 
+  const hydrateRule = async ({ force = false } = {}) => {
+    if (hydrating || (hydrationAttemptedRef.current && !force)) return;
+    hydrationAttemptedRef.current = true;
+    setHydrating(true);
+    setHydrationError('');
+    try {
+      const response = await fetchJSON(`/lotteries/${lottery.id}/rule-hydration`);
+      const hydratedLottery = { ...lottery, ...response };
+      const hydratedRuleText = authoritativeRuleText(hydratedLottery);
+      setHydration(response);
+      setRuleText(hydratedRuleText);
+      setRuleCompleteConfirmed(false);
+      setReviewedConfirmed(false);
+      if (hydratedRuleText) {
+        await requestSuggestion({
+          sourceText: hydratedRuleText,
+          automatic: true,
+          identitySource: hydratedLottery,
+        });
+      }
+    } catch (err) {
+      setHydrationError(err.message || t('lotteries.ruleHydrationFailed'));
+      if (force) notify(err.message || t('lotteries.ruleHydrationFailed'), 'error');
+      if (ruleText.trim() && !suggestion) {
+        await requestSuggestion({ automatic: true });
+      }
+    } finally {
+      setHydrating(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (saveDisabled) {
+      notify(formatText(t('lotteries.ruleSaveBlocked'), {
+        reasons: saveBlockerLabels.join('；'),
+      }), 'warning');
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSave(lottery, {
+        requiredActions: actions,
+        actionPayloads: draftPayloads,
+        ruleText,
+        ruleCompleteConfirmed,
+        reviewed: reviewedConfirmed,
+        executionPathId,
+        platform: lottery.platform,
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!platformModuleReady) {
+    return (
+      <details className="rule-plan-editor">
+        <summary>
+          <span className="badge badge-warn">
+            {t('lotteries.platformModuleLoading')}
+          </span>
+          <span className="small-text">{actionSummary(savedActions, t)}</span>
+        </summary>
+        <div className="notice notice-warning">
+          {t('lotteries.platformModuleLoading')}
+        </div>
+      </details>
+    );
+  }
+
   return (
-    <details className="rule-plan-editor">
+    <details
+      className="rule-plan-editor"
+      onToggle={event => {
+        if (event.currentTarget.open) hydrateRule();
+      }}
+    >
       <summary>
         <span className={`badge ${planReady && !draftChanged ? 'badge-ready' : 'badge-warn'}`}>
           {planReady
@@ -1513,33 +2204,47 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
         )}
         <SavedExactPayloads payloads={savedPayloads} t={t} />
         {savedManualAssisted && (
-          <ManualAssistedChecklist plan={plan} gate={gate} platform={lottery.platform} t={t} />
+          <ManualAssistedChecklist
+            plan={plan}
+            gate={gate}
+            platform={lottery.platform}
+            lotteryId={lottery.id}
+            lotteryStatus={lottery.status}
+            onMarkResult={onMarkResult}
+            t={t}
+          />
         )}
 
-        {String(lottery.platform || '').trim().toLowerCase() === 'weibo' && (
+        {(availableExecutionPaths.length > 1 || !executionPathValid) && (
           <label>
             <span>{t('lotteries.executionPath')}</span>
             <select
               className="input"
               value={executionPathId}
               onChange={event => {
+                operatorEditedRef.current = true;
                 setExecutionPathId(event.target.value);
                 setRuleCompleteConfirmed(false);
                 setReviewedConfirmed(false);
               }}
             >
-              <option value={WEIBO_OAUTH_EXECUTION_PATH_ID}>
-                {t('lotteries.weiboOAuthExecutionPath')}
-              </option>
-              <option value={WEIBO_MANUAL_EXECUTION_PATH_ID}>
-                {t('lotteries.weiboManualExecutionPath')}
-              </option>
+              {!executionPathValid && (
+                <option value={executionPathId} disabled>{executionPathId}</option>
+              )}
+              {availableExecutionPaths.map((pathId) => {
+                const presentation = platformExecutionPathPresentation(lottery.platform, pathId);
+                return (
+                  <option value={pathId} key={pathId}>
+                    {presentation?.labelKey ? t(presentation.labelKey) : pathId}
+                  </option>
+                );
+              })}
             </select>
-            <div className="small-text muted-text">
-              {t(manualAssisted
-                ? 'lotteries.weiboManualExecutionPathHint'
-                : 'lotteries.weiboOAuthExecutionPathHint')}
-            </div>
+            {platformExecutionPathPresentation(lottery.platform, executionPathId)?.hintKey && (
+              <div className="small-text muted-text">
+                {t(platformExecutionPathPresentation(lottery.platform, executionPathId).hintKey)}
+              </div>
+            )}
           </label>
         )}
 
@@ -1553,10 +2258,22 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
             {formatText(t('lotteries.suggestedActionsMissingSaved'), { actions: actionSummary(missingSuggestedActions, t) })}
           </div>
         )}
+        <div className="rule-source-toolbar">
+          <strong>{t('lotteries.fullRuleText')}</strong>
+          <button
+            className="btn-ghost"
+            type="button"
+            disabled={hydrating}
+            onClick={() => hydrateRule({ force: true })}
+          >
+            {hydrating ? t('lotteries.ruleHydrating') : t('lotteries.refreshRuleHydration')}
+          </button>
+        </div>
         <textarea
-          className="input textarea"
+          className="input textarea rule-source-text"
           value={ruleText}
           onChange={event => {
+            operatorEditedRef.current = true;
             setRuleText(event.target.value);
             setRuleCompleteConfirmed(false);
             setReviewedConfirmed(false);
@@ -1565,8 +2282,36 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
           readOnly={sourceRuleLocked}
           aria-readonly={sourceRuleLocked}
           aria-describedby={sourceRuleLocked ? sourceRuleHelpId : undefined}
-          placeholder={t('lotteries.ruleTextPlaceholder')}
+          placeholder={hydrating ? t('lotteries.ruleHydrating') : t('lotteries.ruleTextPlaceholder')}
         />
+        {hydrationError && (
+          <div className="notice notice-warning small-text" role="alert">
+            {t('lotteries.ruleHydrationFailed')}: {hydrationError}
+          </div>
+        )}
+        {!!hydration?.warnings?.length && (
+          <div className="notice notice-warning small-text" role="note">
+            {t('lotteries.ruleHydrationWarnings')}: {hydration.warnings.join(' / ')}
+          </div>
+        )}
+        {!!ruleSnapshotParts.length && (
+          <details className="rule-source-snapshots">
+            <summary>{t('lotteries.ruleSnapshotDetails')}</summary>
+            <div className="rule-source-snapshot-list">
+              {ruleSnapshotParts.map(part => (
+                <div className="rule-source-snapshot" key={part.key}>
+                  <div className="capability-row">
+                    <strong>{t(`lotteries.ruleSnapshotParts.${part.key}`)}</strong>
+                    <span className={`badge ${part.trusted ? 'badge-ready' : 'badge-warn'}`}>
+                      {t(part.trusted ? 'lotteries.snapshotTrusted' : 'lotteries.snapshotUntrusted')}
+                    </span>
+                  </div>
+                  <div className="small-text rule-source-snapshot-text">{part.value}</div>
+                </div>
+              ))}
+            </div>
+          </details>
+        )}
         {sourceRuleLocked && (
           <div className="notice notice-warning small-text" id={sourceRuleHelpId} role="note">
             <div>{t('lotteries.sourceRuleReadOnly')}</div>
@@ -1575,7 +2320,7 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
               : 'lotteries.sourceRuleCorrectionUnavailable')}</div>
           </div>
         )}
-        <button className="btn-ghost" type="button" disabled={!ruleText.trim() || suggesting} onClick={requestSuggestion}>
+        <button className="btn-ghost" type="button" disabled={!ruleText.trim() || suggesting} onClick={() => requestSuggestion()}>
           {suggesting ? t('lotteries.suggesting') : t('lotteries.suggestRule')}
         </button>
         {suggestion && (
@@ -1611,6 +2356,29 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
         {actions.includes('followed') && (
           <fieldset className="exact-payload-editor">
             <legend>{t('lotteries.followTarget')}</legend>
+            <div className="target-identity-card">
+              <div className="capability-row">
+                <strong>{t('lotteries.targetAuthorIdentity')}</strong>
+                <span className={`badge ${targetIdentity.verified ? 'badge-ready' : 'badge-warn'}`}>
+                  {t(targetIdentity.verified
+                    ? 'lotteries.targetIdentityVerified'
+                    : 'lotteries.targetIdentityUnverified')}
+                </span>
+              </div>
+              {targetIdentity.displayName && (
+                <div className="small-text">
+                  {t('lotteries.targetAuthorNickname')}: {targetIdentity.displayName}
+                </div>
+              )}
+              {targetIdentity.uid && (
+                <div className="small-text mono">
+                  {t('lotteries.targetAuthorUid')}: {targetIdentity.uid}
+                </div>
+              )}
+              {!targetIdentity.displayName && !targetIdentity.uid && (
+                <div className="small-text warning-text">{t('lotteries.targetIdentityMissing')}</div>
+              )}
+            </div>
             <label>
               <span>{t('lotteries.followTarget')}</span>
               <input
@@ -1622,52 +2390,116 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
                 autoComplete="off"
               />
             </label>
-            <div className="small-text muted-text">{t('lotteries.followTargetHint')}</div>
+            <div className="small-text muted-text">
+              {t(targetIdentity.displayName
+                ? 'lotteries.followTargetAutoHint'
+                : 'lotteries.followTargetHint')}
+            </div>
           </fieldset>
         )}
 
         {actions.filter(action => ['commented', 'reposted'].includes(action)).map(action => {
           const payload = draftPayloads[action] || { text: '' };
+          const topicTags = actionRequirementValues(semanticSource, action, 'topic_tags');
+          const sourceMentions = actionRequirementValues(semanticSource, action, 'mentions');
+          const friendRequirement = friendMentionRequirements[action];
+          const friendMentions = (Array.isArray(payload.mentions) ? payload.mentions : [])
+            .filter(mention => !sourceMentions.includes(mention));
+          const auxiliaryContentAction = actions.includes('commented') ? 'commented' : 'reposted';
+          const requiresMedia = action === auxiliaryContentAction
+            && sourceRequires(semanticSource, 'media_submission');
+          const requiresTranslation = action === auxiliaryContentAction
+            && sourceRequires(semanticSource, 'translation_required');
+          const requiresRepostText = action === 'reposted'
+            && sourceRequires(semanticSource, 'repost_content');
+          const showTextEditor = action === 'commented' || requiresRepostText;
+          const showAdvancedRequirements = Boolean(
+            friendRequirement || requiresMedia || requiresTranslation,
+          );
           return (
             <fieldset className="exact-payload-editor" key={`payload-${action}`}>
               <legend>{t(`lotteries.exactPayloads.${action}`)}</legend>
-              <label>
-                <span>{t(manualAssisted ? 'lotteries.manualExactText' : 'lotteries.exactText')}</span>
-                <textarea
-                  className="input textarea"
-                  value={payload.text || ''}
-                  onChange={event => updateTextPayload(action, 'text', event.target.value)}
-                  placeholder={t(`lotteries.exactTextPlaceholders.${action}`)}
-                />
-              </label>
-              {['topic_tags', 'mentions', 'media_refs'].map(field => (
-                <label key={field}>
-                  <span>{t(`lotteries.payloadFields.${field}`)}</span>
+              {showTextEditor ? (
+                <label>
+                  <span>{t(manualAssisted ? 'lotteries.manualExactText' : 'lotteries.exactText')}</span>
                   <textarea
                     className="input textarea"
-                    value={metadataLines(payload[field])}
-                    onChange={event => updateTextPayload(action, field, event.target.value)}
-                    placeholder={t('lotteries.onePerLine')}
+                    value={payload.text || ''}
+                    onChange={event => updateTextPayload(action, 'text', event.target.value)}
+                    placeholder={t(`lotteries.exactTextPlaceholders.${action}`)}
                   />
-                  {field === 'mentions' && friendMentionRequirements[action] && (
-                    <span className="small-text muted-text">
-                      {formatText(t('lotteries.friendMentionRequirement'), {
-                        count: friendMentionRequirements[action].count,
-                        mode: t(`lotteries.friendMentionModes.${friendMentionRequirements[action].mode}`),
-                      })}
-                    </span>
-                  )}
                 </label>
-              ))}
-              <label>
-                <span>{t('lotteries.payloadFields.translation')}</span>
-                <textarea
-                  className="input textarea"
-                  value={translationText(payload.translation)}
-                  onChange={event => updateTextPayload(action, 'translation', event.target.value)}
-                  placeholder={t('lotteries.translationPlaceholder')}
-                />
-              </label>
+              ) : (
+                <div className="automatic-payload-binding">
+                  <span className="badge badge-ready">{t('lotteries.automaticPayload')}</span>
+                  <span className="small-text">
+                    {payload.text || t('lotteries.repostWithoutAdditionalText')}
+                  </span>
+                </div>
+              )}
+              {!!(topicTags.length || sourceMentions.length) && (
+                <div className="automatic-requirements">
+                  <strong className="small-text">{t('lotteries.autoBoundRuleTokens')}</strong>
+                  <div className="blocker-list compact-blockers">
+                    {topicTags.map(value => (
+                      <span className="badge badge-info" key={`topic-${value}`}>{value}</span>
+                    ))}
+                    {sourceMentions.map(value => (
+                      <span className="badge badge-info" key={`mention-${value}`}>{value}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {showAdvancedRequirements && (
+                <details className="payload-advanced-requirements">
+                  <summary>{t('lotteries.explicitAdvancedRequirements')}</summary>
+                  <div className="payload-advanced-body">
+                    {friendRequirement && (
+                      <label>
+                        <span>{t('lotteries.friendMentionAccounts')}</span>
+                        <textarea
+                          className="input textarea"
+                          value={metadataLines(friendMentions)}
+                          onChange={event => updateTextPayload(
+                            action,
+                            'mentions',
+                            [...sourceMentions, ...parseMetadataLines(event.target.value)].join('\n'),
+                          )}
+                          placeholder={t('lotteries.onePerLine')}
+                        />
+                        <span className="small-text muted-text">
+                          {formatText(t('lotteries.friendMentionRequirement'), {
+                            count: friendRequirement.count,
+                            mode: t(`lotteries.friendMentionModes.${friendRequirement.mode}`),
+                          })}
+                        </span>
+                      </label>
+                    )}
+                    {requiresMedia && (
+                      <label>
+                        <span>{t('lotteries.payloadFields.media_refs')}</span>
+                        <textarea
+                          className="input textarea"
+                          value={metadataLines(payload.media_refs)}
+                          onChange={event => updateTextPayload(action, 'media_refs', event.target.value)}
+                          placeholder={t('lotteries.onePerLine')}
+                        />
+                      </label>
+                    )}
+                    {requiresTranslation && (
+                      <label>
+                        <span>{t('lotteries.payloadFields.translation')}</span>
+                        <textarea
+                          className="input textarea"
+                          value={translationText(payload.translation)}
+                          onChange={event => updateTextPayload(action, 'translation', event.target.value)}
+                          placeholder={t('lotteries.translationPlaceholder')}
+                        />
+                      </label>
+                    )}
+                  </div>
+                </details>
+              )}
             </fieldset>
           );
         })}
@@ -1696,7 +2528,10 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
           <input
             type="checkbox"
             checked={ruleCompleteConfirmed}
-            onChange={event => setRuleCompleteConfirmed(event.target.checked)}
+            onChange={event => {
+              operatorEditedRef.current = true;
+              setRuleCompleteConfirmed(event.target.checked);
+            }}
           />
           <span>{t('lotteries.completeRuleConfirmation')}</span>
         </label>
@@ -1704,39 +2539,57 @@ function RulePlanEditor({ lottery, gate, onSave, t }) {
           <input
             type="checkbox"
             checked={reviewedConfirmed}
-            onChange={event => setReviewedConfirmed(event.target.checked)}
+            onChange={event => {
+              operatorEditedRef.current = true;
+              setReviewedConfirmed(event.target.checked);
+            }}
           />
           <span>{t(manualAssisted
             ? 'lotteries.manualReviewedPlanConfirmation'
             : 'lotteries.reviewedPlanConfirmation')}</span>
         </label>
+        {saveDisabled && (
+          <div className="rule-save-blockers" id={`lottery-${lottery.id}-save-blockers`} role="alert">
+            <strong>{t('lotteries.ruleSaveMissingTitle')}</strong>
+            <ul>
+              {saveBlockerLabels.map((label, index) => (
+                <li key={`${saveBlockers[index]}-${index}`}>{label}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button
-          className="btn-primary"
+          className={`btn-primary ${saveDisabled ? 'is-blocked' : ''}`}
           type="button"
-          disabled={saveDisabled}
-          title={saveDisabled ? t('lotteries.completeRuleBeforeSave') : ''}
-          onClick={() => onSave(lottery, {
-            requiredActions: actions,
-            actionPayloads: draftPayloads,
-            ruleText,
-            ruleCompleteConfirmed,
-            reviewed: reviewedConfirmed,
-            executionPathId,
-            platform: lottery.platform,
-          })}
+          disabled={saving}
+          aria-disabled={saving}
+          aria-describedby={saveDisabled ? `lottery-${lottery.id}-save-blockers` : undefined}
+          title={saveDisabled ? saveBlockerLabels.join('；') : ''}
+          onClick={handleSave}
         >
-          {t('lotteries.saveCurrentRule')}
+          {saving ? t('lotteries.savingCurrentRule') : t('lotteries.saveCurrentRule')}
         </button>
       </div>
     </details>
   );
 }
 
-function actionPayloadDraft(actions, payloads, contentRequirements = null, platform = 'bilibili') {
+function actionPayloadDraft(
+  actions,
+  payloads,
+  contentRequirements = null,
+  platform = 'bilibili',
+  {
+    followTargetFallback = '',
+    rulePlan = null,
+    prepareForEditing = false,
+  } = {},
+) {
   const source = payloads && typeof payloads === 'object' ? payloads : {};
   const requirements = contentRequirements && typeof contentRequirements === 'object'
     ? contentRequirements
     : {};
+  const auxiliaryContentAction = actions.includes('commented') ? 'commented' : 'reposted';
   return lotteryActionsForPlatform(platform).reduce((result, action) => {
     if (!actions.includes(action)) return result;
     if (action === 'followed') {
@@ -1747,7 +2600,9 @@ function actionPayloadDraft(actions, payloads, contentRequirements = null, platf
         ? source.followed.target_handle
         : '';
       result.followed = {
-        target_handle: followTargets.length === 1 ? followTargets[0] : sourceTarget,
+        target_handle: followTargets.length === 1
+          ? followTargets[0]
+          : (validLotteryHandle(sourceTarget) ? sourceTarget : followTargetFallback),
       };
       return result;
     }
@@ -1756,16 +2611,51 @@ function actionPayloadDraft(actions, payloads, contentRequirements = null, platf
       return result;
     }
     const payload = source[action] && typeof source[action] === 'object' ? source[action] : {};
-    result[action] = { text: typeof payload.text === 'string' ? payload.text : '' };
+    const sourceText = typeof payload.text === 'string' ? payload.text : '';
+    const useDefaultRepost = prepareForEditing
+      && action === 'reposted'
+      && !sourceRequires(rulePlan, 'repost_content');
+    result[action] = {
+      text: useDefaultRepost ? defaultRepostText(platform) : sourceText,
+    };
     for (const field of ['topic_tags', 'mentions', 'media_refs']) {
       const exactRequirement = requirements[action]?.[field];
       if (Array.isArray(exactRequirement)) {
-        if (exactRequirement.length) result[action][field] = [...exactRequirement];
-      } else if (Array.isArray(payload[field]) && payload[field].length) {
+        const values = [...exactRequirement];
+        if (
+          prepareForEditing
+          && field === 'mentions'
+          && rulePlan?.friend_mention_requirements?.[action]
+          && Array.isArray(payload[field])
+        ) {
+          values.push(...payload[field].filter(item => !values.includes(item)));
+        }
+        if (values.length) result[action][field] = [...new Set(values)];
+      } else if (!prepareForEditing && Array.isArray(payload[field]) && payload[field].length) {
+        result[action][field] = [...payload[field]];
+      } else if (
+        prepareForEditing
+        && field === 'media_refs'
+        && action === auxiliaryContentAction
+        && sourceRequires(rulePlan, 'media_submission')
+        && Array.isArray(payload[field])
+        && payload[field].length
+      ) {
         result[action][field] = [...payload[field]];
       }
     }
-    if (payload.translation !== undefined && payload.translation !== null && payload.translation !== '') {
+    if (
+      payload.translation !== undefined
+      && payload.translation !== null
+      && payload.translation !== ''
+      && (
+        !prepareForEditing
+        || (
+          action === auxiliaryContentAction
+          && sourceRequires(rulePlan, 'translation_required')
+        )
+      )
+    ) {
       result[action].translation = payload.translation;
     }
     return result;
@@ -1785,123 +2675,144 @@ function translationText(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-function isWellFormedUnicode(value) {
-  const text = String(value || '');
-  for (let index = 0; index < text.length; index += 1) {
-    const unit = text.charCodeAt(index);
-    if (unit >= 0xD800 && unit <= 0xDBFF) {
-      const next = text.charCodeAt(index + 1);
-      if (!(next >= 0xDC00 && next <= 0xDFFF)) return false;
-      index += 1;
-    } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function exactPayloadErrors(actions, payloads, platform = 'bilibili') {
-  const errors = [];
-  if (actions.includes('followed')) {
-    const target = payloads.followed?.target_handle;
-    if (typeof target !== 'string' || !/^@[\p{L}\p{N}_-]{1,64}$/u.test(target)) {
-      errors.push('action_payload_followed_target_invalid');
-    }
-  }
-  for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
-    const payload = payloads[action] || {};
-    const text = String(payload.text || '');
-    const plainPlatformRepost = ['douyin', 'weibo'].includes(
-      String(platform || '').trim().toLowerCase(),
-    )
-      && action === 'reposted'
-      && !text.trim()
-      && !['topic_tags', 'mentions', 'media_refs'].some(field => (
-        Array.isArray(payload[field]) && payload[field].length
-      ))
-      && !String(payload.translation || '').trim();
-    if (!text.trim() && !plainPlatformRepost) errors.push(`action_payload_${action}_text_required`);
-    if (!isWellFormedUnicode(text)) errors.push(`action_payload_${action}_text_invalid`);
-    if (utf8ByteLength(text) > 4096) errors.push(`action_payload_${action}_text_too_large`);
-    if (String(platform || '').trim().toLowerCase() === 'weibo' && text.length > 140) {
-      errors.push(`weibo_${action}_text_too_long`);
-    }
-    for (const field of ['topic_tags', 'mentions', 'media_refs']) {
-      const values = Array.isArray(payload[field]) ? payload[field] : [];
-      if (values.length > 32) errors.push(`action_payload_${field}_too_many`);
-      if (values.some(item => (
-        !isWellFormedUnicode(item)
-        || utf8ByteLength(item) > 512
-        || (field === 'mentions' && !/^@[\p{L}\p{N}_-]{1,64}$/u.test(item))
-      ))) {
-        errors.push(`action_payload_${field}_invalid`);
-      }
-    }
-    for (const token of payload.topic_tags || []) {
-      if (!actionTextContainsRequiredToken(text, token)) {
-        errors.push('action_payload_required_token_missing');
-      }
-    }
-    for (const mention of payload.mentions || []) {
-      if (!actionTextContainsRequiredToken(text, mention, { mention: true })) {
-        errors.push('action_payload_required_token_missing');
-      }
-    }
-    if (payload.translation !== undefined && payload.translation !== '') {
-      if (typeof payload.translation !== 'string' || !payload.translation.trim()) {
-        errors.push('action_payload_translation_invalid');
-      } else if (!text.includes(payload.translation)) {
-        errors.push('action_payload_translation_missing');
-      }
-    }
-  }
-  if (String(platform || '').trim().toLowerCase() === 'weibo') {
-    const handles = [];
-    if (actions.includes('followed') && payloads.followed?.target_handle) {
-      handles.push(payloads.followed.target_handle);
-    }
-    for (const action of actions.filter(item => ['commented', 'reposted'].includes(item))) {
-      handles.push(...(payloads[action]?.mentions || []));
-    }
-    if (new Set(handles.map(mentionIdentityKey)).size > WEIBO_MAX_UNIQUE_HANDLES) {
-      errors.push('weibo_preflight_unique_handle_limit_exceeded');
-    }
-  }
-  return [...new Set(errors)];
-}
-
-function utf8ByteLength(value) {
-  return new TextEncoder().encode(String(value || '')).length;
-}
-
-function ManualAssistedChecklist({ plan, gate, platform, t }) {
+function ManualAssistedChecklist({
+  plan,
+  gate,
+  platform,
+  lotteryId,
+  lotteryStatus,
+  onMarkResult,
+  t,
+}) {
   const items = manualAssistedChecklist(plan, platform);
   const shadowObservation = manualShadowObservation(gate);
+  const confirmationEnabled = manualParticipationConfirmationEnabled(platform);
+  const finalized = manualParticipationIsFinalized(lotteryStatus);
+  const itemSignature = items
+    .map(item => `${item.action}:${item.required ? '1' : '0'}:${item.exactValue}`)
+    .join('|');
+  const [confirmedActions, setConfirmedActions] = useState({});
+  const [saving, setSaving] = useState(false);
+  const confirmedActionCodes = Object.entries(confirmedActions)
+    .filter(([, confirmed]) => confirmed)
+    .map(([action]) => action);
+  const canSubmit = confirmationEnabled
+    && typeof onMarkResult === 'function'
+    && manualParticipationCanSubmit(items, confirmedActionCodes, lotteryStatus);
+  const resultStatusKey = `lotteries.${String(lotteryStatus || '').trim().toLowerCase()}`;
+  const resultStatusText = finalized ? t(resultStatusKey) : '';
+
+  useEffect(() => {
+    setConfirmedActions({});
+    setSaving(false);
+  }, [lotteryId, itemSignature, lotteryStatus]);
+
+  const toggleConfirmation = action => {
+    if (finalized || saving) return;
+    setConfirmedActions(current => ({
+      ...current,
+      [action]: !current[action],
+    }));
+  };
+
+  const recordParticipation = async () => {
+    if (!canSubmit) return;
+    setSaving(true);
+    try {
+      await onMarkResult(
+        lotteryId,
+        'participated',
+        manualParticipationResultNote(platform, items),
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <section className="manual-assisted-checklist" aria-label={t('lotteries.manualChecklistTitle')}>
       <div className="capability-row">
         <strong>{t('lotteries.manualChecklistTitle')}</strong>
         <span className="badge badge-warn">{t('lotteries.manualAssistedOnly')}</span>
       </div>
-      <p className="small-text muted-text">{t('lotteries.manualChecklistHint')}</p>
+      <p className="small-text muted-text">
+        {t(confirmationEnabled
+          ? 'lotteries.manualChecklistInteractiveHint'
+          : 'lotteries.manualChecklistHint')}
+      </p>
       <ol>
-        {items.map(item => (
-          <li key={item.action}>
-            <span className={`badge ${item.required ? 'badge-ready' : 'badge-danger'}`}>
-              {item.required ? t('lotteries.planIncluded') : t('lotteries.planMissing')}
-            </span>
-            <strong>{t(`lotteries.actions.${item.action}`)}</strong>
-            {item.exactValue && <span className="small-text manual-exact-value">{item.exactValue}</span>}
-          </li>
-        ))}
+        {items.map((item) => {
+          const confirmed = finalized || confirmedActions[item.action] === true;
+          return (
+            <li className={confirmed ? 'is-confirmed' : ''} key={item.action}>
+              {confirmationEnabled ? (
+                <label className="manual-checklist-confirmation">
+                  <input
+                    type="checkbox"
+                    checked={confirmed}
+                    disabled={finalized || saving}
+                    onChange={() => toggleConfirmation(item.action)}
+                  />
+                  <span className={`badge ${confirmed ? 'badge-ready' : 'badge-warn'}`}>
+                    {t(confirmed ? 'lotteries.manualConfirmed' : 'lotteries.manualPending')}
+                  </span>
+                  <span className="manual-checklist-content">
+                    <strong>{t(`lotteries.actions.${item.action}`)}</strong>
+                    {item.evidenceKey && (
+                      <span className="small-text">{t(item.evidenceKey)}</span>
+                    )}
+                    {item.exactValue && (
+                      <span className="small-text manual-exact-value">{item.exactValue}</span>
+                    )}
+                  </span>
+                </label>
+              ) : (
+                <>
+                  <span className={`badge ${item.required ? 'badge-ready' : 'badge-danger'}`}>
+                    {item.required ? t('lotteries.planIncluded') : t('lotteries.planMissing')}
+                  </span>
+                  <strong>{t(`lotteries.actions.${item.action}`)}</strong>
+                  {item.exactValue && (
+                    <span className="small-text manual-exact-value">{item.exactValue}</span>
+                  )}
+                </>
+              )}
+            </li>
+          );
+        })}
       </ol>
+      {confirmationEnabled && (
+        <div className="manual-participation-confirmation">
+          {finalized ? (
+            <div className="capability-row" role="status">
+              <span>{t('lotteries.manualParticipationAlreadyRecorded')}</span>
+              <span className="badge badge-ready">{resultStatusText}</span>
+            </div>
+          ) : (
+            <button
+              className="btn-primary"
+              type="button"
+              disabled={!canSubmit || saving}
+              onClick={recordParticipation}
+            >
+              {saving
+                ? t('lotteries.manualParticipationSaving')
+                : t('lotteries.manualParticipationSubmit')}
+            </button>
+          )}
+        </div>
+      )}
       <div className="small-text mono">
         {t('lotteries.shadowEvidence')}: {shadowObservation.complete
           ? t('lotteries.shadowEvidenceReady')
           : t('lotteries.shadowEvidenceMissing')}
         {shadowObservation.taskId ? ` / ${shortIdentity(shadowObservation.taskId)}` : ''}
       </div>
-      <p className="small-text warning-text">{t('lotteries.manualChecklistNoMutation')}</p>
+      <p className="small-text warning-text">
+        {t(confirmationEnabled
+          ? 'lotteries.manualChecklistConfirmationNoMutation'
+          : 'lotteries.manualChecklistNoMutation')}
+      </p>
     </section>
   );
 }

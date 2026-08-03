@@ -1,47 +1,53 @@
+import {
+  BILIBILI_EXECUTION_PATH_ID,
+  DOUYIN_DEVICE_EXECUTION_PATH_ID,
+  DOUYIN_EXECUTION_PATH_ID,
+  DOUYIN_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MAX_UNIQUE_HANDLES,
+  WEIBO_OAUTH_EXECUTION_PATH_ID,
+  XIAOHONGSHU_BROWSER_EXECUTION_PATH_ID,
+  XIAOHONGSHU_EXECUTION_PATH_ID,
+  XIAOHONGSHU_MANUAL_EXECUTION_PATH_ID,
+  actionsFollowPlatformModuleOrder,
+  platformLotteryActions,
+  platformModeBlocker,
+  platformModule,
+  platformSourceRuleCorrectionPath,
+  platformSupportsExecutionPath,
+  platformUsesFixedManualActions,
+  platformUsesManualAssistance,
+  resolvePlatformExecutionPath,
+} from './platforms/index.js';
+
+export {
+  BILIBILI_EXECUTION_PATH_ID,
+  DOUYIN_DEVICE_EXECUTION_PATH_ID,
+  DOUYIN_EXECUTION_PATH_ID,
+  DOUYIN_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MANUAL_EXECUTION_PATH_ID,
+  WEIBO_MAX_UNIQUE_HANDLES,
+  WEIBO_OAUTH_EXECUTION_PATH_ID,
+  XIAOHONGSHU_BROWSER_EXECUTION_PATH_ID,
+  XIAOHONGSHU_EXECUTION_PATH_ID,
+  XIAOHONGSHU_MANUAL_EXECUTION_PATH_ID,
+};
+
 const TARGET_ERROR_CODES = new Set([
   'https_required',
 ]);
 
 const DISPATCH_MODES = new Set(['dry_run', 'shadow_run', 'real_run']);
-const CANONICAL_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
-const DEFAULT_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'reposted'];
-const XIAOHONGSHU_FOUR_ACTIONS = ['followed', 'liked', 'commented', 'favorited'];
-const DOUYIN_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
-const WEIBO_LOTTERY_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
-export const WEIBO_MAX_UNIQUE_HANDLES = 32;
 const TEXT_ACTIONS = new Set(['commented', 'reposted']);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const HANDLE_PATTERN = /^@[\p{L}\p{N}_-]{1,64}$/u;
 const MENTION_IN_TEXT_PATTERN = /@[\p{L}\p{N}_-]{1,64}(?![\p{L}\p{N}_-])/gu;
 const CONTENT_REQUIREMENT_ACTIONS = ['commented', 'reposted'];
 const CONTENT_REQUIREMENT_FIELDS = ['topic_tags', 'mentions'];
-export const BILIBILI_EXECUTION_PATH_ID = 'bilibili_api_v2';
-export const XIAOHONGSHU_EXECUTION_PATH_ID = 'xiaohongshu_manual_v1';
-export const DOUYIN_EXECUTION_PATH_ID = 'douyin_manual_v1';
-export const WEIBO_OAUTH_EXECUTION_PATH_ID = 'weibo_oauth_v1';
-export const WEIBO_MANUAL_EXECUTION_PATH_ID = 'weibo_manual_v1';
 const UNBOUND_EXECUTION_EVIDENCE_BLOCKERS = new Set([
   'api_path_probe_evidence_not_implemented',
   'selector_config_evidence_binding_not_implemented',
 ]);
-const XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS = new Set([
-  'xiaohongshu_no_official_interaction_api',
-  'xiaohongshu_manual_only',
-]);
-const DOUYIN_EXPECTED_MANUAL_BLOCKERS = new Set([
-  'douyin_no_official_interaction_api',
-  'douyin_manual_only',
-]);
-const WEIBO_EXPECTED_MANUAL_BLOCKERS = new Set([
-  'weibo_manual_execution_selected',
-]);
-const WEIBO_ACTION_CAPABILITY_REQUIREMENTS = {
-  followed: { endpoint: 'friendships/create', permission: 'advanced', client_type: 'weibo' },
-  liked: { endpoint: 'attitudes/create', permission: 'advanced' },
-  commented: { endpoint: 'comments/create', permission: 'standard' },
-  favorited: { endpoint: 'favorites/create', permission: 'standard' },
-  reposted: { endpoint: 'statuses/repost', permission: 'standard' },
-};
 
 export function targetTransportCompatibilityIssue(platform, rawUrl) {
   try {
@@ -53,18 +59,11 @@ export function targetTransportCompatibilityIssue(platform, rawUrl) {
 }
 
 export function lotteryActionsForPlatform(platform) {
-  const normalizedPlatform = normalizePlatform(platform);
-  if (normalizedPlatform === 'xiaohongshu') return [...XIAOHONGSHU_FOUR_ACTIONS];
-  if (normalizedPlatform === 'douyin') return [...DOUYIN_LOTTERY_ACTIONS];
-  if (normalizedPlatform === 'weibo') return [...WEIBO_LOTTERY_ACTIONS];
-  return [...DEFAULT_LOTTERY_ACTIONS];
+  return platformLotteryActions(platform);
 }
 
 export function isManualAssistedPlatform(platform, executionPathId = '') {
-  const normalizedPlatform = normalizePlatform(platform);
-  if (['douyin', 'xiaohongshu'].includes(normalizedPlatform)) return true;
-  return normalizedPlatform === 'weibo'
-    && String(executionPathId || '').trim() === WEIBO_MANUAL_EXECUTION_PATH_ID;
+  return platformUsesManualAssistance(platform, executionPathId);
 }
 
 export function isManualAssistedPlan(platform, planOrExecutionPath = '') {
@@ -75,30 +74,87 @@ export function isManualAssistedPlan(platform, planOrExecutionPath = '') {
 }
 
 export function isFixedManualActionPlatform(platform) {
-  return normalizePlatform(platform) === 'xiaohongshu';
+  return platformUsesFixedManualActions(platform);
 }
 
 export function platformExecutionPathId(platform, currentExecutionPathId = '') {
-  const normalizedPlatform = normalizePlatform(platform);
-  if (normalizedPlatform === 'bilibili') return BILIBILI_EXECUTION_PATH_ID;
-  if (normalizedPlatform === 'xiaohongshu') return XIAOHONGSHU_EXECUTION_PATH_ID;
-  if (normalizedPlatform === 'douyin') return DOUYIN_EXECUTION_PATH_ID;
-  if (normalizedPlatform === 'weibo') {
-    const current = String(currentExecutionPathId || '').trim();
-    return [WEIBO_OAUTH_EXECUTION_PATH_ID, WEIBO_MANUAL_EXECUTION_PATH_ID].includes(current)
-      ? current
-      : WEIBO_OAUTH_EXECUTION_PATH_ID;
-  }
-  return String(currentExecutionPathId || '').trim();
+  return resolvePlatformExecutionPath(platform, currentExecutionPathId);
 }
 
 export function platformDispatchBlocker(platform, mode, executionPathId = '') {
-  const normalizedPlatform = normalizePlatform(platform);
-  const normalizedMode = String(mode || '').trim().toLowerCase();
-  if (!isManualAssistedPlatform(normalizedPlatform, executionPathId)) return null;
-  if (normalizedMode === 'real_run') return `${normalizedPlatform}_manual_only`;
-  if (normalizedMode === 'dry_run') return `${normalizedPlatform}_manual_shadow_only`;
-  return null;
+  return platformModeBlocker(platform, mode, executionPathId);
+}
+
+export function exactActionPayloadErrors(actions, payloads, platform = 'bilibili') {
+  const errors = [];
+  const selectedActions = Array.isArray(actions) ? actions : [];
+  const sourcePayloads = payloads && typeof payloads === 'object' ? payloads : {};
+  const strategy = platformModule(platform)?.strategy;
+  if (selectedActions.includes('followed')) {
+    const target = sourcePayloads.followed?.target_handle;
+    if (!validHandle(target)) errors.push('action_payload_followed_target_invalid');
+  }
+  for (const action of selectedActions.filter(item => TEXT_ACTIONS.has(item))) {
+    const payload = sourcePayloads[action] && typeof sourcePayloads[action] === 'object'
+      ? sourcePayloads[action]
+      : {};
+    const normalizedPolicyPayload = strategy?.normalizeUpdatePayload
+      ? strategy.normalizeUpdatePayload(action, payload)
+      : payload;
+    const text = String(payload.text || '');
+    if (
+      !text.trim()
+      && strategy?.allowsEmptyTextPayload?.({ action, payload: normalizedPolicyPayload }) !== true
+    ) errors.push(`action_payload_${action}_text_required`);
+    if (!isWellFormedUnicode(text)) errors.push(`action_payload_${action}_text_invalid`);
+    if (utf8ByteLength(text) > 4096) errors.push(`action_payload_${action}_text_too_large`);
+    errors.push(...(strategy?.validateTextPayload?.({ action, payload, text }) || []));
+    for (const field of ['topic_tags', 'mentions', 'media_refs']) {
+      const rawValues = payload[field];
+      const values = Array.isArray(rawValues) ? rawValues : [];
+      if (rawValues !== undefined && !Array.isArray(rawValues)) {
+        errors.push(`action_payload_${field}_invalid`);
+      }
+      if (values.length > 32) errors.push(`action_payload_${field}_too_many`);
+      if (values.some(item => (
+        !isWellFormedUnicode(item)
+        || utf8ByteLength(item) > 512
+        || (field === 'mentions' && !validHandle(item))
+      ))) errors.push(`action_payload_${field}_invalid`);
+    }
+    const topicTags = Array.isArray(payload.topic_tags) ? payload.topic_tags : [];
+    const mentions = Array.isArray(payload.mentions) ? payload.mentions : [];
+    for (const token of topicTags) {
+      if (!actionTextContainsRequiredToken(text, token)) {
+        errors.push('action_payload_required_token_missing');
+      }
+    }
+    for (const mention of mentions) {
+      if (!actionTextContainsRequiredToken(text, mention, { mention: true })) {
+        errors.push('action_payload_required_token_missing');
+      }
+    }
+    if (payload.translation !== undefined && payload.translation !== '') {
+      if (typeof payload.translation !== 'string' || !payload.translation.trim()) {
+        errors.push('action_payload_translation_invalid');
+      } else if (!text.includes(payload.translation)) {
+        errors.push('action_payload_translation_missing');
+      }
+    }
+  }
+  const emptyRequirements = {
+    follow_targets: [],
+    commented: { topic_tags: [], mentions: [] },
+    reposted: { topic_tags: [], mentions: [] },
+  };
+  errors.push(...(strategy?.validateBindings?.({
+    requirements: emptyRequirements,
+    sourceRequirements: emptyRequirements,
+    payloads: sourcePayloads,
+    contentRequirementActions: CONTENT_REQUIREMENT_ACTIONS,
+    mentionIdentityKey,
+  }) || []));
+  return [...new Set(errors)];
 }
 
 export function buildActionPlanV2Update({
@@ -127,12 +183,10 @@ export function buildActionPlanV2Update({
 
 function normalizedUpdatePayload(platform, action, value) {
   const payload = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  if (!['douyin', 'weibo'].includes(normalizePlatform(platform)) || action !== 'reposted') return payload;
-  const hasExactText = Boolean(String(payload.text || '').trim());
-  const hasMetadata = ['topic_tags', 'mentions', 'media_refs'].some(field => (
-    Array.isArray(payload[field]) && payload[field].length
-  )) || Boolean(String(payload.translation || '').trim());
-  return hasExactText || hasMetadata ? payload : {};
+  const strategy = platformModule(platform)?.strategy;
+  return strategy?.normalizeUpdatePayload
+    ? strategy.normalizeUpdatePayload(action, payload)
+    : payload;
 }
 
 export function realRunEvidencePath(accountId) {
@@ -151,15 +205,17 @@ export function targetValidationErrorCode(value) {
 }
 
 export function sourceRuleCorrectionPath(platform, sourceType) {
-  const normalizedPlatform = String(platform || '').trim().toLowerCase();
-  const normalizedSource = String(sourceType || '').trim().toLowerCase();
-  if (normalizedPlatform === 'bilibili' && ['up', 'keyword'].includes(normalizedSource)) {
-    return 'discovery_refresh';
-  }
-  return 'unavailable';
+  return platformSourceRuleCorrectionPath(platform, sourceType);
 }
 
-export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailable, accountScopeBound = false }) {
+export function dispatchSafetyBlocker({
+  lottery,
+  mode,
+  gate,
+  safeAccountAvailable,
+  accountScopeBound = false,
+  accountScopeCompatible = accountScopeBound,
+}) {
   const normalizedMode = String(mode || '').trim().toLowerCase();
   if (!lottery?.id) return 'lottery_missing';
   if (!DISPATCH_MODES.has(normalizedMode)) return 'mode_blocked';
@@ -174,6 +230,9 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
     return 'legacy_http_target';
   }
   if (safeAccountAvailable !== true) return 'no_safe_account';
+  if (accountScopeBound === true && accountScopeCompatible !== true) {
+    return 'account_credential_kind_mismatch';
+  }
   if (normalizedMode !== 'dry_run' && accountScopeBound !== true) return 'account_scope_required';
   const planBlockers = manualAssisted
     ? actionPlanV2ReviewBlockers(lottery.action_plan, lottery.platform)
@@ -185,10 +244,20 @@ export function dispatchSafetyBlocker({ lottery, mode, gate, safeAccountAvailabl
   return null;
 }
 
+export function evidenceResponseMatchesAccountScope(response, expectedAccountId) {
+  const expected = String(expectedAccountId ?? '').trim();
+  if (String(response?.selected_account_id ?? '').trim() !== expected) return false;
+  const items = Array.isArray(response?.items) ? response.items : [];
+  return items.every(item => (
+    String(item?.selected_account_id ?? '').trim() === expected
+  ));
+}
+
 function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return ['action_plan_v2_required'];
   const blockers = [];
   const normalizedPlatform = normalizePlatform(platform);
+  const strategy = platformModule(normalizedPlatform)?.strategy;
   if (plan.version !== 2) blockers.push('action_plan_v2_required');
   if (!normalizedPlatform || String(plan.platform || '').trim().toLowerCase() !== normalizedPlatform) {
     blockers.push('action_plan_platform_mismatch');
@@ -197,6 +266,7 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
   const expectedExecutionPathId = platformExecutionPathId(normalizedPlatform, executionPathId);
   if (
     !executionPathId
+    || !platformSupportsExecutionPath(normalizedPlatform, executionPathId)
     || (expectedExecutionPathId && executionPathId !== expectedExecutionPathId)
   ) blockers.push('execution_path_mismatch');
   const reviewedBy = typeof plan.reviewed_by === 'string' ? plan.reviewed_by : '';
@@ -207,55 +277,25 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
     || utf8ByteLength(reviewedBy) > 128
   ) blockers.push('action_plan_not_reviewed');
   if (plan.rule_complete_confirmed !== true) blockers.push('rule_completion_not_attested');
-  if (normalizedPlatform === 'xiaohongshu' && plan.executable !== false) {
-    blockers.push('xiaohongshu_manual_plan_must_be_non_executable');
-  }
-  if (normalizedPlatform === 'douyin' && plan.executable !== false) {
-    blockers.push('douyin_manual_plan_must_be_non_executable');
-  }
-  if (
-    normalizedPlatform === 'weibo'
-    && executionPathId === WEIBO_MANUAL_EXECUTION_PATH_ID
-    && plan.executable !== false
-  ) {
-    blockers.push('weibo_manual_plan_must_be_non_executable');
-  }
   if (requireExecutable && plan.executable !== true) blockers.push('action_plan_not_executable');
   if (!Number.isInteger(plan.rule_snapshot_id) || plan.rule_snapshot_id <= 0) blockers.push('rule_snapshot_missing');
   if (!SHA256_PATTERN.test(String(plan.rule_hash || ''))) blockers.push('rule_hash_missing');
   if (!SHA256_PATTERN.test(String(plan.plan_hash || ''))) blockers.push('action_plan_hash_missing');
 
   const actions = plan.required_actions;
-  const allowedActions = lotteryActionsForPlatform(normalizedPlatform);
-  const actionsValid = Array.isArray(actions)
-    && actions.length > 0
-    && actions.every((action, index) => (
-      allowedActions.includes(action)
-      && actions.indexOf(action) === index
-      && CANONICAL_LOTTERY_ACTIONS.indexOf(action) >= (
-        index ? CANONICAL_LOTTERY_ACTIONS.indexOf(actions[index - 1]) : 0
-      )
-    ));
+  const actionsValid = actionsFollowPlatformModuleOrder(
+    platformModule(normalizedPlatform),
+    actions,
+  );
   if (!actionsValid) blockers.push('required_actions_invalid');
-  if (
-    normalizedPlatform === 'xiaohongshu'
-    && (!actionsValid || !sameOrderedList(actions, XIAOHONGSHU_FOUR_ACTIONS))
-  ) blockers.push('xiaohongshu_four_action_plan_required');
-  if (normalizedPlatform === 'weibo') {
-    const expectedRuntimeRequirements = executionPathId === WEIBO_OAUTH_EXECUTION_PATH_ID
-      ? {
-        contract_version: 1,
-        actions: Object.fromEntries(
-          (Array.isArray(actions) ? actions : [])
-            .filter(action => WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action])
-            .map(action => [action, WEIBO_ACTION_CAPABILITY_REQUIREMENTS[action]]),
-        ),
-      }
-      : {};
-    if (!sameJsonValue(plan.runtime_capability_requirements ?? {}, expectedRuntimeRequirements)) {
-      blockers.push('weibo_oauth_capability_contract_mismatch');
-    }
-  }
+  blockers.push(...(strategy?.validatePlan?.({
+    plan,
+    executionPathId,
+    actions,
+    actionsValid,
+    sameJsonValue,
+    sameOrderedList,
+  }) || []));
 
   const payloads = plan.action_payloads;
   if (!payloads || typeof payloads !== 'object' || Array.isArray(payloads)) {
@@ -281,11 +321,7 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
         }
       } else if (
         TEXT_ACTIONS.has(action)
-        && !(
-          ['douyin', 'weibo'].includes(normalizedPlatform)
-          && action === 'reposted'
-          && Object.keys(payload).length === 0
-        )
+        && strategy?.allowsEmptyTextPayload?.({ action, payload }) !== true
         && !String(payload.text || '').trim()
       ) {
         blockers.push(`action_payload_${action}_text_required`);
@@ -299,12 +335,7 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
         if (unknownFields.length) blockers.push('action_payload_unknown_field');
         if (!isWellFormedUnicode(text)) blockers.push(`action_payload_${action}_text_invalid`);
         if (utf8ByteLength(text) > 4096) blockers.push(`action_payload_${action}_text_too_large`);
-        // Match Core/Worker and the Weibo client contract exactly. JavaScript
-        // string length counts UTF-16 code units, so non-BMP emoji consume two.
-        // Do not truncate reviewed text to make it fit a remote API limit.
-        if (normalizedPlatform === 'weibo' && text.length > 140) {
-          blockers.push(`weibo_${action}_text_too_long`);
-        }
+        blockers.push(...(strategy?.validateTextPayload?.({ action, payload, text }) || []));
         for (const field of ['topic_tags', 'mentions', 'media_refs']) {
           const value = payload[field];
           if (Array.isArray(value) && value.length > 32) {
@@ -342,11 +373,6 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
             blockers.push('action_payload_translation_missing');
           }
         }
-        if (
-          normalizedPlatform === 'bilibili'
-          && Array.isArray(payload.media_refs)
-          && payload.media_refs.length
-        ) blockers.push('action_payload_media_unsupported');
       }
     }
   }
@@ -409,23 +435,13 @@ function collectActionPlanV2Blockers(plan, platform, { requireExecutable }) {
           blockers.push('action_plan_friend_mention_requirement_binding_mismatch');
         }
       }
-      if (normalizedPlatform === 'weibo') {
-        const handles = [
-          ...requirements.follow_targets,
-          ...sourceRequirements.follow_targets,
-          ...(payloads?.followed?.target_handle ? [payloads.followed.target_handle] : []),
-        ];
-        for (const action of CONTENT_REQUIREMENT_ACTIONS) {
-          handles.push(
-            ...requirements[action].mentions,
-            ...sourceRequirements[action].mentions,
-            ...(payloads?.[action]?.mentions || []),
-          );
-        }
-        if (new Set(handles.map(mentionIdentityKey)).size > WEIBO_MAX_UNIQUE_HANDLES) {
-          blockers.push('weibo_preflight_unique_handle_limit_exceeded');
-        }
-      }
+      blockers.push(...(strategy?.validateBindings?.({
+        requirements,
+        sourceRequirements,
+        payloads,
+        contentRequirementActions: CONTENT_REQUIREMENT_ACTIONS,
+        mentionIdentityKey,
+      }) || []));
     }
     for (const [action, constraint] of Object.entries(friendMentionRequirements)) {
       if (!Array.isArray(actions) || !actions.includes(action)) {
@@ -468,23 +484,17 @@ export function actionPlanV2ReviewBlockers(plan, platform = 'bilibili') {
     || !plan
     || typeof plan !== 'object'
   ) return blockers;
-  const normalizedPlatform = normalizePlatform(platform);
+  const strategy = platformModule(platform)?.strategy;
+  const manualReview = strategy?.manualReview;
+  if (!manualReview) return blockers;
   const payloadErrors = Array.isArray(plan.payload_validation_errors)
     ? plan.payload_validation_errors.filter(Boolean)
     : [];
   const capabilityBlockers = Array.isArray(plan.capability_blockers)
     ? plan.capability_blockers.filter(Boolean)
     : [];
-  const capabilityCode = normalizedPlatform === 'douyin'
-    ? 'douyin_no_official_interaction_api'
-    : (normalizedPlatform === 'weibo'
-      ? 'weibo_manual_execution_selected'
-      : 'xiaohongshu_no_official_interaction_api');
-  const expectedCapabilityBlockers = normalizedPlatform === 'douyin'
-    ? DOUYIN_EXPECTED_MANUAL_BLOCKERS
-    : (normalizedPlatform === 'weibo'
-      ? WEIBO_EXPECTED_MANUAL_BLOCKERS
-      : XIAOHONGSHU_EXPECTED_MANUAL_BLOCKERS);
+  const capabilityCode = manualReview.requiredCapabilityBlocker;
+  const expectedCapabilityBlockers = new Set(manualReview.expectedCapabilityBlockers);
   const missingManualCapability = capabilityBlockers.includes(capabilityCode)
     ? []
     : [capabilityCode];
@@ -539,20 +549,72 @@ export function manualAssistedChecklist(plan, platform) {
     !isManualAssistedPlatform(platform, plan?.execution_path_id)
     || !actionPlanV2ReviewReady(plan, platform)
   ) return [];
-  const normalizedPlatform = normalizePlatform(platform);
+  const module = platformModule(platform);
   const actions = Array.isArray(plan?.required_actions) ? plan.required_actions : [];
   const payloads = plan?.action_payloads && typeof plan.action_payloads === 'object'
     ? plan.action_payloads
     : {};
-  const checklistActions = lotteryActionsForPlatform(normalizedPlatform)
-    .filter(action => normalizedPlatform === 'xiaohongshu' || actions.includes(action));
-  return checklistActions.map(action => ({
-    action,
-    required: actions.includes(action),
-    exactValue: action === 'followed'
-      ? String(payloads.followed?.target_handle || '')
-      : (TEXT_ACTIONS.has(action) ? String(payloads[action]?.text || '') : ''),
-  }));
+  const availableActions = lotteryActionsForPlatform(platform);
+  const configuredOrder = Array.isArray(module?.strategy?.manualChecklistActionOrder)
+    ? module.strategy.manualChecklistActionOrder
+    : [];
+  const checklistOrder = [...new Set([...configuredOrder, ...availableActions])]
+    .filter(action => availableActions.includes(action));
+  const evidenceKeys = module?.strategy?.manualChecklistEvidenceKeys;
+  const checklistActions = checklistOrder
+    .filter(action => module?.strategy?.manualChecklistAllActions || actions.includes(action));
+  return checklistActions.map((action) => {
+    const evidenceKey = (
+      evidenceKeys
+      && typeof evidenceKeys === 'object'
+      && typeof evidenceKeys[action] === 'string'
+    ) ? evidenceKeys[action] : '';
+    return {
+      action,
+      required: actions.includes(action),
+      exactValue: action === 'followed'
+        ? String(payloads.followed?.target_handle || '')
+        : (TEXT_ACTIONS.has(action) ? String(payloads[action]?.text || '') : ''),
+      ...(evidenceKey ? { evidenceKey } : {}),
+    };
+  });
+}
+
+export function manualParticipationConfirmationEnabled(platform) {
+  return platformModule(platform)?.strategy?.manualParticipationConfirmation === true;
+}
+
+export function manualParticipationIsFinalized(status) {
+  return ['participated', 'won', 'lost', 'expired'].includes(
+    String(status || '').trim().toLowerCase(),
+  );
+}
+
+export function manualParticipationCanSubmit(items, confirmedActions, status = '') {
+  if (manualParticipationIsFinalized(status)) return false;
+  const requiredActions = (Array.isArray(items) ? items : [])
+    .filter(item => item?.required === true)
+    .map(item => String(item.action || '').trim())
+    .filter(Boolean);
+  if (!requiredActions.length) return false;
+  const confirmed = new Set(
+    (Array.isArray(confirmedActions) ? confirmedActions : [])
+      .map(action => String(action || '').trim())
+      .filter(Boolean),
+  );
+  return requiredActions.every(action => confirmed.has(action));
+}
+
+export function manualParticipationResultNote(platform, items) {
+  const actions = (Array.isArray(items) ? items : [])
+    .filter(item => item?.required === true)
+    .map(item => String(item.action || '').trim())
+    .filter(Boolean);
+  return [
+    'manual_participation_confirmed',
+    `platform=${normalizePlatform(platform)}`,
+    `actions=${actions.join(',')}`,
+  ].join('; ');
 }
 
 export function xiaohongshuShadowObservation(gate) {
@@ -645,9 +707,12 @@ export function unresolvedRuleRequirements(rulePlan, actionPayloads) {
     })) unresolved.push(requirement);
   }
   if (payloads.followed) {
+    const followTargets = contentRequirements.follow_targets;
+    const targetHandle = payloads.followed.target_handle;
     if (
-      contentRequirements.follow_targets.length !== 1
-      || payloads.followed.target_handle !== contentRequirements.follow_targets[0]
+      followTargets.length > 1
+      || (followTargets.length === 1 && targetHandle !== followTargets[0])
+      || (followTargets.length === 0 && !validHandle(targetHandle))
     ) unresolved.push('follow_target');
   } else if (contentRequirements.follow_targets.length) {
     unresolved.push('follow_target');
@@ -708,7 +773,19 @@ function friendMentionRequirementsSatisfied(requirements, payloads, sourceRequir
 }
 
 export function mentionIdentityKey(value) {
-  return String(value || '').normalize('NFKC').toLowerCase();
+  // ECMAScript has no String#casefold. For the handle alphabet accepted by
+  // HANDLE_PATTERN, closing over Unicode upper/lower mappings produces the
+  // same caseless equivalence classes as Python's str.casefold(). Dotless i is
+  // the one over-merged letter, so protect it with a private-use sentinel
+  // (private-use characters are not legal handles) during the closure.
+  const dotlessISentinel = '\uE000';
+  return String(value || '')
+    .normalize('NFKC')
+    .replaceAll('\u0131', dotlessISentinel)
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .replaceAll(dotlessISentinel, '\u0131');
 }
 
 export function actionTextContainsRequiredToken(text, token, { mention = false } = {}) {

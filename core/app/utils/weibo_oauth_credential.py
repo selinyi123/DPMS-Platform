@@ -57,12 +57,9 @@ def is_weibo_oauth_credential_envelope(payload: str | bytes) -> bool:
     )
 
 
-def _utc_expiry(
-    value: Any,
-    *,
-    now: datetime | None = None,
-    min_remaining_seconds: int = WEIBO_OAUTH_MIN_REMAINING_TTL_SECONDS,
-) -> datetime:
+def _utc_expiry(value: Any) -> datetime:
+    """Parse and normalize an expiry without making a freshness decision."""
+
     if not isinstance(value, str) or not value or value != value.strip():
         raise WeiboOAuthCredentialError("weibo_oauth_credential_expiry_invalid")
     token = value[:-1] + "+00:00" if value.endswith("Z") else value
@@ -74,7 +71,15 @@ def _utc_expiry(
         ) from exc
     if parsed.tzinfo is None:
         raise WeiboOAuthCredentialError("weibo_oauth_credential_expiry_invalid")
-    expiry = parsed.astimezone(timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _require_fresh_expiry(
+    expiry: datetime,
+    *,
+    now: datetime | None = None,
+    min_remaining_seconds: int = WEIBO_OAUTH_MIN_REMAINING_TTL_SECONDS,
+) -> None:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         raise WeiboOAuthCredentialError("weibo_oauth_credential_expiry_invalid")
@@ -83,16 +88,10 @@ def _utc_expiry(
         raise WeiboOAuthCredentialError("weibo_oauth_credential_expired")
     if expiry < current_utc + timedelta(seconds=min_remaining_seconds):
         raise WeiboOAuthCredentialError("weibo_oauth_credential_expiring_soon")
-    return expiry
 
 
-def validate_weibo_oauth_credential(
-    value: Any,
-    *,
-    now: datetime | None = None,
-    min_remaining_seconds: int = WEIBO_OAUTH_MIN_REMAINING_TTL_SECONDS,
-) -> dict[str, Any]:
-    """Validate the exact decrypted envelope without ever returning logs."""
+def _validate_weibo_oauth_envelope(value: Any) -> tuple[dict[str, Any], datetime]:
+    """Validate exact shape and field syntax, independent of token freshness."""
 
     if not isinstance(value, Mapping) or set(value) != WEIBO_OAUTH_CREDENTIAL_KEYS:
         raise WeiboOAuthCredentialError("weibo_oauth_credential_invalid")
@@ -116,12 +115,25 @@ def validate_weibo_oauth_credential(
         or int(uid) <= 0
     ):
         raise WeiboOAuthCredentialError("weibo_oauth_uid_invalid")
-    expiry = _utc_expiry(
-        credential.get("expires_at"),
+    expiry = _utc_expiry(credential.get("expires_at"))
+    credential["expires_at"] = expiry.isoformat().replace("+00:00", "Z")
+    return credential, expiry
+
+
+def validate_weibo_oauth_credential(
+    value: Any,
+    *,
+    now: datetime | None = None,
+    min_remaining_seconds: int = WEIBO_OAUTH_MIN_REMAINING_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Validate an exact decrypted envelope for new executable use."""
+
+    credential, expiry = _validate_weibo_oauth_envelope(value)
+    _require_fresh_expiry(
+        expiry,
         now=now,
         min_remaining_seconds=min_remaining_seconds,
     )
-    credential["expires_at"] = expiry.isoformat().replace("+00:00", "Z")
     return credential
 
 
@@ -151,6 +163,35 @@ def parse_weibo_oauth_credential(
         now=now,
         min_remaining_seconds=min_remaining_seconds,
     )
+
+
+def parse_weibo_oauth_credential_for_identity(
+    payload: str | bytes,
+) -> dict[str, Any]:
+    """Parse a stored envelope solely to recover its stable remote identity.
+
+    This deliberately validates duplicate keys, exact shape, field syntax and
+    expiry formatting while ignoring whether the old token is still fresh.
+    The result must never be used as an executable credential.
+    """
+
+    if isinstance(payload, bytes):
+        try:
+            payload = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WeiboOAuthCredentialError(
+                "weibo_oauth_credential_invalid"
+            ) from exc
+    if not isinstance(payload, str):
+        raise WeiboOAuthCredentialError("weibo_oauth_credential_invalid")
+    try:
+        parsed = json.loads(payload, object_pairs_hook=_object_without_duplicate_keys)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise WeiboOAuthCredentialError(
+            "weibo_oauth_credential_invalid"
+        ) from exc
+    credential, _expiry = _validate_weibo_oauth_envelope(parsed)
+    return credential
 
 
 def normalize_weibo_oauth_credential(payload: str) -> str:

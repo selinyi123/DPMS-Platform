@@ -112,16 +112,33 @@ test('fails closed when a Weibo structured export uses another platform', () => 
   });
   const code = errorCode(() => normalizeTargetImportForPlatform('bilibili', source, OPTIONS));
 
-  assert.equal(code, 'target_import_weibo_requires_platform');
+  assert.equal(code, 'target_import_structured_requires_platform');
 });
 
-test('requires Weibo short links to be imported one at a time', () => {
-  const code = errorCode(() => normalizeWeiboTargetImport(JSON.stringify([
+test('retains over-budget Weibo short links for Core rejection and audit', () => {
+  const result = normalizeWeiboTargetImport(JSON.stringify([
     'https://t.cn/A6abcdef?token=discarded',
     'https://t.cn/A6ghijkl',
-  ]), OPTIONS));
+  ]), OPTIONS);
 
-  assert.equal(code, 'weibo_import_short_link_batch_unsupported');
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.blockedShortLinkCount, 2);
+  assert.equal(result.shortLinkCount, 0);
+  assert.deepEqual(result.shortLinkErrorsByPlatform, {
+    weibo: 'weibo_import_short_link_batch_unsupported',
+  });
+  assert.match(result.content, /https:\/\/t\.cn\/A6abcdef/);
+  assert.doesNotMatch(result.content, /token|discarded/i);
+});
+
+test('allows one Weibo short link alongside a direct status link', () => {
+  const result = normalizeWeiboTargetImport(JSON.stringify([
+    'https://t.cn/A6abcdef',
+    'https://weibo.com/detail/PCAGRFqKj',
+  ]), OPTIONS);
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.shortLinkCount, 1);
 });
 
 test('uses the Weibo-specific import size boundary', () => {

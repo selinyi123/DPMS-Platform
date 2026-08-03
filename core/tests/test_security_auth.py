@@ -32,10 +32,16 @@ class ActorFromRequestTests(unittest.TestCase):
         self.assertEqual(actor["role"], "owner")
         self.assertEqual(actor["auth_type"], "x-admin-token")
 
-    def test_query_token_authenticates_read_only_get(self):
-        actor = actor_from_request(request(query={"admin_token": "test-admin-token"}))
+    def test_bearer_token_authenticates(self):
+        actor = actor_from_request(
+            request(headers={"authorization": "Bearer test-admin-token"})
+        )
         self.assertEqual(actor["role"], "owner")
-        self.assertEqual(actor["auth_type"], "admin_token_query")
+        self.assertEqual(actor["auth_type"], "authorization-bearer")
+
+    def test_query_token_is_rejected_for_read_requests(self):
+        actor = actor_from_request(request(query={"admin_token": "test-admin-token"}))
+        self.assertIsNone(actor)
 
     def test_query_token_rejected_for_write_methods(self):
         actor = actor_from_request(request(method="POST", query={"admin_token": "test-admin-token"}))

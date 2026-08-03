@@ -28,22 +28,29 @@ def load_worker_contract():
 worker_contract = load_worker_contract()
 
 
-def manual_plan():
+def manual_plan(
+    actions=("followed", "liked", "commented", "favorited"),
+):
+    payloads = {
+        "followed": {"target_handle": "@抽奖博主"},
+        "liked": {},
+        "commented": {"text": "认真阅读后参与抽奖"},
+        "favorited": {},
+    }
     plan = {
         "version": 2,
         "platform": "xiaohongshu",
         "rule_snapshot_id": 71,
         "rule_hash": "a" * 64,
         "execution_path_id": "xiaohongshu_manual_v1",
-        "required_actions": ["followed", "liked", "commented", "favorited"],
+        "required_actions": list(actions),
         "action_payloads": {
-            "followed": {"target_handle": "@抽奖博主"},
-            "liked": {},
-            "commented": {"text": "认真阅读后参与抽奖"},
-            "favorited": {},
+            action: payloads[action] for action in actions
         },
         "content_requirements": {
-            "follow_targets": ["@抽奖博主"],
+            "follow_targets": (
+                ["@抽奖博主"] if "followed" in actions else []
+            ),
             "commented": {"topic_tags": [], "mentions": []},
             "reposted": {"topic_tags": [], "mentions": []},
         },
@@ -51,7 +58,7 @@ def manual_plan():
         "review_required": False,
         "reviewed_by": "operator-1",
         "rule_complete_confirmed": True,
-        "capability_blockers": ["xiaohongshu_no_official_interaction_api"],
+        "capability_blockers": ["xiaohongshu_manual_execution_selected"],
     }
     plan["plan_hash"] = core_contract.compute_action_plan_hash(plan)
     return plan
@@ -82,18 +89,23 @@ class XiaohongshuActionPlanParityTests(unittest.TestCase):
             worker_contract.compute_action_plan_hash(plan),
         )
 
-    def test_both_contracts_accept_only_the_manual_four_action_envelope(self):
-        plan = manual_plan()
-        for contract in (core_contract, worker_contract):
-            with self.subTest(contract=contract.__name__):
-                validated = contract.validate_action_plan_v2(
-                    copy.deepcopy(plan),
-                    require_executable=False,
-                )
-                self.assertEqual(
-                    ("followed", "liked", "commented", "favorited"),
-                    tuple(validated.required_actions),
-                )
+    def test_both_contracts_accept_canonical_nonempty_manual_subsets(self):
+        for actions in (
+            ("liked",),
+            ("liked", "commented", "favorited"),
+            ("followed", "liked", "commented", "favorited"),
+        ):
+            plan = manual_plan(actions)
+            for contract in (core_contract, worker_contract):
+                with self.subTest(
+                    actions=actions,
+                    contract=contract.__name__,
+                ):
+                    validated = contract.validate_action_plan_v2(
+                        copy.deepcopy(plan),
+                        require_executable=False,
+                    )
+                    self.assertEqual(actions, tuple(validated.required_actions))
 
     def test_capability_path_action_and_legacy_bucket_tampering_fail_closed(self):
         mutations = []
@@ -106,14 +118,21 @@ class XiaohongshuActionPlanParityTests(unittest.TestCase):
         wrong_path["execution_path_id"] = "selector_flow"
         mutations.append(wrong_path)
 
-        missing_favorite = manual_plan()
-        missing_favorite["required_actions"].remove("favorited")
-        missing_favorite["action_payloads"].pop("favorited")
-        mutations.append(missing_favorite)
-
         legacy_repost = manual_plan()
         legacy_repost["content_requirements"]["reposted"]["mentions"] = ["@好友"]
         mutations.append(legacy_repost)
+
+        empty = manual_plan(())
+        mutations.append(empty)
+
+        wrong_order = manual_plan(("liked", "commented"))
+        wrong_order["required_actions"] = ["commented", "liked"]
+        mutations.append(wrong_order)
+
+        reposted = manual_plan(("liked",))
+        reposted["required_actions"].append("reposted")
+        reposted["action_payloads"]["reposted"] = {"text": "转发参与"}
+        mutations.append(reposted)
 
         for plan in mutations:
             plan["plan_hash"] = core_contract.compute_action_plan_hash(plan)

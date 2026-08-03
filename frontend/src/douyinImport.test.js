@@ -169,16 +169,33 @@ test('fails closed when a Douyin structured export is submitted under another pl
   });
   const code = errorCode(() => normalizeTargetImportForPlatform('bilibili', source, OPTIONS));
 
-  assert.equal(code, 'target_import_douyin_requires_platform');
+  assert.equal(code, 'target_import_structured_requires_platform');
 });
 
-test('rejects multiple Douyin short links in one batch', () => {
-  const code = errorCode(() => normalizeDouyinTargetImport(JSON.stringify([
+test('retains multiple Douyin short links for Core rejection and audit', () => {
+  const result = normalizeDouyinTargetImport(JSON.stringify([
     'https://v.douyin.com/abc123/?cookie=discarded',
     'https://v.douyin.com/def456/',
-  ]), OPTIONS));
+  ]), OPTIONS);
 
-  assert.equal(code, 'douyin_import_short_link_batch_unsupported');
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.blockedShortLinkCount, 2);
+  assert.equal(result.shortLinkCount, 0);
+  assert.deepEqual(result.shortLinkErrorsByPlatform, {
+    douyin: 'douyin_import_short_link_batch_unsupported',
+  });
+  assert.match(result.content, /https:\/\/v\.douyin\.com\/abc123/);
+  assert.doesNotMatch(result.content, /cookie|discarded/i);
+});
+
+test('allows one Douyin short link alongside a direct link', () => {
+  const result = normalizeDouyinTargetImport(JSON.stringify([
+    'https://v.douyin.com/abc123/',
+    'https://www.douyin.com/video/7300000000000000008',
+  ]), OPTIONS);
+
+  assert.equal(result.targetCount, 2);
+  assert.equal(result.shortLinkCount, 1);
 });
 
 test('uses a Douyin-specific error for malformed structured exports', () => {

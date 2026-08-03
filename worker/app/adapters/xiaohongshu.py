@@ -1,5 +1,7 @@
 from app.adapters.base import UnsupportedPlatformAction
-from app.adapters.selector_flow import SelectorFlowAdapter
+from collections.abc import Iterable
+
+from app.adapters.selector_flow import SelectorFlowAdapter, selector_list
 
 
 FOLLOW_TEXT = "关注"
@@ -12,10 +14,11 @@ FAVORITE_TEXT = "收藏"
 class XiaohongshuAdapter(SelectorFlowAdapter):
     PLATFORM = "xiaohongshu"
     ACTIONS = ("followed", "liked", "commented", "favorited")
-    STATUS = "manual_only"
+    STATUS = "calibration_required"
     CAPABILITY_BLOCK_REASON = "xiaohongshu_no_official_interaction_api"
     MANUAL_CONFIRMATION_REQUIRED = True
     OFFICIAL_INTERACTION_API_AVAILABLE = False
+    DURABLE_INTENTS_REQUIRED = True
     DEFAULT_SELECTOR_PROBES = {
         "followed": [
             f"button:has-text('{FOLLOW_TEXT}')",
@@ -42,28 +45,63 @@ class XiaohongshuAdapter(SelectorFlowAdapter):
 
     def __init__(self, selector_config: dict | None = None):
         super().__init__(selector_config=selector_config)
-        # A complete selector set is observation metadata only. It cannot
-        # upgrade this adapter into a supported real-action implementation.
-        self.REAL_ACTIONS = False
-        self.STATUS = "manual_only"
+        self._reviewed_comment_text: str | None = None
+        self.REAL_ACTIONS = self.supports_actions(self.ACTIONS)
+        self.STATUS = "configured" if self.REAL_ACTIONS else "calibration_required"
+
+    def supports_actions(self, actions: Iterable[str]) -> bool:
+        """Require explicit mutation and read-back selectors for every action."""
+
+        selected = tuple(actions)
+        if not selected or any(action not in self.ACTIONS for action in selected):
+            return False
+        return all(self._action_selectors_complete(action) for action in selected)
+
+    def _action_selectors_complete(self, action: str) -> bool:
+        config = self.configured_selectors.get(action)
+        if not isinstance(config, dict):
+            return False
+        done = selector_list(config.get("done"))
+        if action == "commented":
+            return bool(
+                selector_list(config.get("input"))
+                and selector_list(config.get("submit"))
+                and done
+            )
+        return bool(selector_list(config.get("click")) and done)
+
+    def bind_reviewed_comment_text(self, text: str) -> None:
+        """Bind the exact reviewed payload before any browser interaction."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise UnsupportedPlatformAction(
+                "xiaohongshu_reviewed_comment_text_required"
+            )
+        configured = self.configured_selectors.get("commented")
+        if isinstance(configured, dict) and "text" in configured:
+            if configured.get("text") != text:
+                raise UnsupportedPlatformAction(
+                    "xiaohongshu_comment_text_binding_mismatch"
+                )
+        self._reviewed_comment_text = text
+
+    def _comment_text(self, config: dict) -> str:
+        text = self._reviewed_comment_text
+        if text is None:
+            raise UnsupportedPlatformAction(
+                "xiaohongshu_reviewed_comment_text_required"
+            )
+        if "text" in config and config.get("text") != text:
+            raise UnsupportedPlatformAction(
+                "xiaohongshu_comment_text_binding_mismatch"
+            )
+        return text
 
     def _unsupported_interaction(self, action: str) -> UnsupportedPlatformAction:
         return UnsupportedPlatformAction(
             f"{self.CAPABILITY_BLOCK_REASON}:{action}"
         )
 
-    async def _follow(self, page):
-        raise self._unsupported_interaction("followed")
-
-    async def _like(self, page):
-        raise self._unsupported_interaction("liked")
-
-    async def _comment(self, page):
-        raise self._unsupported_interaction("commented")
-
-    async def _favorite(self, page):
-        raise self._unsupported_interaction("favorited")
-
     async def _repost(self, page):
-        # Legacy callers must not fall back to SelectorFlowAdapter's click path.
+        # Xiaohongshu's reviewed contract never permits repost/share.
         raise self._unsupported_interaction("reposted")

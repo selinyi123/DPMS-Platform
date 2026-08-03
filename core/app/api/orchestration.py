@@ -140,11 +140,13 @@ async def _load_targets(platform: str | None):
                             AND tr.status = 'succeeded') AS shadow_eligible,
                    EXISTS(SELECT 1 FROM policy_decisions pd
                           WHERE pd.subject_type = 'lottery'
-                            AND pd.subject_id = CAST(l.id AS CHAR)
+                            AND pd.subject_id =
+                                CAST(l.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci
                             AND pd.policy_key = 'real_run_gate'
                             AND pd.id = (SELECT MAX(pd2.id) FROM policy_decisions pd2
                                          WHERE pd2.subject_type = 'lottery'
-                                           AND pd2.subject_id = CAST(l.id AS CHAR)
+                                           AND pd2.subject_id =
+                                               CAST(l.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_0900_ai_ci
                                            AND pd2.policy_key = 'real_run_gate')
                             AND pd.outcome = 'allow'
                             AND pd.policy_version = :active_version

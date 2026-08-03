@@ -1,41 +1,59 @@
-from dataclasses import dataclass
 import re
 from urllib.parse import urlparse
 
+from app.platform_modules import (
+    LotteryTargetValidation,
+    get_platform_module,
+    require_platform_module,
+)
+from app.platform_modules.catalog import (
+    WEIBO_MBLOGID_PATTERN,
+    WEIBO_MID_MAX,
+    WEIBO_MID_PATTERN,
+    XIAOHONGSHU_NOTE_PATTERN,
+    is_weibo_status_id,
+)
 
-@dataclass(frozen=True)
-class LotteryTargetValidation:
-    valid: bool
-    kind: str | None = None
-    reason: str | None = None
+# Compatibility exports remain in this module for existing callers.  The
+# authoritative patterns and validators now live with their platform module.
 
 
-WEIBO_MBLOGID_PATTERN = re.compile(r"(?=.*[A-Za-z])[A-Za-z0-9]{6,16}")
-WEIBO_MID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
-WEIBO_MID_MAX = 2**63 - 1
-XIAOHONGSHU_NOTE_PATTERN = re.compile(r"[0-9a-fA-F]{24}")
+def validate_bilibili_target(parsed, host: str) -> LotteryTargetValidation:
+    return require_platform_module("bilibili").validate_parsed_target(
+        parsed, host
+    )
+
+
+def validate_weibo_target(parsed, host: str) -> LotteryTargetValidation:
+    return require_platform_module("weibo").validate_parsed_target(parsed, host)
+
+
+def validate_xiaohongshu_target(parsed, host: str) -> LotteryTargetValidation:
+    return require_platform_module("xiaohongshu").validate_parsed_target(
+        parsed, host
+    )
+
+
+def validate_douyin_target(parsed, host: str) -> LotteryTargetValidation:
+    return require_platform_module("douyin").validate_parsed_target(parsed, host)
 
 
 def validate_lottery_target(platform: str, raw_url: str) -> LotteryTargetValidation:
     platform_key = str(platform or "").strip().lower()
-    parsed = urlparse((raw_url or "").strip())
+    try:
+        parsed = urlparse((raw_url or "").strip())
+    except ValueError:
+        return LotteryTargetValidation(False, reason="invalid_url")
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return LotteryTargetValidation(False, reason="invalid_url")
     host = validated_url_host(parsed)
     if host is None:
         return LotteryTargetValidation(False, reason="invalid_url")
 
-    result: LotteryTargetValidation
-    if platform_key == "bilibili":
-        result = validate_bilibili_target(parsed, host)
-    elif platform_key == "weibo":
-        result = validate_weibo_target(parsed, host)
-    elif platform_key == "xiaohongshu":
-        result = validate_xiaohongshu_target(parsed, host)
-    elif platform_key == "douyin":
-        result = validate_douyin_target(parsed, host)
-    else:
+    platform_module = get_platform_module(platform_key)
+    if platform_module is None:
         return LotteryTargetValidation(True, kind="generic")
+    result = platform_module.validate_parsed_target(parsed, host)
 
     # Report HTTPS compatibility only for a URL that is otherwise an
     # actionable target on the selected platform.  Checking this after the
@@ -46,6 +64,72 @@ def validate_lottery_target(platform: str, raw_url: str) -> LotteryTargetValidat
     if parsed.scheme != "https":
         return LotteryTargetValidation(False, kind=result.kind, reason="https_required")
     return result
+
+
+def validate_canonical_lottery_target(
+    platform: str,
+    canonical_url: str | None,
+) -> LotteryTargetValidation:
+    """Validate an already-normalized internal target identity.
+
+    Runtime/readiness code must not demote a successfully resolved short link
+    back to ``short_link`` merely because ``raw_url`` still contains b23.tv.
+    Public ingress continues to validate the original HTTPS URL; this helper is
+    only for persisted ``canonical://`` identities produced by the trusted
+    canonicalizer.
+    """
+
+    platform_key = str(platform or "").strip().casefold()
+    try:
+        parsed = urlparse(str(canonical_url or "").strip())
+        port = parsed.port
+        hostname = parsed.hostname
+    except ValueError:
+        return LotteryTargetValidation(False, reason="invalid_canonical_target")
+    if (
+        parsed.scheme != "canonical"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or hostname != platform_key
+        or parsed.query
+        or parsed.fragment
+    ):
+        return LotteryTargetValidation(False, reason="invalid_canonical_target")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 2:
+        return LotteryTargetValidation(False, reason="invalid_canonical_target")
+    kind, resource_id = parts
+    if platform_key == "bilibili":
+        if kind == "dynamic" and re.fullmatch(r"(?:opus_)?[0-9]{1,20}", resource_id):
+            return LotteryTargetValidation(True, kind="dynamic")
+        if kind == "video" and re.fullmatch(r"BV[0-9A-Za-z]{10}", resource_id):
+            return LotteryTargetValidation(True, kind="video")
+        if kind == "article" and re.fullmatch(r"cv[0-9]+", resource_id):
+            return LotteryTargetValidation(True, kind="article")
+    elif platform_key == "xiaohongshu":
+        if kind == "note" and XIAOHONGSHU_NOTE_PATTERN.fullmatch(resource_id):
+            return LotteryTargetValidation(True, kind="note")
+    elif platform_key == "weibo":
+        if kind == "status" and is_weibo_status_id(resource_id):
+            return LotteryTargetValidation(True, kind="status")
+    elif platform_key == "douyin":
+        if kind in {"video", "note"} and re.fullmatch(r"[0-9]{10,24}", resource_id):
+            return LotteryTargetValidation(True, kind=kind)
+    return LotteryTargetValidation(False, reason="invalid_canonical_target")
+
+
+def validate_lottery_identity(
+    platform: str,
+    raw_url: str | None,
+    canonical_url: str | None,
+) -> LotteryTargetValidation:
+    """Prefer a valid persisted canonical identity, then validate raw ingress."""
+
+    canonical = validate_canonical_lottery_target(platform, canonical_url)
+    if canonical.valid:
+        return canonical
+    return validate_lottery_target(platform, str(raw_url or ""))
 
 
 def validated_url_host(parsed) -> str | None:
@@ -62,99 +146,3 @@ def validated_url_host(parsed) -> str | None:
     if not host:
         return None
     return host.rstrip(".").lower()
-
-
-def validate_bilibili_target(parsed, host: str) -> LotteryTargetValidation:
-    path_parts = [part for part in parsed.path.split("/") if part]
-
-    if host == "b23.tv" and path_parts:
-        return LotteryTargetValidation(True, kind="short_link")
-
-    if host == "t.bilibili.com":
-        if len(path_parts) == 1 and path_parts[0].isdigit():
-            return LotteryTargetValidation(True, kind="dynamic")
-        if len(path_parts) == 2 and path_parts[0] == "opus" and path_parts[1].isdigit():
-            return LotteryTargetValidation(True, kind="dynamic")
-
-    if host in {"bilibili.com", "www.bilibili.com"}:
-        if (
-            len(path_parts) >= 2
-            and path_parts[0] == "video"
-            and re.fullmatch(r"(?:BV[0-9A-Za-z]+|av\d+)", path_parts[1], re.IGNORECASE)
-        ):
-            return LotteryTargetValidation(True, kind="video")
-        if len(path_parts) == 2 and path_parts[0] == "opus" and path_parts[1].isdigit():
-            return LotteryTargetValidation(True, kind="dynamic")
-
-    return LotteryTargetValidation(False, reason="bilibili_actionable_url_required")
-
-
-def validate_weibo_target(parsed, host: str) -> LotteryTargetValidation:
-    path_parts = [part for part in parsed.path.split("/") if part]
-
-    if host == "t.cn" and path_parts:
-        return LotteryTargetValidation(True, kind="short_link")
-
-    if host == "m.weibo.cn":
-        if len(path_parts) == 2 and path_parts[0] in {"status", "detail"} and is_weibo_status_id(path_parts[1]):
-            return LotteryTargetValidation(True, kind="status")
-
-    if host in {"weibo.com", "www.weibo.com"}:
-        if len(path_parts) == 2 and path_parts[0] == "detail" and is_weibo_status_id(path_parts[1]):
-            return LotteryTargetValidation(True, kind="status")
-        if len(path_parts) == 2 and path_parts[0].isdigit() and is_weibo_status_id(path_parts[1]):
-            return LotteryTargetValidation(True, kind="status")
-
-    return LotteryTargetValidation(False, reason="weibo_actionable_url_required")
-
-
-def is_weibo_status_id(value: str) -> bool:
-    if WEIBO_MBLOGID_PATTERN.fullmatch(value):
-        return True
-    if not WEIBO_MID_PATTERN.fullmatch(value):
-        return False
-    return int(value) <= WEIBO_MID_MAX
-
-
-def validate_xiaohongshu_target(parsed, host: str) -> LotteryTargetValidation:
-    path_parts = [part for part in parsed.path.split("/") if part]
-
-    if host == "xhslink.com" and path_parts:
-        return LotteryTargetValidation(True, kind="short_link")
-
-    if host in {"xiaohongshu.com", "www.xiaohongshu.com"}:
-        if len(path_parts) == 2 and path_parts[0] == "explore" and XIAOHONGSHU_NOTE_PATTERN.fullmatch(path_parts[1]):
-            return LotteryTargetValidation(True, kind="note")
-        if (
-            len(path_parts) == 3
-            and path_parts[0] == "discovery"
-            and path_parts[1] == "item"
-            and XIAOHONGSHU_NOTE_PATTERN.fullmatch(path_parts[2])
-        ):
-            return LotteryTargetValidation(True, kind="note")
-
-    return LotteryTargetValidation(False, reason="xiaohongshu_actionable_url_required")
-
-
-def validate_douyin_target(parsed, host: str) -> LotteryTargetValidation:
-    path_parts = [part for part in parsed.path.split("/") if part]
-
-    if host == "v.douyin.com" and path_parts:
-        return LotteryTargetValidation(True, kind="short_link")
-
-    if host in {"douyin.com", "www.douyin.com"}:
-        if len(path_parts) == 2 and path_parts[0] == "video" and path_parts[1].isdigit():
-            return LotteryTargetValidation(True, kind="video")
-        if (
-            host == "www.douyin.com"
-            and len(path_parts) == 2
-            and path_parts[0] == "note"
-            and re.fullmatch(r"\d{19}", path_parts[1])
-        ):
-            return LotteryTargetValidation(True, kind="note")
-
-    if host == "www.iesdouyin.com":
-        if len(path_parts) == 3 and path_parts[0] == "share" and path_parts[1] == "video" and path_parts[2].isdigit():
-            return LotteryTargetValidation(True, kind="video")
-
-    return LotteryTargetValidation(False, reason="douyin_actionable_url_required")

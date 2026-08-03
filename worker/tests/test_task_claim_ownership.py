@@ -23,6 +23,7 @@ from app.action_plan import (  # noqa: E402
     compute_action_plan_hash,
     weibo_runtime_capability_requirements,
 )
+from app.platform_modules.base import ExecutionPath  # noqa: E402
 
 
 def as_weibo_manual_plan(value):
@@ -131,7 +132,7 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.account_status, "cooling")
         self.assertIsNone(self.db.account_lease_released_at)
 
-    async def test_known_failure_after_any_succeeded_intent_requires_reconciliation(self):
+    async def test_known_partial_failure_releases_for_missing_action_repair(self):
         await task_runner.mark_task_started(
             "task-1", 9001, 7001, "real_run", "1-0"
         )
@@ -153,11 +154,11 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(self.db.task_status, "failed")
-        self.assertEqual(self.db.task_reconciliation_required, 1)
-        self.assertEqual(self.db.lottery_status, "running")
-        self.assertEqual(self.db.lottery_execution_lock, "task-1")
-        self.assertEqual(self.db.account_status, "cooling")
-        self.assertIsNone(self.db.account_lease_released_at)
+        self.assertEqual(self.db.task_reconciliation_required, 0)
+        self.assertEqual(self.db.lottery_status, "pending")
+        self.assertIsNone(self.db.lottery_execution_lock)
+        self.assertEqual(self.db.account_status, "ready")
+        self.assertIsNotNone(self.db.account_lease_released_at)
 
     async def test_known_failure_before_any_success_can_release_for_safe_retry(self):
         await task_runner.mark_task_started(
@@ -179,6 +180,33 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.db.lottery_execution_lock)
         self.assertEqual(self.db.account_status, "ready")
         self.assertIsNotNone(self.db.account_lease_released_at)
+
+    async def test_repair_settlement_releases_only_repair_lease(self):
+        self.db.task_execution_intent_binding = {
+            "binding_kind": "repair",
+            "requested_actions": ["commented"],
+            "evidence_action_plan_hash": (
+                self.db.task_action_plan_hash
+            ),
+        }
+        self.db.account_lease_operation_kind = "repair_run"
+        await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0"
+        )
+
+        await task_runner.mark_task_finished(
+            "task-1",
+            False,
+            "repair action rejected with confirmed no effect",
+        )
+
+        self.assertEqual(self.db.task_status, "failed")
+        self.assertEqual(self.db.task_reconciliation_required, 0)
+        self.assertEqual(self.db.lottery_status, "pending")
+        self.assertEqual(self.db.account_status, "ready")
+        self.assertIsNotNone(
+            self.db.account_lease_released_at
+        )
 
     async def test_first_weibo_rejection_moves_account_out_of_ready_by_category(self):
         cases = (
@@ -211,7 +239,15 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     action_plan=db.lottery_action_plan,
                 )
 
-                async def reject_first_action(_task):
+                async def reject_first_action(
+                    _path,
+                    _mode,
+                    _task,
+                    _adapter,
+                    _pool,
+                    *,
+                    runtime=None,
+                ):
                     db.external_action_intents = [
                         {
                             "intent_id": "intent-followed",
@@ -231,8 +267,8 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 ), patch.object(
                     task_runner, "ensure_account_can_run", AsyncMock()
                 ), patch.object(
-                    task_runner,
-                    "execute_weibo_oauth_real_task",
+                    ExecutionPath,
+                    "execute",
                     reject_first_action,
                 ):
                     completed = await task_runner.execute_task_with_phases(
@@ -332,13 +368,20 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         originals = {
             "gate": task_runner.enforce_task_real_run_gate,
             "account": task_runner.ensure_account_can_run,
-            "execute": task_runner.execute_bilibili_api_real_task,
         }
 
         async def no_op(*_args, **_kwargs):
             return None
 
-        async def fail_account_status(_task):
+        async def fail_account_status(
+            _path,
+            _mode,
+            _task,
+            _adapter,
+            _pool,
+            *,
+            runtime=None,
+        ):
             raise task_runner.AccountStatusPersistenceFailed(
                 9001,
                 "cooling",
@@ -348,14 +391,21 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         task_runner.enforce_task_real_run_gate = no_op
         task_runner.ensure_account_can_run = no_op
-        task_runner.execute_bilibili_api_real_task = fail_account_status
         try:
-            with self.assertRaises(task_runner.TaskSettlementUnconfirmed):
-                await task_runner.execute_task_with_phases(message, adapter=None, pool=None)
+            with patch.object(
+                ExecutionPath,
+                "execute",
+                fail_account_status,
+            ):
+                with self.assertRaises(task_runner.TaskSettlementUnconfirmed):
+                    await task_runner.execute_task_with_phases(
+                        message,
+                        adapter=None,
+                        pool=None,
+                    )
         finally:
             task_runner.enforce_task_real_run_gate = originals["gate"]
             task_runner.ensure_account_can_run = originals["account"]
-            task_runner.execute_bilibili_api_real_task = originals["execute"]
 
         self.assertEqual("running", self.db.task_status)
         self.assertEqual("running", self.db.lottery_status)
@@ -408,6 +458,55 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.db.task_status, "failed")
         self.assertEqual(self.db.task_reconciliation_required, 1)
+        self.assertIsNone(self.db.account_lease_released_at)
+
+    async def test_repair_success_closes_only_the_persisted_requested_subset(self):
+        self.db.task_execution_intent_binding = {
+            "binding_kind": "repair",
+            "requested_actions": '["commented","reposted"]',
+            "evidence_action_plan_hash": self.db.task_action_plan_hash,
+        }
+        self.db.account_lease_operation_kind = "repair_run"
+        await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0"
+        )
+        self.db.external_action_intents = [
+            intent
+            for intent in self.confirmed_intents()
+            if intent["action"] in {"comment", "repost"}
+        ]
+
+        settled = await task_runner.mark_task_finished("task-1", True)
+
+        self.assertTrue(settled)
+        self.assertEqual(self.db.task_status, "succeeded")
+        self.assertEqual(self.db.task_reconciliation_required, 0)
+        self.assertEqual(self.db.lottery_status, "participated")
+        self.assertIsNone(self.db.lottery_execution_lock)
+        self.assertEqual(self.db.account_status, "ready")
+        self.assertIsNotNone(self.db.account_lease_released_at)
+
+    async def test_repair_success_with_a_full_plan_action_is_rejected(self):
+        self.db.task_execution_intent_binding = {
+            "binding_kind": "repair",
+            "requested_actions": '["commented","reposted"]',
+            "evidence_action_plan_hash": self.db.task_action_plan_hash,
+        }
+        self.db.account_lease_operation_kind = "repair_run"
+        await task_runner.mark_task_started(
+            "task-1", 9001, 7001, "real_run", "1-0"
+        )
+        self.db.external_action_intents = [
+            intent
+            for intent in self.confirmed_intents()
+            if intent["action"] in {"like", "comment", "repost"}
+        ]
+
+        await task_runner.mark_task_finished("task-1", True)
+
+        self.assertEqual(self.db.task_status, "failed")
+        self.assertEqual(self.db.task_reconciliation_required, 1)
+        self.assertEqual(self.db.lottery_status, "running")
         self.assertIsNone(self.db.account_lease_released_at)
 
     async def test_real_success_with_extra_intent_is_failed_and_retains_fence(self):
@@ -474,6 +573,7 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
         self.db.task_worker_id = "worker-a"
         self.db.lottery_status = "running"
         self.db.account_status = "executing"
+        self.db.account_lease_operation_kind = "shadow_run"
 
         await task_runner.mark_task_finished("task-1", True)
 
@@ -510,6 +610,68 @@ class TaskClaimOwnershipTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(binding.task_mode, "shadow_run")
         self.assertEqual(self.db.task_status, "running")
+
+    async def test_shadow_claim_rejects_cross_platform_account_before_writes(self):
+        self.db.task_mode = "shadow_run"
+        self.db.lottery_platform = "weibo"
+        self.db.lottery_action_plan = as_weibo_manual_plan(
+            self.db.lottery_action_plan
+        )
+        self.db.lottery_raw_url = "https://weibo.com/123456/AbCdEf1"
+        self.db.lottery_canonical_url = self.db.lottery_raw_url
+        message = {
+            "platform": self.db.lottery_platform,
+            "raw_url": self.db.lottery_raw_url,
+            "canonical_url": self.db.lottery_canonical_url,
+            "action_plan": self.db.lottery_action_plan,
+            "selector_config": self.db.selector_config,
+        }
+        authoritative_fetch_one = self.db.fetch_one
+
+        async def fetch_with_mismatched_account(query, values=None):
+            row = await authoritative_fetch_one(query, values)
+            if "FROM accounts" in str(query) and row:
+                return {**row, "platform": "bilibili"}
+            return row
+
+        self.db.fetch_one = fetch_with_mismatched_account
+        writes_before_claim = self.db.writes
+
+        with self.assertRaisesRegex(
+            task_runner.TaskClaimConflict,
+            "task_account_platform_mismatch",
+        ):
+            await task_runner.mark_task_started(
+                "task-1", 9001, 7001, "shadow_run", "1-0", task_message=message
+            )
+
+        self.assertEqual(self.db.writes, writes_before_claim)
+        self.assertEqual(self.db.task_status, "queued")
+        self.assertEqual(self.db.lottery_status, "claimed")
+        self.assertEqual(self.db.account_status, "ready")
+
+    async def test_dry_run_claim_rejects_queue_platform_before_writes(self):
+        self.db.task_mode = "dry_run"
+        self.db.lottery_platform = "weibo"
+        writes_before_claim = self.db.writes
+
+        with self.assertRaisesRegex(
+            task_runner.TaskClaimConflict,
+            "task_message_platform_mismatch",
+        ):
+            await task_runner.mark_task_started(
+                "task-1",
+                9001,
+                7001,
+                "dry_run",
+                "1-0",
+                task_message={"platform": "bilibili"},
+            )
+
+        self.assertEqual(self.db.writes, writes_before_claim)
+        self.assertEqual(self.db.task_status, "queued")
+        self.assertEqual(self.db.lottery_status, "claimed")
+        self.assertEqual(self.db.account_status, "ready")
 
     async def test_tampered_shadow_target_is_rejected_before_claim(self):
         self.db.task_mode = "shadow_run"

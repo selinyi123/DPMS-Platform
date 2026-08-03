@@ -9,13 +9,20 @@ import {
   actionPlanV2ReviewReady,
   buildActionPlanV2Update,
   dispatchSafetyBlocker,
+  evidenceResponseMatchesAccountScope,
+  exactActionPayloadErrors,
   executionEvidencePresentation,
   isFixedManualActionPlatform,
   isManualAssistedPlan,
   isManualAssistedPlatform,
   lotteryActionsForPlatform,
   manualAssistedChecklist,
+  manualParticipationCanSubmit,
+  manualParticipationConfirmationEnabled,
+  manualParticipationIsFinalized,
+  manualParticipationResultNote,
   manualShadowObservation,
+  mentionIdentityKey,
   platformDispatchBlocker,
   platformExecutionPathId,
   realRunEvidencePath,
@@ -30,6 +37,47 @@ import {
   xiaohongshuManualChecklist,
   xiaohongshuShadowObservation,
 } from './lotteryCompatibility.js';
+import { loadRegisteredPlatformModules } from './platforms/index.js';
+
+await loadRegisteredPlatformModules();
+
+test('mention identity matches NFKC Unicode casefold semantics', () => {
+  assert.equal(mentionIdentityKey('@ＡＬＩＣＥ'), mentionIdentityKey('@alice'));
+  assert.equal(mentionIdentityKey('@ß'), mentionIdentityKey('@SS'));
+  assert.equal(mentionIdentityKey('@ẞ'), mentionIdentityKey('@ss'));
+  assert.equal(mentionIdentityKey('@ς'), mentionIdentityKey('@Σ'));
+  assert.notEqual(mentionIdentityKey('@ı'), mentionIdentityKey('@i'));
+});
+
+test('malformed Weibo metadata returns blockers instead of throwing', () => {
+  const malformedPayloads = {
+    commented: {
+      text: '@friend #topic',
+      topic_tags: {},
+      mentions: {},
+      media_refs: {},
+    },
+  };
+  assert.deepEqual(
+    new Set(exactActionPayloadErrors(['commented'], malformedPayloads, 'weibo')),
+    new Set([
+      'action_payload_topic_tags_invalid',
+      'action_payload_mentions_invalid',
+      'action_payload_media_refs_invalid',
+    ]),
+  );
+
+  const malformedPlan = weiboPlanV2({
+    action_payloads: {
+      ...weiboPlanV2().action_payloads,
+      commented: malformedPayloads.commented,
+    },
+  });
+  const blockers = actionPlanV2Blockers(malformedPlan, 'weibo');
+  assert.ok(blockers.includes('action_payload_topic_tags_invalid'));
+  assert.ok(blockers.includes('action_payload_mentions_invalid'));
+  assert.ok(blockers.includes('action_payload_media_refs_invalid'));
+});
 
 function planV2(overrides = {}) {
   return {
@@ -83,7 +131,7 @@ function xiaohongshuPlanV2(overrides = {}) {
     review_required: false,
     reviewed_by: 'operator-1',
     rule_complete_confirmed: true,
-    capability_blockers: ['xiaohongshu_no_official_interaction_api'],
+    capability_blockers: ['xiaohongshu_manual_execution_selected'],
     ...overrides,
   };
 }
@@ -239,6 +287,24 @@ test('uses one fail-closed dispatch decision for every UI entry point', () => {
   );
 });
 
+test('account-scoped evidence rejects stale or internally mixed responses', () => {
+  assert.equal(evidenceResponseMatchesAccountScope({
+    selected_account_id: 7,
+    items: [
+      { selected_account_id: 7, lottery_id: 1 },
+      { selected_account_id: 7, lottery_id: 2 },
+    ],
+  }, '7'), true);
+  assert.equal(evidenceResponseMatchesAccountScope({
+    selected_account_id: 6,
+    items: [{ selected_account_id: 6 }],
+  }, '7'), false);
+  assert.equal(evidenceResponseMatchesAccountScope({
+    selected_account_id: 7,
+    items: [{ selected_account_id: 8 }],
+  }, '7'), false);
+});
+
 test('legacy, unreviewed, unhashed, and non-executable plans fail closed', () => {
   assert.deepEqual(actionPlanV2Blockers({ version: 1 }), [
     'action_plan_v2_required',
@@ -284,7 +350,7 @@ test('builds an exact v2 update without carrying payloads for unselected actions
   });
 });
 
-test('uses the exact Xiaohongshu four-action contract and manual execution path', () => {
+test('exposes Xiaohongshu manual action capabilities without fixing the selected subset', () => {
   assert.deepEqual(
     lotteryActionsForPlatform('xiaohongshu'),
     ['followed', 'liked', 'commented', 'favorited'],
@@ -293,11 +359,22 @@ test('uses the exact Xiaohongshu four-action contract and manual execution path'
     lotteryActionsForPlatform('bilibili'),
     ['followed', 'liked', 'commented', 'reposted'],
   );
-  assert.equal(isManualAssistedPlatform('XIAOHONGSHU'), true);
+  assert.equal(isManualAssistedPlatform('XIAOHONGSHU'), false);
+  assert.equal(
+    isManualAssistedPlatform('XIAOHONGSHU', 'xiaohongshu_manual_v1'),
+    true,
+  );
+  assert.equal(isFixedManualActionPlatform('xiaohongshu'), false);
+  assert.equal(manualParticipationConfirmationEnabled('xiaohongshu'), true);
+  assert.equal(manualParticipationConfirmationEnabled('douyin'), false);
   assert.equal(isManualAssistedPlatform('bilibili'), false);
-  assert.equal(platformExecutionPathId('xiaohongshu'), 'xiaohongshu_manual_v1');
+  assert.equal(platformExecutionPathId('xiaohongshu'), 'xiaohongshu_browser_v1');
   assert.equal(platformExecutionPathId('bilibili'), 'bilibili_api_v2');
-  assert.equal(platformExecutionPathId('weibo', 'weibo-browser-v1'), 'weibo_oauth_v1');
+  assert.equal(platformExecutionPathId('weibo', 'weibo-browser-v1'), 'weibo-browser-v1');
+  assert.equal(
+    platformDispatchBlocker('weibo', 'dry_run', 'weibo-browser-v1'),
+    'execution_path_mismatch',
+  );
 });
 
 test('Weibo selects a capability-bound OAuth path with an explicit manual fallback', () => {
@@ -318,6 +395,8 @@ test('Weibo selects a capability-bound OAuth path with an explicit manual fallba
   assert.deepEqual(actionPlanV2ReviewBlockers(manual, 'weibo'), []);
   assert.equal(actionPlanV2ReviewReady(manual, 'weibo'), true);
   assert.equal(platformDispatchBlocker('weibo', 'real_run', 'weibo_manual_v1'), 'weibo_manual_only');
+  const unknownPath = weiboPlanV2({ execution_path_id: 'weibo-browser-v1' });
+  assert.ok(actionPlanV2Blockers(unknownPath, 'weibo').includes('execution_path_mismatch'));
   assert.equal(platformDispatchBlocker('weibo', 'shadow_run', 'weibo_manual_v1'), null);
   assert.ok(actionPlanV2ReviewBlockers({
     ...manual,
@@ -486,6 +565,48 @@ test('Weibo plan validation keeps friend-count and OAuth capability contracts fa
     .includes('action_payload_mentions_invalid'));
 });
 
+test('draft payload validation delegates platform-only policy without leaking it to peers', () => {
+  const emptyRepost = { reposted: { text: '' } };
+  assert.deepEqual(exactActionPayloadErrors(['reposted'], emptyRepost, 'weibo'), []);
+  assert.ok(exactActionPayloadErrors(['reposted'], emptyRepost, 'douyin')
+    .includes('action_payload_reposted_text_required'));
+  assert.ok(exactActionPayloadErrors(['reposted'], emptyRepost, 'bilibili')
+    .includes('action_payload_reposted_text_required'));
+  assert.ok(exactActionPayloadErrors(['reposted'], emptyRepost, 'xiaohongshu')
+    .includes('action_payload_reposted_text_required'));
+
+  const unnormalizedPersistedRepost = weiboPlanV2({
+    action_payloads: {
+      ...weiboPlanV2().action_payloads,
+      reposted: { text: '' },
+    },
+  });
+  assert.ok(actionPlanV2Blockers(unnormalizedPersistedRepost, 'weibo')
+    .includes('action_payload_reposted_text_required'));
+
+  const longComment = { commented: { text: 'a'.repeat(141) } };
+  assert.ok(exactActionPayloadErrors(['commented'], longComment, 'weibo')
+    .includes('weibo_commented_text_too_long'));
+  assert.equal(
+    exactActionPayloadErrors(['commented'], longComment, 'douyin')
+      .includes('weibo_commented_text_too_long'),
+    false,
+  );
+
+  const mentions = Array.from({ length: 32 }, (_, index) => `@friend${index}`);
+  const boundHandles = {
+    followed: { target_handle: '@brand' },
+    commented: { text: mentions.join(' '), mentions },
+  };
+  assert.ok(exactActionPayloadErrors(['followed', 'commented'], boundHandles, 'weibo')
+    .includes('weibo_preflight_unique_handle_limit_exceeded'));
+  assert.equal(
+    exactActionPayloadErrors(['followed', 'commented'], boundHandles, 'douyin')
+      .includes('weibo_preflight_unique_handle_limit_exceeded'),
+    false,
+  );
+});
+
 test('Weibo friend rules become represented only after action-scoped handles are bound', () => {
   const suggestion = {
     version: 1,
@@ -563,18 +684,26 @@ test('Weibo plans cap distinct resolved handles across all actions', () => {
     .includes('weibo_preflight_unique_handle_limit_exceeded'));
 });
 
-test('uses a variable, semantically distinct Douyin manual action contract', () => {
+test('uses the exact four-action Douyin device contract with a manual fallback', () => {
   assert.deepEqual(lotteryActionsForPlatform('douyin'), [
     'followed',
     'liked',
     'commented',
     'favorited',
-    'reposted',
   ]);
-  assert.equal(isManualAssistedPlatform('DOUYIN'), true);
+  assert.equal(isManualAssistedPlatform('DOUYIN'), false);
+  assert.equal(
+    isManualAssistedPlatform('DOUYIN', 'douyin_manual_v1'),
+    true,
+  );
   assert.equal(isFixedManualActionPlatform('douyin'), false);
-  assert.equal(isFixedManualActionPlatform('xiaohongshu'), true);
-  assert.equal(platformExecutionPathId('douyin', 'bilibili_api_v2'), 'douyin_manual_v1');
+  assert.equal(isFixedManualActionPlatform('xiaohongshu'), false);
+  assert.equal(platformExecutionPathId('douyin'), 'douyin_device_v1');
+  assert.equal(platformExecutionPathId('douyin', 'bilibili_api_v2'), 'bilibili_api_v2');
+  assert.equal(
+    platformDispatchBlocker('douyin', 'shadow_run', 'bilibili_api_v2'),
+    'execution_path_mismatch',
+  );
 
   const update = buildActionPlanV2Update({
     platform: 'douyin',
@@ -589,11 +718,11 @@ test('uses a variable, semantically distinct Douyin manual action contract', () 
     ruleCompleteConfirmed: true,
     reviewed: true,
   });
-  assert.deepEqual(update.required_actions, ['commented', 'favorited', 'reposted']);
-  assert.deepEqual(Object.keys(update.action_payloads), ['commented', 'favorited', 'reposted']);
+  assert.deepEqual(update.required_actions, ['commented', 'favorited']);
+  assert.deepEqual(Object.keys(update.action_payloads), ['commented', 'favorited']);
 });
 
-test('Douyin is reviewable but automatic dispatch remains permanently unavailable', () => {
+test('Douyin device execution allows all modes while the manual fallback stays shadow-only', () => {
   const plan = douyinPlanV2();
   assert.equal(actionPlanV2ReviewReady(plan, 'douyin'), true);
   assert.equal(actionPlanV2Ready(plan, 'douyin'), false);
@@ -624,9 +753,24 @@ test('Douyin is reviewable but automatic dispatch remains permanently unavailabl
     raw_url: 'https://www.douyin.com/video/7300000000000000000',
     action_plan: plan,
   };
-  assert.equal(platformDispatchBlocker('douyin', 'dry_run'), 'douyin_manual_shadow_only');
-  assert.equal(platformDispatchBlocker('douyin', 'real_run'), 'douyin_manual_only');
-  assert.equal(platformDispatchBlocker('douyin', 'shadow_run'), null);
+  for (const mode of ['dry_run', 'shadow_run', 'real_run']) {
+    assert.equal(
+      platformDispatchBlocker('douyin', mode, 'douyin_device_v1'),
+      null,
+    );
+  }
+  assert.equal(
+    platformDispatchBlocker('douyin', 'dry_run', 'douyin_manual_v1'),
+    'douyin_manual_shadow_only',
+  );
+  assert.equal(
+    platformDispatchBlocker('douyin', 'real_run', 'douyin_manual_v1'),
+    'douyin_manual_only',
+  );
+  assert.equal(
+    platformDispatchBlocker('douyin', 'shadow_run', 'douyin_manual_v1'),
+    null,
+  );
   assert.equal(
     dispatchSafetyBlocker({ lottery, mode: 'shadow_run', safeAccountAvailable: true, accountScopeBound: true }),
     null,
@@ -654,28 +798,15 @@ test('builds Douyin manual checklist only from reviewed required actions', () =>
     selector_observation_complete: true,
     manual_shadow_task_id: 'dy-shadow-1',
   }), { complete: true, taskId: 'dy-shadow-1' });
-  const plainRepost = douyinPlanV2({
-    required_actions: ['reposted'],
-    action_payloads: { reposted: {} },
-    content_requirements: {
-      follow_targets: [],
-      commented: { topic_tags: [], mentions: [] },
-      reposted: { topic_tags: [], mentions: [] },
-    },
-  });
-  assert.deepEqual(actionPlanV2ReviewBlockers(plainRepost, 'douyin'), []);
-  assert.deepEqual(manualAssistedChecklist(plainRepost, 'douyin'), [
-    { action: 'reposted', required: true, exactValue: '' },
-  ]);
   assert.deepEqual(buildActionPlanV2Update({
     platform: 'douyin',
-    requiredActions: ['reposted'],
-    actionPayloads: { reposted: { text: '' } },
+    requiredActions: ['reposted', 'liked'],
+    actionPayloads: { reposted: { text: 'must not leak' }, liked: {} },
     executionPathId: 'douyin_manual_v1',
-    ruleText: '转发本视频参与抽奖',
+    ruleText: 'like the target',
     ruleCompleteConfirmed: true,
     reviewed: true,
-  }).action_payloads, { reposted: {} });
+  }).action_payloads, { liked: {} });
   assert.deepEqual(manualAssistedChecklist(
     douyinPlanV2({ review_required: true }),
     'douyin',
@@ -716,7 +847,7 @@ test('builds Xiaohongshu updates without leaking repost or unsupported actions',
   });
 });
 
-test('separates Xiaohongshu semantic review from unavailable automatic real-run', () => {
+test('separates Xiaohongshu manual review from the executable browser path', () => {
   const plan = xiaohongshuPlanV2();
   assert.equal(actionPlanV2ReviewReady(plan, 'xiaohongshu'), true);
   assert.equal(actionPlanV2Ready(plan, 'xiaohongshu'), false);
@@ -736,7 +867,7 @@ test('separates Xiaohongshu semantic review from unavailable automatic real-run'
   );
   assert.equal(
     actionPlanV2ReviewReady(xiaohongshuPlanV2({
-      capability_blockers: ['xiaohongshu_no_official_interaction_api', 'unexpected_blocker'],
+      capability_blockers: ['xiaohongshu_manual_execution_selected', 'unexpected_blocker'],
     }), 'xiaohongshu'),
     false,
   );
@@ -744,10 +875,10 @@ test('separates Xiaohongshu semantic review from unavailable automatic real-run'
     actionPlanV2ReviewBlockers(
       xiaohongshuPlanV2({ capability_blockers: [] }),
       'xiaohongshu',
-    ).includes('xiaohongshu_no_official_interaction_api'),
+    ).includes('xiaohongshu_manual_execution_selected'),
   );
 
-  const missingFavorite = xiaohongshuPlanV2({
+  const selectedSubset = xiaohongshuPlanV2({
     required_actions: ['followed', 'liked', 'commented'],
     action_payloads: {
       followed: { target_handle: '@creator' },
@@ -755,9 +886,10 @@ test('separates Xiaohongshu semantic review from unavailable automatic real-run'
       commented: { text: '#giveaway# exact comment', topic_tags: ['#giveaway#'] },
     },
   });
-  assert.ok(
-    actionPlanV2ReviewBlockers(missingFavorite, 'xiaohongshu')
+  assert.equal(
+    actionPlanV2ReviewBlockers(selectedSubset, 'xiaohongshu')
       .includes('xiaohongshu_four_action_plan_required'),
+    false,
   );
   assert.ok(
     actionPlanV2ReviewBlockers(
@@ -773,16 +905,31 @@ test('separates Xiaohongshu semantic review from unavailable automatic real-run'
   );
 });
 
-test('Xiaohongshu allows only shadow tasks and cannot trust gate.allowed for real-run', () => {
+test('Xiaohongshu browser execution allows all modes while the manual fallback stays shadow-only', () => {
   const lottery = {
     id: 9,
     platform: 'xiaohongshu',
     raw_url: 'https://www.xiaohongshu.com/explore/example',
     action_plan: xiaohongshuPlanV2(),
   };
-  assert.equal(platformDispatchBlocker('xiaohongshu', 'dry_run'), 'xiaohongshu_manual_shadow_only');
-  assert.equal(platformDispatchBlocker('xiaohongshu', 'real_run'), 'xiaohongshu_manual_only');
-  assert.equal(platformDispatchBlocker('xiaohongshu', 'shadow_run'), null);
+  for (const mode of ['dry_run', 'shadow_run', 'real_run']) {
+    assert.equal(
+      platformDispatchBlocker('xiaohongshu', mode, 'xiaohongshu_browser_v1'),
+      null,
+    );
+  }
+  assert.equal(
+    platformDispatchBlocker('xiaohongshu', 'dry_run', 'xiaohongshu_manual_v1'),
+    'xiaohongshu_manual_shadow_only',
+  );
+  assert.equal(
+    platformDispatchBlocker('xiaohongshu', 'real_run', 'xiaohongshu_manual_v1'),
+    'xiaohongshu_manual_only',
+  );
+  assert.equal(
+    platformDispatchBlocker('xiaohongshu', 'shadow_run', 'xiaohongshu_manual_v1'),
+    null,
+  );
   assert.equal(
     dispatchSafetyBlocker({ lottery, mode: 'dry_run', safeAccountAvailable: true }),
     'xiaohongshu_manual_shadow_only',
@@ -803,14 +950,84 @@ test('Xiaohongshu allows only shadow tasks and cannot trust gate.allowed for rea
   );
 });
 
-test('builds a read-only Xiaohongshu manual checklist from the reviewed plan', () => {
+test('builds Xiaohongshu manual checklists in the video verification order', () => {
   assert.deepEqual(xiaohongshuManualChecklist(xiaohongshuPlanV2()), [
-    { action: 'followed', required: true, exactValue: '@creator' },
-    { action: 'liked', required: true, exactValue: '' },
-    { action: 'commented', required: true, exactValue: '#giveaway# exact comment' },
-    { action: 'favorited', required: true, exactValue: '' },
+    {
+      action: 'liked',
+      required: true,
+      exactValue: '',
+      evidenceKey: 'lotteries.xiaohongshuManualEvidence.liked',
+    },
+    {
+      action: 'favorited',
+      required: true,
+      exactValue: '',
+      evidenceKey: 'lotteries.xiaohongshuManualEvidence.favorited',
+    },
+    {
+      action: 'followed',
+      required: true,
+      exactValue: '@creator',
+      evidenceKey: 'lotteries.xiaohongshuManualEvidence.followed',
+    },
+    {
+      action: 'commented',
+      required: true,
+      exactValue: '#giveaway# exact comment',
+      evidenceKey: 'lotteries.xiaohongshuManualEvidence.commented',
+    },
   ]);
+  const subset = xiaohongshuPlanV2({
+    required_actions: ['liked', 'commented', 'favorited'],
+    action_payloads: {
+      liked: {},
+      commented: { text: '好耶，参加' },
+      favorited: {},
+    },
+    content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+  });
+  assert.deepEqual(
+    xiaohongshuManualChecklist(subset).map(item => item.action),
+    ['liked', 'favorited', 'commented'],
+  );
   assert.deepEqual(xiaohongshuManualChecklist(planV2(), 'bilibili'), []);
+});
+
+test('manual participation completes only after every selected action is verified', () => {
+  const items = xiaohongshuManualChecklist(xiaohongshuPlanV2({
+    required_actions: ['liked', 'commented', 'favorited'],
+    action_payloads: {
+      liked: {},
+      commented: { text: '好耶' },
+      favorited: {},
+    },
+    content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+  }));
+  assert.equal(manualParticipationCanSubmit(items, ['liked', 'favorited']), false);
+  assert.equal(
+    manualParticipationCanSubmit(items, ['liked', 'favorited', 'commented']),
+    true,
+  );
+  for (const status of ['participated', 'won', 'lost', 'expired']) {
+    assert.equal(manualParticipationIsFinalized(status), true);
+    assert.equal(
+      manualParticipationCanSubmit(items, ['liked', 'favorited', 'commented'], status),
+      false,
+    );
+  }
+  assert.equal(manualParticipationIsFinalized('pending'), false);
+  assert.equal(
+    manualParticipationResultNote('XIAOHONGSHU', items),
+    'manual_participation_confirmed; platform=xiaohongshu; actions=liked,favorited,commented',
+  );
 });
 
 test('Xiaohongshu Shadow status trusts selector observation, not real-run qualification', () => {
@@ -900,6 +1117,34 @@ test('v2 metadata can represent semantic requirements while unknown requirements
     }, payloads),
     ['ambiguous_rule'],
   );
+});
+
+test('implicit author follow accepts one reviewed exact handle and explicit source targets still win', () => {
+  const implicitAuthorRule = {
+    content_requirements: {
+      follow_targets: [],
+      commented: { topic_tags: [], mentions: [] },
+      reposted: { topic_tags: [], mentions: [] },
+    },
+    unsupported_actions: [],
+  };
+  assert.deepEqual(unresolvedRuleRequirements(implicitAuthorRule, {
+    followed: { target_handle: '@目标作者' },
+  }), []);
+  assert.deepEqual(unresolvedRuleRequirements(implicitAuthorRule, {
+    followed: { target_handle: '398016211' },
+  }), ['follow_target']);
+
+  const explicitTargetRule = {
+    ...implicitAuthorRule,
+    content_requirements: {
+      ...implicitAuthorRule.content_requirements,
+      follow_targets: ['@规则指定账号'],
+    },
+  };
+  assert.deepEqual(unresolvedRuleRequirements(explicitTargetRule, {
+    followed: { target_handle: '@目标作者' },
+  }), ['follow_target']);
 });
 
 test('follow and per-action source requirements are exact, not presence checks', () => {

@@ -1,0 +1,1 @@
+function l(n,e,a){const o=n(e);return o!==e?o:n(a)}function t(n,e){const o=`knowledge.gaps.${typeof(n==null?void 0:n.code)=="string"&&/^[a-z0-9_]{1,64}$/u.test(n.code)?n.code:"unknown"}`;return{label:l(e,`${o}.label`,"knowledge.gaps.unknown.label"),title:l(e,`${o}.title`,"knowledge.gaps.unknown.title"),detail:l(e,`${o}.detail`,"knowledge.gaps.unknown.detail")}}export{t as k};

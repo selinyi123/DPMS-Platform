@@ -3,10 +3,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from enum import StrEnum
 
-from typing import Optional
+from typing import Literal, Optional
 from typing import Any
 
 from datetime import datetime
+
+
+LOTTERY_SOURCE_TYPE_MAX_LENGTH = 32
+LOTTERY_SOURCE_ID_MAX_LENGTH = 64
+LOTTERY_RAW_URL_MAX_LENGTH = 512
+TRACKED_SOURCE_VALUE_MAX_LENGTH = 256
 
 
 
@@ -188,11 +194,21 @@ class LotteryCreate(BaseModel):
 
     platform: str = "bilibili"
 
-    source_type: str = "manual"
+    source_type: str = Field(
+        default="manual",
+        min_length=1,
+        max_length=LOTTERY_SOURCE_TYPE_MAX_LENGTH,
+    )
 
-    source_id: Optional[str] = None
+    source_id: Optional[str] = Field(
+        default=None,
+        max_length=LOTTERY_SOURCE_ID_MAX_LENGTH,
+    )
 
-    raw_url: str = Field(min_length=8, max_length=2048)
+    raw_url: str = Field(
+        min_length=8,
+        max_length=LOTTERY_RAW_URL_MAX_LENGTH,
+    )
 
     canonical_url: Optional[str] = None
 
@@ -228,9 +244,16 @@ class LotteryTargetImport(BaseModel):
 
     platform: str = "bilibili"
 
-    source_type: str = "manual_upload"
+    source_type: str = Field(
+        default="manual_upload",
+        min_length=1,
+        max_length=LOTTERY_SOURCE_TYPE_MAX_LENGTH,
+    )
 
-    source_id: Optional[str] = None
+    source_id: Optional[str] = Field(
+        default=None,
+        max_length=LOTTERY_SOURCE_ID_MAX_LENGTH,
+    )
 
     content: str = Field(min_length=1, max_length=200_000)
 
@@ -243,7 +266,13 @@ class TrackedSourceCreate(BaseModel):
 
     source_type: str = "url_list"
 
-    source_value: str = Field(min_length=1, max_length=2048)
+    # Keep request validation aligned with tracked_sources.source_value
+    # (VARCHAR(256)). Accepting a larger value here otherwise turns an
+    # ordinary client error into a database failure or silent truncation.
+    source_value: str = Field(
+        min_length=1,
+        max_length=TRACKED_SOURCE_VALUE_MAX_LENGTH,
+    )
 
     scan_interval_minutes: int = Field(default=30, ge=1, le=1440)
 
@@ -267,6 +296,39 @@ class RealRunSettingUpdate(BaseModel):
 class RuntimeRollbackRequest(BaseModel):
 
     reason: Optional[str] = "manual runtime rollback"
+
+
+class AutopilotHeartbeatReport(BaseModel):
+
+    """Bounded, non-secret status reported by the Autopilot process."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+    deployment_real_run_enabled: bool
+
+    real_run_ack_valid: bool
+
+    platform_allowlist: list[
+        Literal["bilibili", "weibo", "xiaohongshu", "douyin"]
+    ] = Field(default_factory=list, max_length=4)
+
+    platform_allowlist_valid: bool = True
+
+    poll_interval_seconds: float = Field(ge=1, le=3600)
+
+    round_status: Literal["ok", "error", "disabled"]
+
+    selected: int = Field(default=0, ge=0, le=100)
+
+    dispatched: int = Field(default=0, ge=0, le=100)
+
+    failures: int = Field(default=0, ge=0, le=100)
+
+    probes_requested: int = Field(default=0, ge=0, le=100)
+
+    deferred: int = Field(default=0, ge=0, le=100)
 
 
 class AdapterProbeRequest(BaseModel):

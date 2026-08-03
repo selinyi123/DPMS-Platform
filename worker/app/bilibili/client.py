@@ -67,6 +67,8 @@ def _random_buvid3() -> str:
 
 
 class BilibiliApiActionOutcomeUnknown(BiliApiError):
+    quarantine_account = True
+
     """A state-changing request may have reached Bilibili but was not confirmed.
 
     Callers must not automatically replay the action. A durable journal can
@@ -236,9 +238,20 @@ class BilibiliApiClient:
     # ----- reads -----
 
     async def check_login(self) -> bool:
-        """True iff the cookie is a logged-in session (nav.isLogin)."""
+        """Prove the authenticated session is the declared DedeUserID."""
         data = await self._get_json(_NAV)
-        return bool((data.get("data") or {}).get("isLogin"))
+        account = data.get("data") or {}
+        if not account.get("isLogin"):
+            return False
+        try:
+            authenticated_uid = int(account.get("mid") or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            self.uid > 0
+            and authenticated_uid > 0
+            and authenticated_uid == self.uid
+        )
 
     async def get_myinfo(self) -> dict:
         return await self._get_json(_SPACE_MYINFO)

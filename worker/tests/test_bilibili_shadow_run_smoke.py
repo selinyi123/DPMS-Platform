@@ -122,7 +122,10 @@ class FakeShadowDatabase:
                 "execution_revision": 3,
                 "platform": "bilibili",
                 "status": "ready",
-                "encrypted_credential": "SESSDATA=fake",
+                "encrypted_credential": task_runner.cookie_vault.encrypt(
+                    "SESSDATA=fake",
+                    aad=task_runner.CREDENTIAL_AAD,
+                ),
             }
         if "FROM task_runs tr" in query:
             plan = plan_v2()
@@ -305,7 +308,7 @@ class BilibiliShadowRunSmokeTests(unittest.IsolatedAsyncioTestCase):
         evidence = preflight_evidence()
         record = AsyncMock(return_value="event-1")
         with patch(
-            "app.task_runner.run_readonly_api_preflight",
+            "app.platform_modules.bilibili.run_readonly_api_preflight",
             AsyncMock(return_value=evidence),
         ) as preflight, patch("app.task_runner.record_event", record):
             screenshot = await task_runner.execute_shadow_run(
@@ -323,7 +326,7 @@ class BilibiliShadowRunSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_shadow_lease_rejects_observation(self):
         self.db.lease_active = 0
         with patch(
-            "app.task_runner.run_readonly_api_preflight",
+            "app.platform_modules.bilibili.run_readonly_api_preflight",
             AsyncMock(return_value=preflight_evidence()),
         ):
             with self.assertRaises(task_runner.TaskOwnershipLost):

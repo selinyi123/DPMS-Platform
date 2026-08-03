@@ -159,7 +159,13 @@ async def record_policy_decision(*, decision_id: str, policy: dict, inputs: dict
     )
 
 
-async def evaluate_real_run_decision(lottery, *, account_id: int | None, record: bool = True) -> dict:
+async def evaluate_real_run_decision(
+    lottery,
+    *,
+    account_id: int | None,
+    execution_required_actions: tuple[str, ...] | None = None,
+    record: bool = True,
+) -> dict:
     """Authoritatively evaluate (and optionally record) the real-run decision.
 
     Returns ``allowed``, the recorded ``decision_id`` / ``policy_version``, the
@@ -172,6 +178,7 @@ async def evaluate_real_run_decision(lottery, *, account_id: int | None, record:
         selector_config=selector_config,
         real_run_enabled=real_run_enabled,
         account_id=account_id,
+        execution_required_actions=execution_required_actions,
     )
     breaker_allowed, _ = await circuit_breaker_allows(lottery["platform"])
     policy = await load_active_policy(REAL_RUN_GATE_POLICY_KEY)
