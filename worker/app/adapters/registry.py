@@ -1,8 +1,6 @@
 from app.adapters.base import BaseAdapter
-from app.adapters.bilibili import BilibiliAdapter
-from app.adapters.douyin import DouyinAdapter
-from app.adapters.weibo import WeiboAdapter
-from app.adapters.xiaohongshu import XiaohongshuAdapter
+from app.platform_modules.base import PlatformRoutingError
+from app.platform_modules.registry import get_platform_module
 
 
 class UnsupportedAdapter(BaseAdapter):
@@ -10,19 +8,11 @@ class UnsupportedAdapter(BaseAdapter):
         self.PLATFORM = platform
 
 
-ADAPTERS = {
-    "bilibili": BilibiliAdapter,
-    "weibo": WeiboAdapter,
-    "douyin": DouyinAdapter,
-    "xiaohongshu": XiaohongshuAdapter,
-}
-
-
 def get_adapter(platform: str, selector_config: dict | None = None):
-    adapter_cls = ADAPTERS.get(platform)
-    if adapter_cls:
-        try:
-            return adapter_cls(selector_config=selector_config)
-        except TypeError:
-            return adapter_cls()
-    return UnsupportedAdapter(platform)
+    """Compatibility facade; adapter ownership lives in platform modules."""
+
+    normalized = str(platform or "").strip().lower()
+    try:
+        return get_platform_module(normalized).create_adapter(selector_config)
+    except PlatformRoutingError:
+        return UnsupportedAdapter(normalized)

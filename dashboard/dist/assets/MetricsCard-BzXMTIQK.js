@@ -1,0 +1,1 @@
+import{j as e}from"./index-CqqVUy6d.js";function l({label:r,value:s,unit:i,color:c}){return e.jsxs("div",{className:"metric-card",style:{borderTopColor:c||"#2563eb"},children:[e.jsx("div",{className:"metric-label",children:r}),e.jsx("div",{className:"metric-value",children:s??"-"}),e.jsx("div",{className:"metric-unit",children:i})]})}export{l as M};

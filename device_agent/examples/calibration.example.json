@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "package": "com.ss.android.ugc.aweme",
+  "risk_texts": [
+    "安全验证",
+    "操作频繁",
+    "人脸验证",
+    "滑块验证",
+    "账号异常"
+  ],
+  "settle_seconds": 1.0,
+  "target_markers": {
+    "0000000000000000000000000000000000000000000000000000000000000000": {
+      "markers": [
+        {
+          "resource_id": "REPLACE_WITH_EXACT_NOTE_ID",
+          "content_desc": "REPLACE_WITH_EXACT_NOTE_IDENTITY"
+        }
+      ],
+      "author_handle": "REPLACE_WITH_EXACT_AUTHOR_HANDLE",
+      "follow_markers": [
+        {
+          "resource_id": "REPLACE_WITH_EXACT_AUTHOR_HANDLE_ID",
+          "text": "REPLACE_WITH_EXACT_AUTHOR_HANDLE"
+        }
+      ]
+    }
+  },
+  "actions": {
+    "follow": {
+      "trigger": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_FOLLOW_ID",
+        "text": "关注"
+      },
+      "done": [
+        {
+          "resource_id": "REPLACE_WITH_CALIBRATED_FOLLOW_ID",
+          "text": "已关注"
+        }
+      ]
+    },
+    "like": {
+      "trigger": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_LIKE_ID",
+        "content_desc": "未点赞"
+      },
+      "done": [
+        {
+          "resource_id": "REPLACE_WITH_CALIBRATED_LIKE_ID",
+          "content_desc": "已点赞"
+        }
+      ]
+    },
+    "comment": {
+      "trigger": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_COMMENT_INPUT_ID"
+      },
+      "typed": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_COMMENT_INPUT_ID",
+        "text": "$comment"
+      },
+      "submit": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_COMMENT_SUBMIT_ID",
+        "text": "发送"
+      },
+      "done": [
+        {
+          "resource_id": "REPLACE_WITH_CALIBRATED_COMMENT_ITEM_ID",
+          "text": "$comment"
+        }
+      ]
+    },
+    "favorite": {
+      "trigger": {
+        "resource_id": "REPLACE_WITH_CALIBRATED_FAVORITE_ID",
+        "content_desc": "收藏"
+      },
+      "done": [
+        {
+          "resource_id": "REPLACE_WITH_CALIBRATED_FAVORITE_ID",
+          "content_desc": "已收藏"
+        }
+      ]
+    }
+  }
+}

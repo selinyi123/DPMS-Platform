@@ -16,6 +16,8 @@ DPMS_TO_API_ACTION = {
 API_TO_DPMS_PHASE = {api: phase for phase, api in DPMS_TO_API_ACTION.items()}
 ACCOUNT_COOLING_OUTCOMES = {Outcome.CAPTCHA, Outcome.LIMIT, Outcome.RISK}
 LOGIN_REQUIRED_OUTCOMES = {Outcome.AUTH}
+BILIBILI_DYNAMIC_ID_PATTERN = re.compile(r"[0-9]{1,20}", re.ASCII)
+BILIBILI_DIRECT_DYNAMIC_ID_PATTERN = re.compile(r"[0-9]{10,20}", re.ASCII)
 
 
 class BilibiliRuntimeError(ValueError):
@@ -34,19 +36,56 @@ def extract_bilibili_dynamic_id(*values: str | None) -> str:
         raw = str(value or "").strip()
         if not raw:
             continue
-        if re.fullmatch(r"\d{10,}", raw):
+        if BILIBILI_DIRECT_DYNAMIC_ID_PATTERN.fullmatch(raw):
             return raw
 
-        parsed = urlparse(raw)
-        host = parsed.netloc.lower().split(":", 1)[0]
+        try:
+            parsed = urlparse(raw)
+            port = parsed.port
+            hostname = parsed.hostname
+        except ValueError:
+            continue
+        if (
+            parsed.scheme.lower() == "canonical"
+            and hostname == "bilibili"
+            and parsed.username is None
+            and parsed.password is None
+            and port is None
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) == 2 and parts[0] == "dynamic":
+                resource_id = parts[1]
+                if resource_id.startswith("opus_"):
+                    resource_id = resource_id[len("opus_") :]
+                if BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(resource_id):
+                    return resource_id
+        if (
+            parsed.scheme.lower() != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            continue
+        if port not in (None, 443):
+            continue
+        host = (hostname or "").rstrip(".").lower()
         parts = [part for part in parsed.path.split("/") if part]
         if host == "t.bilibili.com":
-            if len(parts) == 1 and parts[0].isdigit():
+            if len(parts) == 1 and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[0]):
                 return parts[0]
-            if len(parts) == 2 and parts[0] == "opus" and parts[1].isdigit():
+            if (
+                len(parts) == 2
+                and parts[0] == "opus"
+                and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[1])
+            ):
                 return parts[1]
         if host in {"bilibili.com", "www.bilibili.com"}:
-            if len(parts) == 2 and parts[0] == "opus" and parts[1].isdigit():
+            if (
+                len(parts) == 2
+                and parts[0] == "opus"
+                and BILIBILI_DYNAMIC_ID_PATTERN.fullmatch(parts[1])
+            ):
                 return parts[1]
     raise BilibiliRuntimeError("bilibili_dynamic_target_required")
 
@@ -55,8 +94,8 @@ def parse_detail_card(payload: dict, requested_dynamic_id: str) -> DynamicCard:
     data = payload.get("data") if isinstance(payload, dict) else None
     item = data.get("item") if isinstance(data, dict) else None
     card = parse_dynamic_card(item)
-    if not card.dynamic_id and requested_dynamic_id:
-        card.dynamic_id = requested_dynamic_id
+    if card.dynamic_id and requested_dynamic_id and card.dynamic_id != requested_dynamic_id:
+        raise BilibiliRuntimeError("bilibili_dynamic_detail_target_mismatch")
     if not card.dynamic_id:
         raise BilibiliRuntimeError("bilibili_dynamic_detail_unparseable")
     return card

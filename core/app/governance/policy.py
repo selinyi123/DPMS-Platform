@@ -20,24 +20,30 @@ from __future__ import annotations
 
 REAL_RUN_GATE_POLICY_KEY = "real_run_gate"
 
+# These gates are the non-negotiable safety floor for every real-run policy.
+# A versioned/custom policy may add stricter gates, but it must never be able to
+# remove one of these gates or mark it optional.  Keep the canonical order: it
+# is also the operator-facing remediation order when several gates fail.
+MANDATORY_REAL_RUN_GATES = (
+    {"code": "global_real_run_enabled", "required": True, "remediation": "enable_real_run"},
+    {"code": "circuit_breaker_closed", "required": True, "remediation": "review_breaker"},
+    {"code": "valid_lottery_target", "required": True, "remediation": "add_target"},
+    {"code": "action_plan_reviewed", "required": True, "remediation": "review_rule"},
+    {"code": "calibrated_account_available", "required": True, "remediation": "add_account"},
+    {"code": "real_adapter_enabled", "required": True, "remediation": "configure_adapter"},
+    {"code": "recent_complete_probe", "required": True, "remediation": "probe"},
+    {"code": "recent_shadow_run", "required": True, "remediation": "shadow_run"},
+    {"code": "no_recent_account_risk", "required": True, "remediation": "review_risk"},
+)
+MANDATORY_REAL_RUN_GATE_CODES = frozenset(gate["code"] for gate in MANDATORY_REAL_RUN_GATES)
+
 # The canonical real-run policy (version 1). Each gate mirrors an existing
-# real-run evidence requirement, now expressed as versioned data. Order is the
-# operator-facing remediation order.
+# real-run evidence requirement, now expressed as versioned data.
 DEFAULT_REAL_RUN_POLICY = {
     "policy_key": REAL_RUN_GATE_POLICY_KEY,
     "version": 1,
     "description": "Real-run readiness gate as a versioned policy object.",
-    "gates": [
-        {"code": "global_real_run_enabled", "required": True, "remediation": "enable_real_run"},
-        {"code": "circuit_breaker_closed", "required": True, "remediation": "review_breaker"},
-        {"code": "valid_lottery_target", "required": True, "remediation": "add_target"},
-        {"code": "action_plan_reviewed", "required": True, "remediation": "review_rule"},
-        {"code": "calibrated_account_available", "required": True, "remediation": "add_account"},
-        {"code": "real_adapter_enabled", "required": True, "remediation": "configure_adapter"},
-        {"code": "recent_complete_probe", "required": True, "remediation": "probe"},
-        {"code": "recent_shadow_run", "required": True, "remediation": "shadow_run"},
-        {"code": "no_recent_account_risk", "required": True, "remediation": "review_risk"},
-    ],
+    "gates": [dict(gate) for gate in MANDATORY_REAL_RUN_GATES],
 }
 
 
@@ -65,7 +71,46 @@ def validate_policy(policy: dict) -> tuple[bool, list[str]]:
         codes.append(gate["code"])
     if len(codes) != len(set(codes)):
         errors.append("gate_codes_must_be_unique")
+    if policy.get("policy_key") == REAL_RUN_GATE_POLICY_KEY:
+        gates_by_code = {
+            gate.get("code"): gate
+            for gate in gates
+            if isinstance(gate, dict) and gate.get("code")
+        }
+        for mandatory_gate in MANDATORY_REAL_RUN_GATES:
+            code = mandatory_gate["code"]
+            gate = gates_by_code.get(code)
+            if gate is None:
+                errors.append(f"mandatory_real_run_gate_missing:{code}")
+            elif not bool(gate.get("required", True)):
+                errors.append(f"mandatory_real_run_gate_optional:{code}")
     return (not errors), errors
+
+
+def effective_policy_gates(policy: dict) -> list[dict]:
+    """Return the gates that are authoritative for this evaluation.
+
+    Stored policy definitions are data and may pre-date the mandatory-gate
+    validation above (or have been written outside the API).  The final
+    evaluator therefore overlays the canonical real-run safety floor at read
+    time as well.  Custom definitions can only append stricter gates; their
+    copies of mandatory gates cannot change required/remediation semantics.
+    """
+
+    configured = policy.get("gates")
+    configured_gates = configured if isinstance(configured, list) else []
+    if policy.get("policy_key") != REAL_RUN_GATE_POLICY_KEY:
+        return [gate for gate in configured_gates if isinstance(gate, dict)]
+
+    effective = [dict(gate) for gate in MANDATORY_REAL_RUN_GATES]
+    effective.extend(
+        gate
+        for gate in configured_gates
+        if isinstance(gate, dict)
+        and gate.get("code")
+        and gate.get("code") not in MANDATORY_REAL_RUN_GATE_CODES
+    )
+    return effective
 
 
 def evaluate_policy(*, policy: dict, inputs: dict) -> dict:
@@ -77,7 +122,7 @@ def evaluate_policy(*, policy: dict, inputs: dict) -> dict:
     """
     satisfied: list[str] = []
     failed: list[dict] = []
-    for gate in policy.get("gates", []):
+    for gate in effective_policy_gates(policy):
         code = gate.get("code")
         required = bool(gate.get("required", True))
         present = bool(inputs.get(code))

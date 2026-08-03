@@ -9,10 +9,12 @@ Run:  python -m unittest worker.tests.test_bilibili_engine   (from worker/)
   or: python worker/tests/test_bilibili_engine.py
 """
 
+import asyncio
 import sys
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # worker/ -> import app.*
 
@@ -25,9 +27,10 @@ from app.bilibili.client import (
     parse_cookie,
 )
 from app.bilibili.config import BiliEngineConfig
-from app.bilibili.errors import Outcome, classify
+from app.bilibili.errors import CodeResult, Outcome, classify
 from app.bilibili.executor import BilibiliApiExecutor
 from app.bilibili.parser import DynamicCard, looks_like_lottery, parse_feed
+from app.bilibili.runtime import BilibiliRuntimeError, parse_detail_card
 
 COOKIE = "DedeUserID=12345; bili_jct=abc123csrf; SESSDATA=deadbeef"
 
@@ -135,6 +138,27 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(c.origin.uid, 7)
         self.assertTrue(looks_like_lottery(c))
 
+    def test_detail_response_must_match_requested_dynamic(self):
+        payload = self._feed()
+        payload["data"]["item"] = payload["data"].pop("items")[0]
+        with self.assertRaisesRegex(
+            BilibiliRuntimeError,
+            "bilibili_dynamic_detail_target_mismatch",
+        ):
+            parse_detail_card(payload, "111111111111111111")
+
+    def test_detail_response_missing_dynamic_id_is_not_filled_from_request(self):
+        payload = self._feed()
+        item = payload["data"].pop("items")[0]
+        item.pop("id_str")
+        payload["data"]["item"] = item
+
+        with self.assertRaisesRegex(
+            BilibiliRuntimeError,
+            "bilibili_dynamic_detail_unparseable",
+        ):
+            parse_detail_card(payload, "999888777666555444")
+
 
 def _resp(payload, request):
     return httpx.Response(200, json=payload, request=request)
@@ -155,7 +179,7 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
 
             if path.endswith("/x/web-interface/nav"):
                 return _resp(
-                    {"code": 0, "data": {"isLogin": True, "wbi_img": {
+                    {"code": 0, "data": {"isLogin": True, "mid": 12345, "wbi_img": {
                         "img_url": "https://i0.hdslb.com/bfs/wbi/" + "a" * 32 + ".png",
                         "sub_url": "https://i0.hdslb.com/bfs/wbi/" + "b" * 32 + ".png",
                     }}},
@@ -184,15 +208,16 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["act"], "1")
         self.assertEqual(body["csrf"], "abc123csrf")  # injected from bili_jct
 
-    async def test_follow_failover_to_second_route_on_unknown_code(self):
-        # relation/modify returns an unknown code (-> FATAL) so the client should
-        # fail over to feed/SetUserFollow.
+    async def test_follow_unknown_business_code_stops_without_route_failover(self):
+        # An unrecognised response cannot prove that the first mutation failed;
+        # sending another route could duplicate a successful follow.
         async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler(default_code=88888))) as c:
-            res = await c.follow(42)
-        self.assertIs(res.outcome, Outcome.OK)
+            with self.assertRaises(BilibiliApiActionOutcomeUnknown) as caught:
+                await c.follow(42)
+        self.assertEqual(caught.exception.action, "follow")
         paths = [p for _, p, _, _ in self.calls]
         self.assertTrue(any(p.endswith("/x/relation/modify") for p in paths))
-        self.assertTrue(any("SetUserFollow" in p for p in paths))
+        self.assertFalse(any("SetUserFollow" in p for p in paths))
 
     async def test_space_dynamics_is_wbi_signed_and_caches_keys(self):
         async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler())) as c:
@@ -210,6 +235,37 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
         async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler())) as c:
             self.assertTrue(await c.check_login())
 
+    async def test_check_login_rejects_authenticated_uid_mismatch(self):
+        def handle(request: httpx.Request) -> httpx.Response:
+            return _resp(
+                {
+                    "code": 0,
+                    "data": {"isLogin": True, "mid": 54321},
+                },
+                request,
+            )
+
+        async with BilibiliApiClient(
+            COOKIE,
+            transport=httpx.MockTransport(handle),
+        ) as client:
+            self.assertFalse(await client.check_login())
+
+    async def test_client_close_failure_does_not_replace_completed_body_outcome(self):
+        class FailingCloseClient:
+            async def aclose(self):
+                raise RuntimeError("local pool close failed")
+
+        client = BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler()))
+        await client._client.aclose()
+        client._client = FailingCloseClient()
+
+        with patch("app.bilibili.client.structured_log") as log:
+            await client.__aexit__(None, None, None)
+
+        log.assert_called_once()
+        self.assertEqual(log.call_args.args[1], "bilibili_http_client_close_failed")
+
     async def test_comment_captcha_surfaces_url(self):
         async with BilibiliApiClient(COOKIE, transport=httpx.MockTransport(self._handler())) as c:
             res = await c.comment("111222333", 17, "hi")
@@ -224,7 +280,10 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
             attempts += 1
             if attempts < 3:
                 raise httpx.ConnectError("temporary read failure", request=request)
-            return _resp({"code": 0, "data": {"isLogin": True}}, request)
+            return _resp(
+                {"code": 0, "data": {"isLogin": True, "mid": 12345}},
+                request,
+            )
 
         config = BiliEngineConfig(max_http_retries=2, http_retry_wait=0)
         async with BilibiliApiClient(
@@ -266,6 +325,18 @@ class ClientMockTransportTests(unittest.IsolatedAsyncioTestCase):
                 await client.like("dyn1")
         self.assertEqual(attempts, 1)
 
+    async def test_cancelled_post_is_quarantined_as_unknown_outcome(self):
+        async with BilibiliApiClient(COOKIE) as client:
+            async def cancelled_request(*_args, **_kwargs):
+                raise asyncio.CancelledError()
+
+            client._client.request = cancelled_request
+            with self.assertRaises(BilibiliApiActionOutcomeUnknown) as caught:
+                await client.like("dyn1")
+
+        self.assertEqual(caught.exception.action, "like")
+        self.assertEqual(caught.exception.reason, "cancelled")
+
     async def test_post_business_retry_result_is_still_classified(self):
         attempts = 0
 
@@ -302,7 +373,7 @@ class _FakeClient:
         return await self._pop("like", dyid)
 
     async def repost(self, dyid, content="转发动态"):
-        return await self._pop("repost", dyid)
+        return await self._pop("repost", dyid, content)
 
     async def comment(self, oid, chat_type, message, code=""):
         return await self._pop("comment", oid, chat_type, message)
@@ -312,8 +383,16 @@ def _card(rid="rid1"):
     return DynamicCard(uid=42, type=2, rid_str=rid, chat_type=11, dynamic_id="dyn1")
 
 
+EXACT_ACTION_PAYLOADS = {
+    "followed": {},
+    "liked": {},
+    "commented": {"text": "#ASUS翻转夏日# @ASUS华硕官方UP 精确评论"},
+    "reposted": {"text": "#ASUS翻转夏日# 精确转发"},
+}
+
+
 class ExecutorTests(unittest.IsolatedAsyncioTestCase):
-    def _exec(self, fake, before_action=None):
+    def _exec(self, fake, before_action=None, after_action=None):
         # no real waiting; deterministic jitter
         return BilibiliApiExecutor(
             fake,
@@ -321,6 +400,7 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             sleep=self._nosleep,
             rand=lambda: 0.5,
             before_action=before_action,
+            after_action=after_action,
         )
 
     async def _nosleep(self, _seconds):
@@ -328,16 +408,116 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_actions_succeed(self):
         fake = _FakeClient({})  # default OK for everything
-        res = await self._exec(fake).participate(_card(), ["follow", "like", "repost", "comment"])
+        res = await self._exec(fake).participate(
+            _card(), ["follow", "like", "repost", "comment"], EXACT_ACTION_PAYLOADS
+        )
         self.assertTrue(res.success)
         self.assertEqual(set(res.performed), {"follow", "like", "repost", "comment"})
+        self.assertEqual(
+            fake.args["comment"][0][2],
+            "#ASUS翻转夏日# @ASUS华硕官方UP 精确评论",
+        )
+        self.assertEqual(fake.args["repost"][0][1], "#ASUS翻转夏日# 精确转发")
 
     async def test_abort_on_risk_stops_remaining_phases(self):
         fake = _FakeClient({"follow": [classify("follow", 22015)]})  # RISK
-        res = await self._exec(fake).participate(_card(), ["follow", "like", "comment"])
+        res = await self._exec(fake).participate(
+            _card(), ["follow", "like", "comment"], EXACT_ACTION_PAYLOADS
+        )
         self.assertTrue(res.aborted)
         self.assertFalse(res.success)
         self.assertEqual(fake.calls, ["follow"])  # like/comment never attempted
+
+    async def test_every_terminal_non_ok_result_is_settled_then_stops_next_phase(self):
+        terminal_outcomes = (
+            Outcome.LIMIT,
+            Outcome.SKIP,
+            Outcome.CAPTCHA,
+            Outcome.RISK,
+            Outcome.AUTH,
+            Outcome.FATAL,
+        )
+        for outcome in terminal_outcomes:
+            with self.subTest(outcome=outcome.value):
+                fake = _FakeClient(
+                    {"follow": [CodeResult(123, outcome, f"{outcome.value} result")]}
+                )
+                settled = []
+
+                async def after_action(action, result):
+                    settled.append((action, result.outcome))
+
+                res = await self._exec(fake, after_action=after_action).participate(
+                    _card(), ["follow", "like"]
+                )
+
+                self.assertTrue(res.aborted)
+                self.assertFalse(res.success)
+                self.assertEqual(fake.calls, ["follow"])
+                self.assertEqual(settled, [("follow", outcome)])
+
+    async def test_retry_exhaustion_is_settled_then_stops_next_phase(self):
+        retries = [
+            CodeResult(1000001, Outcome.RETRY, "retry result")
+            for _ in range(BiliEngineConfig().action_max_attempts)
+        ]
+        fake = _FakeClient({"follow": retries})
+        settled = []
+
+        async def after_action(action, result):
+            settled.append((action, result.outcome))
+
+        res = await self._exec(fake, after_action=after_action).participate(
+            _card(), ["follow", "like"]
+        )
+
+        self.assertTrue(res.aborted)
+        self.assertFalse(res.success)
+        self.assertEqual(
+            fake.calls,
+            ["follow"] * BiliEngineConfig().action_max_attempts,
+        )
+        self.assertEqual(settled, [("follow", Outcome.RETRY)])
+
+    async def test_action_cap_is_reported_as_an_abort_before_next_mutation(self):
+        fake = _FakeClient({})
+        executor = BilibiliApiExecutor(
+            fake,
+            BiliEngineConfig(max_actions_per_target=1),
+            sleep=self._nosleep,
+            rand=lambda: 0.5,
+        )
+
+        result = await executor.participate(_card(), ["follow", "like"])
+
+        self.assertTrue(result.aborted)
+        self.assertFalse(result.success)
+        self.assertEqual("达到单目标动作上限", result.abort_reason)
+        self.assertEqual(["follow"], fake.calls)
+
+    async def test_action_cap_counts_retry_attempts_not_only_successes(self):
+        fake = _FakeClient(
+            {
+                "follow": [
+                    CodeResult(1000001, Outcome.RETRY, "retry result"),
+                    CodeResult(1000001, Outcome.RETRY, "retry result"),
+                    CodeResult(1000001, Outcome.RETRY, "retry result"),
+                ]
+            }
+        )
+        executor = BilibiliApiExecutor(
+            fake,
+            BiliEngineConfig(max_actions_per_target=2, action_max_attempts=4),
+            sleep=self._nosleep,
+            rand=lambda: 0.5,
+        )
+
+        result = await executor.participate(_card(), ["follow", "like"])
+
+        self.assertTrue(result.aborted)
+        self.assertFalse(result.success)
+        self.assertEqual("达到单目标动作上限", result.abort_reason)
+        self.assertEqual(["follow", "follow"], fake.calls)
 
     async def test_retry_then_success(self):
         fake = _FakeClient({"like": [classify("like", 1000001), classify("like", 0)]})  # RETRY then OK
@@ -370,11 +550,39 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checked, ["follow", "like"])
         self.assertEqual(fake.calls, ["follow"])
 
+    async def test_confirmed_action_is_settled_before_next_gate_check(self):
+        fake = _FakeClient({})
+        settled = []
+
+        async def before_action(action):
+            if action == "like":
+                raise RuntimeError("real_run_gate_blocked:real_run_disabled")
+
+        async def after_action(action, result):
+            settled.append((action, result.outcome))
+
+        with self.assertRaisesRegex(RuntimeError, "real_run_disabled"):
+            await self._exec(fake, before_action, after_action).participate(
+                _card(), ["follow", "like"]
+            )
+        self.assertEqual(settled, [("follow", Outcome.OK)])
+        self.assertEqual(fake.calls, ["follow"])
+
     async def test_comment_skipped_without_rid(self):
         fake = _FakeClient({})
-        res = await self._exec(fake).participate(_card(rid=""), ["comment"])
+        settled = []
+
+        async def after_action(action, result):
+            settled.append((action, result.outcome))
+
+        res = await self._exec(fake, after_action=after_action).participate(
+            _card(rid=""), ["comment", "repost"], EXACT_ACTION_PAYLOADS
+        )
         self.assertIs(res.actions["comment"].outcome, Outcome.SKIP)
+        self.assertTrue(res.aborted)
+        self.assertEqual(settled, [("comment", Outcome.SKIP)])
         self.assertNotIn("comment", fake.calls)
+        self.assertNotIn("repost", fake.calls)
 
     async def test_forward_acts_on_origin(self):
         # A 转发 (type==1) of a lottery: follow/repost/comment must hit the origin.
@@ -383,11 +591,36 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
             uid=42, type=1, dynamic_id="fwd", rid_str="r0", chat_type=17,
             origin=DynamicCard(uid=7, type=2, dynamic_id="orig", rid_str="r1", chat_type=11),
         )
-        res = await self._exec(fake).participate(card, ["follow", "repost"])
+        res = await self._exec(fake).participate(
+            card, ["follow", "repost"], EXACT_ACTION_PAYLOADS
+        )
         self.assertTrue(res.success)
         self.assertEqual(res.dynamic_id, "orig")
         self.assertEqual(fake.args["follow"][0][0], 7)       # followed origin uid, not 42
         self.assertEqual(fake.args["repost"][0][0], "orig")  # reposted origin dynamic
+
+    async def test_comment_or_repost_without_reviewed_text_is_blocked_before_actions(self):
+        for action in ("comment", "repost"):
+            with self.subTest(action=action):
+                fake = _FakeClient({})
+                with self.assertRaisesRegex(
+                    RuntimeError, f"bilibili_{action}_exact_text_required"
+                ):
+                    await self._exec(fake).participate(_card(), [action], {})
+                self.assertEqual(fake.calls, [])
+
+    async def test_media_payload_is_not_silently_downgraded_to_text_only(self):
+        fake = _FakeClient({})
+        payloads = {
+            **EXACT_ACTION_PAYLOADS,
+            "commented": {
+                "text": "精确评论",
+                "media_refs": ["evidence:photo-1"],
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "media_unsupported"):
+            await self._exec(fake).participate(_card(), ["comment"], payloads)
+        self.assertEqual(fake.calls, [])
 
 
 if __name__ == "__main__":

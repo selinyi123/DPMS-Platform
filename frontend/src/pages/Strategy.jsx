@@ -1,50 +1,92 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { fetchJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
+import { createLatestAbortableRequestGate } from '../requestGeneration';
 import { useUi } from '../uiContext';
 
 const TIER_ORDER = ['S', 'A', 'B', 'hold'];
 const TIER_COLOR = { S: '#dc2626', A: '#d97706', B: '#2563eb', hold: '#64748b' };
+const STRATEGY_REFRESH_MS = 8_000;
+// The API has a 15 second fail-closed evaluation envelope. Keep a response
+// delivery margin so the browser receives its structured 503 instead of
+// replacing it with a client-side AbortError at the same deadline.
+const STRATEGY_API_TIMEOUT_MS = 20_000;
 
 export default function Strategy() {
   const { t, language } = useUi();
   const [items, setItems] = useState([]);
-  const [error, setError] = useState('');
+  const [listError, setListError] = useState('');
   const [selected, setSelected] = useState(null);
   const [explain, setExplain] = useState(null);
+  const [explainError, setExplainError] = useState('');
   const [explaining, setExplaining] = useState(false);
+  const loadInFlightRef = useRef(false);
+  const explainRequestGateRef = useRef(null);
+  if (explainRequestGateRef.current === null) {
+    explainRequestGateRef.current = createLatestAbortableRequestGate();
+  }
 
-  const load = () => fetchJSON('/lotteries/strategy/queue?limit=50')
-    .then(data => {
+  const load = async () => {
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
+    try {
+      const data = await fetchJSON(
+        '/lotteries/strategy/queue?limit=50',
+        { timeoutMs: STRATEGY_API_TIMEOUT_MS },
+      );
       setItems(data.items || []);
-      setError('');
-    })
-    .catch(err => setError(err.message));
+      setListError('');
+    } catch (err) {
+      setListError(err.message);
+    } finally {
+      loadInFlightRef.current = false;
+    }
+  };
 
   useEffect(() => {
-    load();
-    const timer = setInterval(load, 8000);
-    return () => clearInterval(timer);
+    void load();
+    const timer = setInterval(load, STRATEGY_REFRESH_MS);
+    return () => {
+      clearInterval(timer);
+      explainRequestGateRef.current.invalidate();
+    };
   }, []);
 
   const openExplain = async (item) => {
+    const request = explainRequestGateRef.current.begin();
     setSelected(item);
     setExplain(null);
     setExplaining(true);
+    setExplainError('');
     try {
-      const detail = await fetchJSON(`/lotteries/${item.lottery_id}/strategy/explain`);
-      setExplain(detail);
+      const detail = await fetchJSON(
+        `/lotteries/${item.lottery_id}/strategy/explain`,
+        {
+          signal: request.signal,
+          timeoutMs: STRATEGY_API_TIMEOUT_MS,
+        },
+      );
+      if (explainRequestGateRef.current.isCurrent(request)) {
+        setExplain(detail);
+      }
     } catch (err) {
-      setError(err.message);
+      if (explainRequestGateRef.current.isCurrent(request)) {
+        setExplainError(err.message);
+      }
     } finally {
-      setExplaining(false);
+      if (explainRequestGateRef.current.isCurrent(request)) {
+        setExplaining(false);
+      }
     }
   };
 
   const closeExplain = () => {
+    explainRequestGateRef.current.invalidate();
     setSelected(null);
     setExplain(null);
+    setExplainError('');
+    setExplaining(false);
   };
 
   const grouped = useMemo(() => {
@@ -82,7 +124,7 @@ export default function Strategy() {
         <button className="btn-ghost" onClick={load}>{t('common.refresh')}</button>
       </header>
       <p className="muted-text small-text">{t('strategy.subtitle')}</p>
-      {error && <div className="alert-danger">{error}</div>}
+      {listError && <div className="alert-danger">{listError}</div>}
 
       <div className="metric-grid readiness-metric-grid">
         {cards.map(card => <MetricsCard key={card.label} {...card} />)}
@@ -147,6 +189,7 @@ export default function Strategy() {
               <button className="btn-ghost" onClick={closeExplain}>{t('common.cancel')}</button>
             </header>
             {explaining && <div className="muted-text">{t('strategy.explaining')}</div>}
+            {explainError && <div className="alert-danger">{explainError}</div>}
             {explain && <ExplainBody explain={explain} t={t} reasonLabel={reasonLabel} modeLabel={modeLabel} language={language} />}
           </aside>
         </div>

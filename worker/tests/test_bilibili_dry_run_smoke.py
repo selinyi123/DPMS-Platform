@@ -2,8 +2,8 @@
 
 Drives a real Bilibili task through the genuine worker executor
 (`execute_task_with_phases` in dry-run mode), asserting the adapter is
-selected, real actions are enabled by the shipped example selectors, every
-phase runs in order, and the task completes.
+selected, the observation-only shipped example does not claim real-action
+readiness, every simulated phase runs in order, and the task completes.
 
 Shares its fake DB and dispatch-message builder with
 tools/smoke_bilibili_dry_run.py via tools/bilibili_dry_run_harness.py, so the
@@ -94,8 +94,11 @@ class BilibiliDryRunSmokeTests(unittest.TestCase):
         selector_config = task_runner.parse_json_field(message["selector_config"])
         adapter = get_adapter("bilibili", selector_config)
         self.assertEqual(type(adapter).__name__, "BilibiliAdapter")
-        self.assertTrue(adapter.REAL_ACTIONS)
-        self.assertEqual(adapter.STATUS, "configured")
+        # The example selectors intentionally have no target-bound success
+        # readback, so they may drive Dry/Shadow observation but never claim
+        # that browser mutations are real-ready.
+        self.assertFalse(adapter.REAL_ACTIONS)
+        self.assertEqual(adapter.STATUS, "calibration_required")
 
         original_ensure = task_runner.ensure_account_can_run
         safety_calls = []

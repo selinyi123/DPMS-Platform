@@ -17,14 +17,19 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from .config import BiliEngineConfig
-from .errors import ABORT_OUTCOMES, CodeResult, Outcome
+from .errors import CodeResult, Outcome
 from .parser import DynamicCard
 
-# Canonical execution order; required_actions is intersected against this.
-PHASE_ORDER = ("follow", "like", "repost", "comment")
+# Keep the API engine aligned with task_runner.PHASE_ORDER so its single latest
+# phase marker remains monotonic and safe to resume.
+PHASE_ORDER = ("follow", "like", "comment", "repost")
+
+
+class ActionAttemptLimitExceeded(RuntimeError):
+    """The per-target remote mutation-attempt budget is exhausted."""
 
 
 @dataclass
@@ -50,12 +55,19 @@ class BilibiliApiExecutor:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rand: Callable[[], float] = random.random,
         before_action: Callable[[str], Awaitable[None]] | None = None,
+        after_attempt: Callable[[str, CodeResult], Awaitable[None]] | None = None,
+        on_attempt_error: Callable[[str, BaseException], Awaitable[None]] | None = None,
+        after_action: Callable[[str, CodeResult], Awaitable[None]] | None = None,
     ) -> None:
         self.client = client
         self.config = config or BiliEngineConfig()
         self._sleep = sleep
         self._rand = rand
         self._before_action = before_action
+        self._after_attempt = after_attempt
+        self._on_attempt_error = on_attempt_error
+        self._after_action = after_action
+        self._action_attempts = 0
 
     def _jittered(self, base: float) -> float:
         # [1-f, 1+f] * base, matching the reference's ±50% relay jitter but
@@ -68,19 +80,36 @@ class BilibiliApiExecutor:
 
     async def _do_action(self, name: str, call: Callable[[], Awaitable[CodeResult]]) -> CodeResult:
         """Run one action, re-checking the gate before every external attempt."""
-        if self._before_action is not None:
-            await self._before_action(name)
-        result = await call()
+        async def attempt() -> CodeResult:
+            if self._action_attempts >= self.config.max_actions_per_target:
+                raise ActionAttemptLimitExceeded("达到单目标动作上限")
+            if self._before_action is not None:
+                await self._before_action(name)
+            self._action_attempts += 1
+            try:
+                result = await call()
+            except BaseException as exc:
+                if self._on_attempt_error is not None:
+                    await self._on_attempt_error(name, exc)
+                raise
+            if self._after_attempt is not None:
+                await self._after_attempt(name, result)
+            return result
+
+        result = await attempt()
         attempts = 1
         while result.outcome is Outcome.RETRY and attempts < self.config.action_max_attempts:
             await self._sleep(self._jittered(self.config.action_retry_base_wait * attempts))
-            if self._before_action is not None:
-                await self._before_action(name)
-            result = await call()
+            result = await attempt()
             attempts += 1
         return result
 
-    async def participate(self, card: DynamicCard, required_actions: list[str]) -> ExecutionResult:
+    async def participate(
+        self,
+        card: DynamicCard,
+        required_actions: list[str],
+        action_payloads: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> ExecutionResult:
         # When handed a forward (转发) of a lottery, the real lottery — the UP to
         # follow, the dynamic to repost, the thread to comment on — is the
         # original dynamic, so act on it rather than the wrapper.
@@ -100,37 +129,60 @@ class BilibiliApiExecutor:
             return result
 
         phases = [p for p in PHASE_ORDER if p in set(required_actions)]
+        payloads = dict(action_payloads or {})
+        for payload in payloads.values():
+            if not isinstance(payload, Mapping):
+                raise RuntimeError("bilibili_action_payload_invalid")
+            if payload.get("media_refs"):
+                raise RuntimeError("bilibili_action_payload_media_unsupported")
+
+        exact_text: dict[str, str] = {}
+        for api_action, dpms_action in (("comment", "commented"), ("repost", "reposted")):
+            if api_action not in phases:
+                continue
+            payload = payloads.get(dpms_action)
+            text = payload.get("text") if isinstance(payload, Mapping) else None
+            if not isinstance(text, str) or not text.strip():
+                raise RuntimeError(f"bilibili_{api_action}_exact_text_required")
+            exact_text[api_action] = text
+        self._action_attempts = 0
         builders: dict[str, Callable[[], Awaitable[CodeResult]]] = {
             "follow": lambda: self.client.follow(target.uid),
             "like": lambda: self.client.like(target.dynamic_id),
-            "repost": lambda: self.client.repost(target.dynamic_id, self.config.repost_text),
+            "repost": lambda: self.client.repost(target.dynamic_id, exact_text["repost"]),
             "comment": lambda: self.client.comment(
-                target.rid_str, target.chat_type, random.choice(list(self.config.comment_pool))
+                target.rid_str, target.chat_type, exact_text["comment"]
             ),
         }
 
-        performed = 0
         for i, phase in enumerate(phases):
-            if performed >= self.config.max_actions_per_target:
-                result.abort_reason = "达到单目标动作上限"
-                break
             if phase == "comment" and not target.rid_str:
-                result.actions[phase] = CodeResult(0, Outcome.SKIP, "无评论 rid，跳过评论")
-                continue
-
-            if i > 0:
-                await self._pace()
-            res = await self._do_action(phase, builders[phase])
+                res = CodeResult(0, Outcome.SKIP, "无评论 rid，跳过评论")
+            else:
+                if i > 0:
+                    await self._pace()
+                try:
+                    res = await self._do_action(phase, builders[phase])
+                except ActionAttemptLimitExceeded as exc:
+                    res = CodeResult(-1, Outcome.LIMIT, str(exc))
+                    result.actions[phase] = res
+                    if self._after_action is not None:
+                        await self._after_action(phase, res)
+                    result.aborted = True
+                    result.abort_reason = str(exc)
+                    return result
             result.actions[phase] = res
+            if self._after_action is not None:
+                await self._after_action(phase, res)
 
-            if res.outcome in ABORT_OUTCOMES:
+            # Every entry in ``required_actions`` is eligibility-critical.
+            # Once one of them is not OK, later mutations cannot make the
+            # participation complete and only add external side effects. The
+            # result is persisted above before the run fails closed.
+            if not res.ok:
                 result.aborted = True
                 result.abort_reason = f"{phase}: {res.message}"
                 return result
-            if res.ok:
-                performed += 1
-            # LIMIT/SKIP/CAPTCHA/FATAL: record and move on to the next phase.
-
         # Success = every required phase ended OK (a SKIP on an impossible phase
         # does not count as success — the lottery's requirement was not met).
         result.success = bool(phases) and all(result.actions.get(p, CodeResult(0, Outcome.FATAL, "")).ok for p in phases)

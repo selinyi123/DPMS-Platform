@@ -1,0 +1,29 @@
+groups:
+  - name: dpms-runtime
+    rules:
+      - alert: DPMSConsumerGroupRetention
+        expr: dpms_consumer_group_retention_alerts > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: DPMS Redis consumer-group retention is blocking deletion
+          description: One or more Redis groups have stale consumers or pending entries.
+
+      - alert: DPMSPlatformTaskTransportUnavailable
+        expr: dpms_task_transport_by_platform_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: DPMS platform task transport is unavailable
+          description: The {{ $labels.platform }} task lane is not ready.
+
+      - alert: DPMSOutboxBacklog
+        expr: dpms_task_outbox_undelivered_by_platform > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: DPMS platform Outbox has undelivered rows
+          description: The {{ $labels.platform }} Outbox has pending or stale rows.

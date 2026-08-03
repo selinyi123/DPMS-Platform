@@ -26,12 +26,43 @@ class BilibiliRuntimeTests(unittest.TestCase):
         self.assertEqual(extract_bilibili_dynamic_id("https://t.bilibili.com/opus/123456789012"), "123456789012")
         self.assertEqual(extract_bilibili_dynamic_id("https://www.bilibili.com/opus/123456789012"), "123456789012")
         self.assertEqual(extract_bilibili_dynamic_id("123456789012"), "123456789012")
+        self.assertEqual(
+            extract_bilibili_dynamic_id(
+                "canonical://bilibili/dynamic/opus_123456789012"
+            ),
+            "123456789012",
+        )
 
     def test_rejects_non_dynamic_targets_for_api_real_run(self):
-        with self.assertRaisesRegex(ValueError, "bilibili_dynamic_target_required"):
-            extract_bilibili_dynamic_id("https://www.bilibili.com/video/BV1xx411c7mD")
-        with self.assertRaisesRegex(ValueError, "bilibili_dynamic_target_required"):
-            extract_bilibili_dynamic_id("https://b23.tv/abc123")
+        for target in (
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+            "https://b23.tv/abc123",
+            "http://t.bilibili.com/123456789012",
+            "https://t.bilibili.com:444/123456789012",
+            "https://t.bilibili.com:443@evil.example/123456789012",
+            "canonical://bilibili:123/dynamic/123456789012",
+            "canonical://bilibili:not-a-port/dynamic/123456789012",
+            "canonical://operator@bilibili/dynamic/123456789012",
+            "https://t.bilibili.com/" + "\uff11" * 12,
+            "https://t.bilibili.com/" + "1" * 21,
+            "\uff11" * 12,
+            "1" * 21,
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(ValueError, "bilibili_dynamic_target_required"):
+                    extract_bilibili_dynamic_id(target)
+
+    def test_dynamic_id_extraction_fails_closed_for_malformed_canonical_authority(self):
+        for target in (
+            "canonical://[bilibili/dynamic/123456789012",
+            "canonical://bilibili／evil/dynamic/123456789012",
+            "canonical://bilibili：443/dynamic/123456789012",
+        ):
+            with self.subTest(target=target):
+                with self.assertRaisesRegex(
+                    ValueError, "bilibili_dynamic_target_required"
+                ):
+                    extract_bilibili_dynamic_id(target)
 
     def test_phase_mapping(self):
         self.assertEqual(
@@ -52,6 +83,31 @@ class BilibiliRuntimeTests(unittest.TestCase):
         self.assertIn("DedeUserID=42", header)
         self.assertIn("bili_jct=csrf", header)
         self.assertEqual(credential_to_cookie_header("Cookie: SESSDATA=s1; bili_jct=csrf"), "SESSDATA=s1; bili_jct=csrf")
+
+    def test_cookie_header_rejects_duplicate_json_cookie_names(self):
+        credential = json.dumps(
+            [
+                {"name": "DedeUserID", "value": "42"},
+                {"name": "DedeUserID", "value": "84"},
+            ]
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "Duplicate cookie name.*DedeUserID",
+        ):
+            credential_to_cookie_header(credential)
+
+    def test_cookie_header_keeps_optional_duplicate_names_compatible(self):
+        credential = json.dumps(
+            [
+                {"name": "buvid3", "value": "host-a"},
+                {"name": "buvid3", "value": "host-b"},
+            ]
+        )
+        self.assertEqual(
+            credential_to_cookie_header(credential),
+            "buvid3=host-a; buvid3=host-b",
+        )
 
     def test_account_status_for_risk_results(self):
         self.assertEqual(account_status_for_results({"comment": classify("comment", 12015)}), ("cooling", "bilibili_comment_captcha"))

@@ -1,50 +1,76 @@
-import { useEffect, useState } from 'react';
+import {
+  Component,
+  Suspense,
+  lazy,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 
-import { fetchJSON } from './api';
+import {
+  fetchJSON,
+  isAuthenticationApiError,
+} from './api';
+import { reloadApplicationModuleGraph } from './asyncSlices';
 import NavButton from './components/NavButton';
+import PlatformModuleBoundary from './components/PlatformModuleBoundary';
 import ToastStack from './components/ToastStack';
-import Accounts from './pages/Accounts';
-import Capacity from './pages/Capacity';
-import Dashboard from './pages/Dashboard';
-import Deploy from './pages/Deploy';
-import EventTimeline from './pages/EventTimeline';
-import Experiments from './pages/Experiments';
-import Governance from './pages/Governance';
-import Knowledge from './pages/Knowledge';
-import Learning from './pages/Learning';
-import Lotteries from './pages/Lotteries';
-import Orchestration from './pages/Orchestration';
-import RiskCenter from './pages/RiskCenter';
-import RiskIntelligence from './pages/RiskIntelligence';
-import Scheduling from './pages/Scheduling';
-import SemanticTrace from './pages/SemanticTrace';
-import Strategy from './pages/Strategy';
-import TaskMonitor from './pages/TaskMonitor';
-import Throughput from './pages/Throughput';
-import TransitionGraph from './pages/TransitionGraph';
 import { useUi } from './uiContext';
 
 const pages = {
-  dashboard: { Component: Dashboard },
-  accounts: { Component: Accounts },
-  lotteries: { Component: Lotteries },
-  strategy: { Component: Strategy },
-  knowledge: { Component: Knowledge },
-  experiments: { Component: Experiments },
-  riskIntel: { Component: RiskIntelligence },
-  learning: { Component: Learning },
-  governance: { Component: Governance },
-  transitions: { Component: TransitionGraph },
-  semantic: { Component: SemanticTrace },
-  scheduling: { Component: Scheduling },
-  capacity: { Component: Capacity },
-  orchestration: { Component: Orchestration },
-  throughput: { Component: Throughput },
-  tasks: { Component: TaskMonitor },
-  events: { Component: EventTimeline },
-  risk: { Component: RiskCenter },
-  deploy: { Component: Deploy },
+  dashboard: { load: () => import('./pages/Dashboard.jsx') },
+  accounts: { load: () => import('./pages/Accounts.jsx') },
+  lotteries: { load: () => import('./pages/Lotteries.jsx'), platformAware: true },
+  xhsTargets: { load: () => import('./pages/XiaohongshuTargets.jsx') },
+  strategy: { load: () => import('./pages/Strategy.jsx') },
+  knowledge: { load: () => import('./pages/Knowledge.jsx') },
+  experiments: { load: () => import('./pages/Experiments.jsx') },
+  riskIntel: { load: () => import('./pages/RiskIntelligence.jsx') },
+  learning: { load: () => import('./pages/Learning.jsx') },
+  governance: { load: () => import('./pages/Governance.jsx') },
+  transitions: { load: () => import('./pages/TransitionGraph.jsx') },
+  semantic: { load: () => import('./pages/SemanticTrace.jsx') },
+  scheduling: { load: () => import('./pages/Scheduling.jsx') },
+  capacity: { load: () => import('./pages/Capacity.jsx') },
+  orchestration: { load: () => import('./pages/Orchestration.jsx') },
+  throughput: { load: () => import('./pages/Throughput.jsx') },
+  tasks: { load: () => import('./pages/TaskMonitor.jsx') },
+  events: { load: () => import('./pages/EventTimeline.jsx') },
+  risk: { load: () => import('./pages/RiskCenter.jsx') },
+  deploy: { load: () => import('./pages/Deploy.jsx') },
 };
+
+class PageErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error('page_module_load_failed', error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="auth-gate">
+          <div className="auth-gate-card" role="alert">
+            <h2>{this.props.title}</h2>
+            <p>{this.props.message}</p>
+            <button type="button" onClick={this.props.onRetry}>
+              {this.props.retryLabel}
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 export default function App() {
   const [tokenDraft, setTokenDraft] = useState('');
@@ -53,7 +79,17 @@ export default function App() {
   );
   const [authState, setAuthState] = useState({ status: 'unknown', role: '', error: '' });
   const { language, setLanguage, theme, setTheme, t, page, navigate } = useUi();
-  const PageComponent = (pages[page] || pages.dashboard).Component;
+  const pageDefinition = pages[page] || pages.dashboard;
+  const PageComponent = useMemo(
+    () => lazy(pageDefinition.load),
+    [pageDefinition],
+  );
+  const pageLoadingText = language === 'en' ? 'Loading page…' : '正在加载页面…';
+  const pageLoadFailureTitle = language === 'en' ? 'Page unavailable' : '页面暂不可用';
+  const pageLoadFailureMessage = language === 'en'
+    ? 'The page module could not be loaded.'
+    : '页面模块加载失败。';
+  const pageLoadRetryText = language === 'en' ? 'Reload' : '重新加载';
   const authText = language === 'en'
     ? {
       label: 'Admin token',
@@ -63,6 +99,9 @@ export default function App() {
       verified: 'Verified',
       missing: 'Not signed in',
       failed: 'Invalid token',
+      unavailable: 'Service temporarily unavailable. Retry when Core is healthy.',
+      unavailableTitle: 'Service temporarily unavailable',
+      unavailableBody: 'The saved token was kept. Use Sign in to retry the connection.',
       settings: 'Access & display settings',
       gateTitle: 'Sign in required',
       gateBody: 'Enter a valid ADMIN_TOKEN to access the console — every data endpoint requires authentication.',
@@ -76,6 +115,9 @@ export default function App() {
       verified: '已验证',
       missing: '未登录',
       failed: '令牌无效',
+      unavailable: '服务暂不可用，请在 Core 恢复健康后重试。',
+      unavailableTitle: '服务暂不可用',
+      unavailableBody: '已保留本机令牌；请点击登录重试连接。',
       settings: '访问与显示设置',
       gateTitle: '需要登录',
       gateBody: '请输入有效的 ADMIN_TOKEN 以访问控制台——所有数据接口均需鉴权。',
@@ -87,11 +129,17 @@ export default function App() {
       setAuthState({ status: 'missing', role: '', error: '' });
       return;
     }
+    setAuthState({ status: 'unknown', role: '', error: '' });
     try {
       const actor = await fetchJSON('/auth/me', { auth: true });
       setAuthState({ status: 'verified', role: actor.role, error: '' });
     } catch (err) {
-      setAuthState({ status: 'failed', role: '', error: err.message || '' });
+      const tokenRejected = isAuthenticationApiError(err);
+      setAuthState({
+        status: tokenRejected ? 'failed' : 'unavailable',
+        role: '',
+        error: tokenRejected ? authText.failed : authText.unavailable,
+      });
     }
   };
 
@@ -108,10 +156,11 @@ export default function App() {
 
   const saveToken = async () => {
     const value = tokenDraft.trim();
-    if (!value) {
-      localStorage.removeItem('dpms_admin_token');
-    } else {
+    if (value) {
       localStorage.setItem('dpms_admin_token', value);
+    } else if (!localStorage.getItem('dpms_admin_token')) {
+      setAuthState({ status: 'missing', role: '', error: '' });
+      return;
     }
     await verifyToken();
     setTokenDraft('');
@@ -171,7 +220,11 @@ export default function App() {
               ? authText.verified
               : authState.status === 'failed'
                 ? (authState.error || authText.failed)
-                : authText.missing}
+                : authState.status === 'unavailable'
+                  ? (authState.error || authText.unavailable)
+                  : authState.status === 'unknown'
+                    ? authText.checking
+                    : authText.missing}
             {authState.role ? ` / ${authState.role}` : ''}
           </div>
           <label>
@@ -199,7 +252,26 @@ export default function App() {
 
       <main className="main-pane">
         {authState.status === 'verified' ? (
-          <PageComponent />
+          <PageErrorBoundary
+            key={page}
+            title={pageLoadFailureTitle}
+            message={pageLoadFailureMessage}
+            onRetry={() => reloadApplicationModuleGraph()}
+            retryLabel={pageLoadRetryText}
+          >
+            <Suspense fallback={(
+              <div className="auth-gate">
+                <div className="auth-gate-card">{pageLoadingText}</div>
+              </div>
+            )}
+            >
+              {pageDefinition.platformAware ? (
+                <PlatformModuleBoundary Component={PageComponent} language={language} />
+              ) : (
+                <PageComponent />
+              )}
+            </Suspense>
+          </PageErrorBoundary>
         ) : authState.status === 'unknown' ? (
           <div className="auth-gate">
             <div className="auth-gate-card">{authText.checking}</div>
@@ -207,8 +279,12 @@ export default function App() {
         ) : (
           <div className="auth-gate">
             <div className="auth-gate-card">
-              <h2>{authText.gateTitle}</h2>
-              <p>{authText.gateBody}</p>
+              <h2>{authState.status === 'unavailable'
+                ? authText.unavailableTitle
+                : authText.gateTitle}</h2>
+              <p>{authState.status === 'unavailable'
+                ? authText.unavailableBody
+                : authText.gateBody}</p>
               <input
                 className="auth-gate-input"
                 type="password"
@@ -219,8 +295,12 @@ export default function App() {
                 onKeyDown={e => { if (e.key === 'Enter') saveToken(); }}
               />
               <button type="button" onClick={saveToken}>{authText.save}</button>
-              {authState.status === 'failed' && (
-                <div className="auth-gate-error">{authState.error || authText.failed}</div>
+              {['failed', 'unavailable'].includes(authState.status) && (
+                <div className="auth-gate-error">
+                  {authState.error || (authState.status === 'failed'
+                    ? authText.failed
+                    : authText.unavailable)}
+                </div>
               )}
             </div>
           </div>

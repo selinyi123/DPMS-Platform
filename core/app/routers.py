@@ -19,6 +19,7 @@ from app.api import (
     throughput,
     transitions,
     update,
+    xiaohongshu_targets,
 )
 
 
@@ -41,6 +42,11 @@ API_ROUTERS = (
     (capacity.router, "/api/capacity", ["capacity"]),
     (orchestration.router, "/api/orchestration", ["orchestration"]),
     (throughput.router, "/api/throughput", ["throughput"]),
+    (
+        xiaohongshu_targets.router,
+        "/api/xiaohongshu-targets",
+        ["xiaohongshu-targets"],
+    ),
 )
 
 

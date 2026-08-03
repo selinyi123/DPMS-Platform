@@ -6,7 +6,28 @@ from app.config import settings
 from app.utils.log import structured_log
 
 
-database = databases.Database(settings.database_url)
+# Keep every pooled session on the same clock contract as Core. In particular,
+# TIMESTAMP risk deadlines must not change meaning when a host/server default
+# time zone differs between deployment units.
+database = databases.Database(
+    settings.database_url,
+    init_command="SET time_zone = '+00:00'",
+)
+
+
+async def execute_affected_rows(query, values=None, *, db=None) -> int:
+    """Execute MySQL DML and read the connection-local affected-row count."""
+
+    target = db or database
+    async with target.transaction():
+        await target.execute(query, values)
+        row = await target.fetch_one("SELECT ROW_COUNT() AS affected")
+    if row is None:
+        raise RuntimeError("database_affected_row_count_unavailable")
+    affected = int(row["affected"])
+    if affected < 0:
+        raise RuntimeError("database_affected_row_count_invalid")
+    return affected
 
 
 class RedisClient:
@@ -14,11 +35,19 @@ class RedisClient:
         self._conn = None
 
     async def initialize(self):
+        auth_options = {}
+        if settings.redis_username:
+            auth_options["username"] = settings.redis_username
+        if settings.redis_password:
+            auth_options["password"] = settings.redis_password
         self._conn = aioredis.from_url(
             settings.redis_url,
             encoding="utf-8",
             decode_responses=True,
-            max_connections=10,
+            max_connections=settings.redis_max_connections,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_connect_timeout_seconds,
+            **auth_options,
         )
 
     async def close(self):

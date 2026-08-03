@@ -1,9 +1,47 @@
 import { useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
 
-import { authenticatedApiPath, deleteJSON, fetchJSON, postJSON, putJSON } from '../api';
+import {
+  deleteJSON,
+  fetchJSON,
+  postJSON,
+  putJSON,
+} from '../api';
+import {
+  calibrationNeedsIdentityReview,
+  isWeiboOAuthAccount,
+  weiboOAuthCapabilityPresentation,
+} from '../accountCalibration';
+import { accountIdentityPresentation } from '../accountIdentityPresentation';
 import StatusBadge from '../components/StatusBadge';
+import AuthenticatedAssetLink from '../components/AuthenticatedAssetLink';
+import AuthenticatedImage from '../components/AuthenticatedImage';
+import {
+  DOUYIN_DEVICE_CREDENTIAL_INVALID,
+  normalizeDouyinDeviceCredential,
+} from '../douyinDeviceCredential';
+import {
+  browserLoginImagePath,
+  isActiveLoginSession,
+  isTerminalLoginStatus,
+  loginSessionPollRetryDelay,
+} from '../loginSessionPresentation';
 import { useUi } from '../uiContext';
+
+const WEIBO_ACTIONS = ['followed', 'liked', 'commented', 'favorited', 'reposted'];
+
+function defaultWeiboAttestationDraft() {
+  return {
+    app_review_status: 'unknown',
+    client_type: 'other',
+    granted_actions: Object.fromEntries(WEIBO_ACTIONS.map(action => [action, false])),
+  };
+}
+
+function usesDouyinDeviceCredential(account) {
+  return account?.platform === 'douyin'
+    && account?.credential_kind !== 'browser_session';
+}
 
 export default function Accounts() {
   const { language, notify, t } = useUi();
@@ -13,18 +51,59 @@ export default function Accounts() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [form, setForm] = useState({ platform: 'bilibili', encrypted_credential: '' });
+  const [qrPlatform, setQrPlatform] = useState('bilibili');
   const [credentialDrafts, setCredentialDrafts] = useState({});
   const [proxyDrafts, setProxyDrafts] = useState({});
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [loginSession, setLoginSession] = useState(null);
   const [imageReady, setImageReady] = useState(false);
+  const [qrImageRevision, setQrImageRevision] = useState(0);
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [recheckResult, setRecheckResult] = useState(null);
+  const [weiboAttestationDrafts, setWeiboAttestationDrafts] = useState({});
   const text = accountText[language] || accountText.zh;
 
   const selectedPlatform = useMemo(
     () => platforms.find(platform => platform.id === form.platform),
     [platforms, form.platform],
+  );
+  const selectedQrPlatform = useMemo(
+    () => platforms.find(platform => platform.id === qrPlatform),
+    [platforms, qrPlatform],
+  );
+  const loginSessionActive = isActiveLoginSession(loginSession);
+  const selectedQrSessionActive = loginSessionActive
+    && loginSession?.platform === qrPlatform;
+  const formUsesWeiboOAuth = form.platform === 'weibo';
+  const formUsesDouyinDevice = form.platform === 'douyin';
+  const formCredentialKeys = formUsesWeiboOAuth
+    ? {
+      kicker: 'accounts.weiboOAuthLogin',
+      title: 'accounts.weiboOAuthImport',
+      label: 'accounts.weiboOAuthCredential',
+      placeholder: 'accounts.weiboOAuthCredentialPlaceholder',
+      hint: 'accounts.weiboOAuthCredentialHint',
+    }
+    : formUsesDouyinDevice
+      ? {
+        kicker: 'accounts.douyinDeviceLogin',
+        title: 'accounts.douyinDeviceImport',
+        label: 'accounts.douyinDeviceCredential',
+        placeholder: 'accounts.douyinDeviceCredentialPlaceholder',
+        hint: 'accounts.douyinDeviceCredentialHint',
+      }
+      : {
+        kicker: 'accounts.cookieLogin',
+        title: 'accounts.cookieImport',
+        label: 'accounts.cookie',
+        placeholder: 'accounts.cookiePlaceholder',
+        hint: 'accounts.rawCookieHint',
+      };
+
+  const describeCredentialError = err => (
+    err?.code === DOUYIN_DEVICE_CREDENTIAL_INVALID
+      ? t('accounts.douyinDeviceCredentialInvalid')
+      : err.message
   );
 
   const load = async () => {
@@ -45,9 +124,10 @@ export default function Accounts() {
   useEffect(() => { load(); }, []);
 
   useEffect(() => {
-    if (!loginSession?.session_id || ['confirmed', 'expired', 'failed'].includes(loginSession.status)) return undefined;
+    if (!loginSession?.session_id || isTerminalLoginStatus(loginSession.status)) return undefined;
     let cancelled = false;
     let timer;
+    let transientError = '';
     const poll = async () => {
       try {
         const next = loginSession.login_mode === 'official_qr'
@@ -55,9 +135,23 @@ export default function Accounts() {
           : await fetchJSON(`/accounts/login/qr/${loginSession.session_id}`);
         if (cancelled) return;
         setLoginSession(next);
+        if (next.login_mode !== 'official_qr') {
+          setQrImageRevision(current => current + 1);
+        }
+        if (transientError) {
+          setError(current => (current === transientError ? '' : current));
+          transientError = '';
+        }
         if (next.status === 'confirmed') await load();
       } catch (err) {
         if (cancelled) return;
+        const retryDelay = loginSessionPollRetryDelay(err);
+        if (retryDelay !== null) {
+          transientError = err.message;
+          setError(transientError);
+          timer = window.setTimeout(poll, retryDelay);
+          return;
+        }
         setError(err.message);
         setLoginSession(current => (
           current?.session_id === loginSession.session_id
@@ -100,9 +194,10 @@ export default function Accounts() {
     setBusy(true);
     setError('');
     setImageReady(false);
+    setQrImageRevision(0);
     setQrDataUrl('');
     try {
-      const session = await postJSON('/accounts/login/qr', { platform: form.platform });
+      const session = await postJSON('/accounts/login/qr', { platform: qrPlatform });
       setLoginSession(session);
       notify(`${t('accounts.qrLogin')} ${t(`status.${session.status}`)}`, 'info');
     } catch (err) {
@@ -118,30 +213,43 @@ export default function Accounts() {
     setBusy(true);
     setError('');
     try {
-      await postJSON('/accounts/', form);
+      const encryptedCredential = formUsesDouyinDevice
+        ? normalizeDouyinDeviceCredential(form.encrypted_credential)
+        : form.encrypted_credential;
+      await postJSON('/accounts/', {
+        ...form,
+        encrypted_credential: encryptedCredential,
+      });
       setForm({ ...form, encrypted_credential: '' });
       notify(t('accounts.importQueued'), 'success');
       await load();
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      const message = describeCredentialError(err);
+      setError(message);
+      notify(message, 'error');
     } finally {
       setBusy(false);
     }
   };
 
-  const saveCredential = async (accountId) => {
-    const value = credentialDrafts[accountId] || '';
+  const saveCredential = async (account) => {
+    const value = credentialDrafts[account.id] || '';
     setBusy(true);
     setError('');
     try {
-      await putJSON(`/accounts/${accountId}/credential`, { encrypted_credential: value });
-      setCredentialDrafts(prev => ({ ...prev, [accountId]: '' }));
+      const encryptedCredential = usesDouyinDeviceCredential(account)
+        ? normalizeDouyinDeviceCredential(value)
+        : value;
+      await putJSON(`/accounts/${account.id}/credential`, {
+        encrypted_credential: encryptedCredential,
+      });
+      setCredentialDrafts(prev => ({ ...prev, [account.id]: '' }));
       notify(t('accounts.credentialSaved'), 'success');
       await load();
     } catch (err) {
-      setError(err.message);
-      notify(err.message, 'error');
+      const message = describeCredentialError(err);
+      setError(message);
+      notify(message, 'error');
     } finally {
       setBusy(false);
     }
@@ -165,6 +273,45 @@ export default function Accounts() {
     try {
       await postJSON(`/accounts/${account.id}/calibrate`, { force: false });
       notify(t('accounts.calibrationQueued'), 'success');
+      await load();
+    } catch (err) {
+      setError(err.message);
+      notify(err.message, 'error');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const updateWeiboAttestation = (accountId, update) => {
+    setWeiboAttestationDrafts(previous => ({
+      ...previous,
+      [accountId]: {
+        ...defaultWeiboAttestationDraft(),
+        ...(previous[accountId] || {}),
+        ...update,
+      },
+    }));
+  };
+
+  const updateWeiboGrant = (accountId, action, granted) => {
+    const current = weiboAttestationDrafts[accountId] || defaultWeiboAttestationDraft();
+    updateWeiboAttestation(accountId, {
+      granted_actions: { ...current.granted_actions, [action]: granted },
+    });
+  };
+
+  const attestWeiboCapabilities = async (account) => {
+    if (!window.confirm(t('accounts.weiboOAuthAttestationConfirm'))) return;
+    const draft = weiboAttestationDrafts[account.id] || defaultWeiboAttestationDraft();
+    setBusy(true);
+    setError('');
+    try {
+      await postJSON(
+        `/accounts/${account.id}/weibo-oauth-capability-attestation`,
+        { ...draft, confirm: true },
+        { confirm: true },
+      );
+      notify(t('accounts.weiboOAuthAttestationQueued'), 'success');
       await load();
     } catch (err) {
       setError(err.message);
@@ -236,31 +383,165 @@ export default function Accounts() {
     );
   };
 
-  const canMarkReady = account => account.status === 'cooling' && account.credential_ready;
+  const canMarkReady = account => {
+    const weiboCapability = weiboOAuthCapabilityPresentation(account);
+    return ['warming', 'cooling'].includes(account.status)
+      && account.credential_ready
+      && account.latest_calibration?.status === 'succeeded'
+      && (!weiboCapability || (
+        weiboCapability.blockers.length === 0
+        && weiboCapability.grantedActions.length > 0
+      ));
+  };
   const canMarkCooling = account => ['ready', 'warming', 'executing'].includes(account.status);
   const canFreeze = account => !['frozen', 'banned'].includes(account.status);
-  const canCalibrate = account => account.credential_ready && !['executing', 'banned'].includes(account.status);
+  // A generic identity-only OAuth calibration becomes the newest evidence and
+  // intentionally invalidates an older capability attestation. OAuth accounts
+  // therefore refresh through the explicit admin-attestation workflow below.
+  const canCalibrate = account => account.credential_ready
+    && !isWeiboOAuthAccount(account)
+    && !['executing', 'banned'].includes(account.status);
   const proxyOptionsFor = account => proxies.filter(proxy => (
     !proxy.assigned_account || proxy.assigned_account.id === account.id
   ));
 
   const renderCalibration = (account) => {
     const calibration = account.latest_calibration;
-    if (!calibration) return <span className="badge badge-muted">{t('accounts.notChecked')}</span>;
+    const weiboCapability = weiboOAuthCapabilityPresentation(account);
+    const weiboOAuthAccount = isWeiboOAuthAccount(account);
+    const attestationDraft = weiboAttestationDrafts[account.id] || defaultWeiboAttestationDraft();
+    if (!calibration && !weiboOAuthAccount) {
+      return <span className="badge badge-muted">{t('accounts.notChecked')}</span>;
+    }
     return (
       <div className="calibration-summary">
-        <StatusBadge status={calibration.status} />
-        {calibration.screenshot_path && calibration.calibration_id && (
-          <a
+        {calibration
+          ? <StatusBadge status={calibration.status} />
+          : <span className="badge badge-muted">{t('accounts.notChecked')}</span>}
+        {calibrationNeedsIdentityReview(calibration) && (
+          <span className="badge badge-warn" title={t('accounts.sessionOnlyHint')}>
+            {t('accounts.sessionOnly')}
+          </span>
+        )}
+        {calibration?.screenshot_path && calibration.calibration_id && (
+          <AuthenticatedAssetLink
             className="badge badge-info evidence-link"
-            href={authenticatedApiPath(`/accounts/calibrations/${calibration.calibration_id}/screenshot`)}
-            target="_blank"
-            rel="noreferrer"
+            path={`/accounts/calibrations/${calibration.calibration_id}/screenshot`}
+            onError={(assetError) => {
+              setError(assetError.message);
+              notify(assetError.message, 'error');
+            }}
           >
             {t('accounts.evidence')}
-          </a>
+          </AuthenticatedAssetLink>
         )}
-        {calibration.error_message && <span className="mono small-text">{calibration.error_message}</span>}
+        {calibration?.error_message && <span className="mono small-text">{calibration.error_message}</span>}
+        {weiboCapability && (
+          <div className="runtime-summary">
+            <span className={`badge ${weiboCapability.blockers.length ? 'badge-warn' : 'badge-ready'}`}>
+              {t(weiboCapability.blockers.length
+                ? 'accounts.weiboOAuthNeedsEvidence'
+                : 'accounts.weiboOAuthVerified')}
+            </span>
+            {weiboCapability.present && (
+              <>
+                <span className="small-text">
+                  {t('accounts.weiboOAuthClient')}: {weiboCapability.clientType || '-'}
+                </span>
+                <span className="small-text">
+                  {t('accounts.weiboOAuthGranted')}: {weiboCapability.grantedActions.length
+                    ? weiboCapability.grantedActions.map(action => t(`lotteries.actions.${action}`)).join(' / ')
+                    : t('common.none')}
+                </span>
+                {!!weiboCapability.deniedActions.length && (
+                  <span className="small-text warning-text">
+                    {t('accounts.weiboOAuthDenied')}: {weiboCapability.deniedActions
+                      .map(action => t(`lotteries.actions.${action}`)).join(' / ')}
+                  </span>
+                )}
+                {weiboCapability.verifiedAt && (
+                  <span className="mono small-text">
+                    {t('accounts.weiboOAuthVerifiedAt')}: {weiboCapability.verifiedAt}
+                  </span>
+                )}
+                {weiboCapability.attestedAt && (
+                  <span className="mono small-text">
+                    {t('accounts.weiboOAuthAttestedAt')}: {weiboCapability.attestedAt}
+                  </span>
+                )}
+                {weiboCapability.attestedBy && (
+                  <span className="small-text">
+                    {t('accounts.weiboOAuthAttestedBy')}: {weiboCapability.attestedBy}
+                  </span>
+                )}
+              </>
+            )}
+            {weiboCapability.blockers.map(code => (
+              <span className="badge badge-warn" key={code}>
+                {t(`accounts.weiboOAuthBlockers.${code}`)}
+              </span>
+            ))}
+          </div>
+        )}
+        {weiboOAuthAccount && (
+          <details className="runtime-summary">
+            <summary>{t('accounts.weiboOAuthAttestationTitle')}</summary>
+            <span className="small-text warning-text">
+              {t('accounts.weiboOAuthAttestationWarning')}
+            </span>
+            <label>
+              <span>{t('accounts.weiboOAuthAppReviewStatus')}</span>
+              <select
+                className="input compact-input"
+                value={attestationDraft.app_review_status}
+                onChange={event => updateWeiboAttestation(account.id, {
+                  app_review_status: event.target.value,
+                })}
+              >
+                {['unknown', 'test_only', 'approved'].map(value => (
+                  <option value={value} key={value}>
+                    {t(`accounts.weiboOAuthAppReviewStatuses.${value}`)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>{t('accounts.weiboOAuthClientType')}</span>
+              <select
+                className="input compact-input"
+                value={attestationDraft.client_type}
+                onChange={event => updateWeiboAttestation(account.id, {
+                  client_type: event.target.value,
+                })}
+              >
+                {['other', 'weibo'].map(value => (
+                  <option value={value} key={value}>
+                    {t(`accounts.weiboOAuthClientTypes.${value}`)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="check-grid">
+              {WEIBO_ACTIONS.map(action => (
+                <label className="check-item" key={action}>
+                  <input
+                    type="checkbox"
+                    checked={attestationDraft.granted_actions[action]}
+                    onChange={event => updateWeiboGrant(account.id, action, event.target.checked)}
+                  />
+                  <span>{t(`lotteries.actions.${action}`)}</span>
+                </label>
+              ))}
+            </div>
+            <button
+              className="btn-danger"
+              disabled={busy || !account.credential_ready || ['executing', 'banned'].includes(account.status)}
+              onClick={() => attestWeiboCapabilities(account)}
+            >
+              {t('accounts.weiboOAuthAttestationSubmit')}
+            </button>
+          </details>
+        )}
       </div>
     );
   };
@@ -287,6 +568,41 @@ export default function Accounts() {
       );
     }
     return <span className="badge badge-muted">{t('lotteries.noRuns')}</span>;
+  };
+
+  const renderPlatformIdentity = (account) => {
+    const identity = accountIdentityPresentation(account);
+    if (!identity.verified) {
+      return (
+        <div className="runtime-summary account-identity-summary">
+          <span className="badge badge-muted">
+            {t(`accounts.identityStates.${identity.state}`)}
+          </span>
+        </div>
+      );
+    }
+    return (
+      <div className="runtime-summary account-identity-summary">
+        <span className="badge badge-ready">{t('accounts.identityVerified')}</span>
+        {identity.nickname && <strong>{identity.nickname}</strong>}
+        {identity.uid && (
+          <span className="mono small-text">
+            {t('accounts.platformUid')}: {identity.uid}
+          </span>
+        )}
+        {identity.title && <span className="badge badge-info">{identity.title}</span>}
+        {identity.level && (
+          <span className="small-text">
+            {t('accounts.platformLevel')}: {identity.level}
+          </span>
+        )}
+        {identity.state === 'verified_without_public_profile' && (
+          <span className="small-text muted-text">
+            {t('accounts.identityStates.verified_without_public_profile')}
+          </span>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -317,12 +633,23 @@ export default function Accounts() {
           <div className="form-row">
             <label>
               <span>{t('accounts.platform')}</span>
-              <select className="input" value={form.platform} onChange={e => setForm({ ...form, platform: e.target.value })}>
+              <select className="input" value={qrPlatform} onChange={e => setQrPlatform(e.target.value)}>
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
               </select>
             </label>
-            <button className="btn-primary" disabled={busy || !selectedPlatform?.qr_login} onClick={startQrLogin}>{t('accounts.generateQr')}</button>
+            <button
+              className="btn-primary"
+              disabled={busy || !selectedQrPlatform?.qr_login || selectedQrSessionActive}
+              onClick={startQrLogin}
+            >
+              {t('accounts.generateQr')}
+            </button>
           </div>
+          {selectedQrPlatform?.qr_login_blocker && (
+            <div className="alert-warn">
+              {t(`accounts.qrLoginBlockers.${selectedQrPlatform.qr_login_blocker}`)}
+            </div>
+          )}
           <div className="qr-frame">
             {loginSession?.session_id ? (
               <>
@@ -332,14 +659,21 @@ export default function Accounts() {
                     : <div className="qr-empty">{t('accounts.qrOpening')}</div>
                 ) : (
                   <>
-                    {!imageReady && <div className="qr-empty">{t('accounts.qrOpening')}</div>}
-                    <img
-                      alt="QR login screen"
-                      src={authenticatedApiPath(`/accounts/login/qr/${loginSession.session_id}/image?ts=${loginSession.updated_at || Date.now()}`)}
-                      style={{ display: imageReady ? 'block' : 'none' }}
-                      onLoad={() => setImageReady(true)}
-                      onError={() => setImageReady(false)}
-                    />
+                    {!imageReady && loginSessionActive && (
+                      <div className="qr-empty">{t('accounts.qrOpening')}</div>
+                    )}
+                    {!imageReady && !loginSessionActive && (
+                      <div className="qr-empty">{loginSession.error_message || t(`status.${loginSession.status}`)}</div>
+                    )}
+                    {loginSessionActive && (
+                      <AuthenticatedImage
+                        alt="QR login screen"
+                        path={browserLoginImagePath(loginSession, qrImageRevision)}
+                        style={{ display: imageReady ? 'block' : 'none' }}
+                        onLoad={() => setImageReady(true)}
+                        onError={() => setImageReady(false)}
+                      />
+                    )}
                   </>
                 )}
                 <div className="qr-status">
@@ -356,25 +690,35 @@ export default function Accounts() {
         </div>
 
         <div className="panel">
-          <div className="panel-kicker">{t('accounts.cookieLogin')}</div>
-          <div className="panel-title">{t('accounts.cookieImport')}</div>
+          <div className="panel-kicker">{t(formCredentialKeys.kicker)}</div>
+          <div className="panel-title">{t(formCredentialKeys.title)}</div>
           <form onSubmit={createAccount} className="stack-form">
             <label>
               <span>{t('accounts.platform')}</span>
-              <select className="input" value={form.platform} onChange={e => setForm({ ...form, platform: e.target.value })}>
+              <select
+                className="input"
+                value={form.platform}
+                onChange={e => setForm({
+                  ...form,
+                  platform: e.target.value,
+                  encrypted_credential: '',
+                })}
+              >
                 {platforms.map(platform => <option value={platform.id} key={platform.id}>{platform.label}</option>)}
               </select>
             </label>
             <label>
-              <span>{t('accounts.cookie')}</span>
+              <span>{t(formCredentialKeys.label)}</span>
               <textarea
                 className="input textarea tall-textarea"
                 value={form.encrypted_credential}
                 onChange={e => setForm({ ...form, encrypted_credential: e.target.value })}
-                placeholder={t('accounts.cookiePlaceholder')}
+                placeholder={t(formCredentialKeys.placeholder)}
+                autoComplete="off"
+                spellCheck={false}
               />
             </label>
-            <p className="muted-text tight-text">{t('accounts.rawCookieHint')}</p>
+            <p className="muted-text tight-text">{t(formCredentialKeys.hint)}</p>
             <button className="btn-primary" disabled={busy || !form.encrypted_credential} type="submit">{t('accounts.importCreate')}</button>
           </form>
           {error && <div className="alert-danger">{error}</div>}
@@ -387,8 +731,9 @@ export default function Accounts() {
           <table className="data-table">
             <thead>
               <tr>
-                <th>ID</th>
+                <th>{t('accounts.internalId')}</th>
                 <th>{text.platform}</th>
+                <th>{t('accounts.platformIdentity')}</th>
                 <th>{text.credential}</th>
                 <th>{text.status}</th>
                 <th>{text.calibration}</th>
@@ -405,6 +750,7 @@ export default function Accounts() {
                 <tr key={account.id}>
                   <td className="mono">A{account.id}</td>
                   <td>{platforms.find(platform => platform.id === account.platform)?.label || account.platform}</td>
+                  <td>{renderPlatformIdentity(account)}</td>
                   <td>{account.credential_ready ? <span className="badge badge-ready">{t('accounts.imported')}</span> : <span className="badge badge-warn">{t('accounts.missing')}</span>}</td>
                   <td><StatusBadge status={account.status} /></td>
                   <td>{renderCalibration(account)}</td>
@@ -452,7 +798,7 @@ export default function Accounts() {
                   </td>
                 </tr>
               ))}
-              {!accounts.length && <tr><td colSpan="11" className="empty-cell">{t('accounts.noAccounts')}</td></tr>}
+              {!accounts.length && <tr><td colSpan="12" className="empty-cell">{t('accounts.noAccounts')}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -471,9 +817,20 @@ export default function Accounts() {
                 className="input textarea"
                 value={credentialDrafts[account.id] || ''}
                 onChange={e => setCredentialDrafts(prev => ({ ...prev, [account.id]: e.target.value }))}
-                placeholder={t('accounts.cookiePlaceholder')}
+                placeholder={t(usesDouyinDeviceCredential(account)
+                  ? 'accounts.douyinDeviceCredentialPlaceholder'
+                  : account.platform === 'weibo'
+                    ? (isWeiboOAuthAccount(account)
+                      ? 'accounts.weiboOAuthCredentialPlaceholder'
+                      : 'accounts.cookiePlaceholder')
+                    : 'accounts.cookiePlaceholder')}
+                autoComplete="off"
+                spellCheck={false}
               />
-              <button className="btn-primary" disabled={busy || !credentialDrafts[account.id]} onClick={() => saveCredential(account.id)}>{text.save}</button>
+              {usesDouyinDeviceCredential(account) && (
+                <p className="muted-text tight-text">{t('accounts.douyinDeviceCredentialHint')}</p>
+              )}
+              <button className="btn-primary" disabled={busy || !credentialDrafts[account.id]} onClick={() => saveCredential(account)}>{text.save}</button>
             </div>
           ))}
           {!accounts.length && <div className="empty-cell">{t('accounts.noRefresh')}</div>}

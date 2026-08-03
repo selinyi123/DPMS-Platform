@@ -23,7 +23,10 @@ class SecretPostureTests(unittest.TestCase):
             admin_token="a-strong-admin-token-value",
             update_secret="a-strong-update-secret-value",
             encryption_key=GOOD_KEY,
-            database_url="mysql+aiomysql://app:S3cret@mysql:3306/lottery",
+            database_url=(
+                "mysql+aiomysql://app:"
+                "a-strong-runtime-secret@mysql:3306/lottery"
+            ),
         )
         self.assertEqual(problems, [])
 
@@ -76,6 +79,46 @@ class SecretPostureTests(unittest.TestCase):
         )
         self.assertTrue(any(p["key"] == "DATABASE_URL" for p in problems))
 
+    def test_built_in_role_passwords_are_flagged_when_url_encoded(self):
+        problems = secret_posture(
+            admin_token="a-strong-admin-token-value",
+            update_secret="a-strong-update-secret-value",
+            encryption_key=GOOD_KEY,
+            database_url=(
+                "mysql+aiomysql://dpms_runtime:"
+                "dpms-runtime-local-only-change-me-2026"
+                "@mysql:3306/lottery"
+            ),
+        )
+        self.assertIn(
+            "database_password_is_built_in_default",
+            {
+                problem["issue"]
+                for problem in problems
+                if problem["key"] == "DATABASE_URL"
+            },
+        )
+
+    def test_migration_role_is_rejected_for_runtime(self):
+        problems = secret_posture(
+            admin_token="a-strong-admin-token-value",
+            update_secret="a-strong-update-secret-value",
+            encryption_key=GOOD_KEY,
+            database_url=(
+                "mysql+aiomysql://dpms_migrate:"
+                "a-strong-migration-password"
+                "@mysql:3306/lottery"
+            ),
+        )
+        self.assertIn(
+            "runtime_uses_default_migration_role",
+            {
+                problem["issue"]
+                for problem in problems
+                if problem["key"] == "DATABASE_URL"
+            },
+        )
+
 
 class LogRedactionTests(unittest.TestCase):
     def test_sensitive_keys_are_redacted(self):
@@ -87,6 +130,29 @@ class LogRedactionTests(unittest.TestCase):
         self.assertEqual(_redact_extra("platform", "bilibili"), "bilibili")
         self.assertEqual(_redact_extra("task_id", "abc"), "abc")
         self.assertEqual(_redact_extra("count", 5), "5")
+
+    def test_error_and_nested_secret_values_are_redacted(self):
+        self.assertEqual(
+            _redact_extra(
+                "error",
+                "connection failed for mysql://user:secret@host/db",
+            ),
+            "<redacted>",
+        )
+        sanitized = _redact_extra(
+            "context",
+            {
+                "platform": "weibo",
+                "credential": "sensitive-cookie",
+            },
+        )
+        self.assertEqual(sanitized["platform"], "weibo")
+        self.assertEqual(sanitized["credential"], "<redacted>")
+
+    def test_log_fields_are_bounded(self):
+        value = _redact_extra("detail", "x" * 10_000)
+        self.assertLess(len(value), 600)
+        self.assertTrue(value.endswith("<truncated>"))
 
 
 if __name__ == "__main__":

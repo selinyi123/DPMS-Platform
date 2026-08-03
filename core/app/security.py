@@ -36,11 +36,12 @@ def parse_bool(value: Any) -> bool:
 def actor_from_request(request: Request) -> dict[str, str] | None:
     provided = request.headers.get("x-admin-token", "")
     auth_type = "x-admin-token"
-    if not provided and request.method in {"GET", "HEAD"}:
-        # Browser-native EventSource, <img>, and normal links cannot attach
-        # custom headers. Restrict query-token auth to read-only requests.
-        provided = request.query_params.get("admin_token", "")
-        auth_type = "admin_token_query"
+    if not provided:
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, bearer_value = authorization.partition(" ")
+        if separator and scheme.casefold() == "bearer":
+            provided = bearer_value.strip()
+            auth_type = "authorization-bearer"
     if settings.admin_token and provided and hmac.compare_digest(provided, settings.admin_token):
         return {
             "actor_id": "admin-token",
@@ -99,11 +100,22 @@ async def set_runtime_setting(key: str, value: str) -> None:
            ON DUPLICATE KEY UPDATE setting_value = :value, updated_at = NOW()""",
         {"key": key, "value": value},
     )
+    persisted = await database.fetch_one(
+        "SELECT setting_value FROM runtime_settings WHERE setting_key = :key",
+        {"key": key},
+    )
+    if not persisted or str(persisted["setting_value"]) != str(value):
+        raise RuntimeError(f"Runtime setting write was not persisted: {key}")
 
 
 async def is_real_run_enabled() -> bool:
-    default = "true" if settings.real_run_enabled else "false"
-    value = await get_runtime_setting("real_run_enabled", default)
+    # Two independent keys are required.  The deployment-level environment
+    # flag is the hard ceiling; the mutable database flag can only disable a
+    # process that was explicitly started with real-run capability.  Missing
+    # runtime state is fail-closed instead of inheriting a permissive default.
+    if not settings.real_run_enabled:
+        return False
+    value = await get_runtime_setting("real_run_enabled", "false")
     return parse_bool(value)
 
 

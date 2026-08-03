@@ -21,9 +21,11 @@ from typing import Any, Optional
 
 import httpx
 
+from app.utils.log import structured_log
+
 from . import wbi
 from .config import BiliEngineConfig
-from .errors import BiliApiError, CodeResult, classify
+from .errors import BiliApiError, CodeResult, Outcome, classify
 
 # Hosts/paths.
 _NAV = "https://api.bilibili.com/x/web-interface/nav"
@@ -65,10 +67,12 @@ def _random_buvid3() -> str:
 
 
 class BilibiliApiActionOutcomeUnknown(BiliApiError):
+    quarantine_account = True
+
     """A state-changing request may have reached Bilibili but was not confirmed.
 
-    Callers must not automatically replay the action.  A later durable journal
-    can route this state to reconciliation without pretending it is a normal
+    Callers must not automatically replay the action. A durable journal can
+    later route this state to reconciliation without pretending it is a normal
     transport retry.
     """
 
@@ -122,7 +126,18 @@ class BilibiliApiClient:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        await self.aclose()
+        try:
+            await self.aclose()
+        except Exception as close_exc:
+            # Closing the local HTTP pool cannot reverse a response that was
+            # already classified and durably settled. Letting cleanup replace
+            # the body outcome would incorrectly mark a completed task failed
+            # and make it eligible for replay.
+            structured_log(
+                "warning",
+                "bilibili_http_client_close_failed",
+                exception=close_exc,
+            )
 
     # ----- low-level transport with retry -----
 
@@ -136,10 +151,9 @@ class BilibiliApiClient:
     ) -> httpx.Response:
         """Send a request, retrying only when replay is known to be safe.
 
-        Reads use the existing transport/5xx retry policy.  State-changing
-        requests pass ``retry_safe=False`` so a timeout or a 5xx response is
-        surfaced after exactly one attempt: the server may already have applied
-        the mutation even though the client did not receive a usable result.
+        Reads retain the existing retry policy. State-changing requests pass
+        ``retry_safe=False`` because a timeout or 5xx can still mean that the
+        remote mutation succeeded even though no usable response arrived.
         """
         last: Exception | None = None
         max_attempts = self.config.max_http_retries + 1 if retry_safe else 1
@@ -180,6 +194,12 @@ class BilibiliApiClient:
                 data=body,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
+        except asyncio.CancelledError as exc:
+            # Cancellation can arrive after the request left this process but
+            # before a response was observed. Treat it like a lost response so
+            # the task-level quarantine path opens a breaker instead of
+            # assuming that the remote mutation did not happen.
+            raise BilibiliApiActionOutcomeUnknown(action, "cancelled") from exc
         except (httpx.TransportError, BiliApiError) as exc:
             raise BilibiliApiActionOutcomeUnknown(action, type(exc).__name__) from exc
         try:
@@ -188,6 +208,10 @@ class BilibiliApiClient:
         except Exception as exc:  # noqa: BLE001
             raise BilibiliApiActionOutcomeUnknown(action, "unclassifiable_response") from exc
         result = classify(action, code)
+        if result.outcome is Outcome.FATAL:
+            raise BilibiliApiActionOutcomeUnknown(
+                action, f"unrecognized_business_code_{code}"
+            )
         # carry the captcha url through for the (future) OCR path
         if code == 12015:
             url_field = (payload.get("data") or {}).get("url")
@@ -214,9 +238,20 @@ class BilibiliApiClient:
     # ----- reads -----
 
     async def check_login(self) -> bool:
-        """True iff the cookie is a logged-in session (nav.isLogin)."""
+        """Prove the authenticated session is the declared DedeUserID."""
         data = await self._get_json(_NAV)
-        return bool((data.get("data") or {}).get("isLogin"))
+        account = data.get("data") or {}
+        if not account.get("isLogin"):
+            return False
+        try:
+            authenticated_uid = int(account.get("mid") or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            self.uid > 0
+            and authenticated_uid > 0
+            and authenticated_uid == self.uid
+        )
 
     async def get_myinfo(self) -> dict:
         return await self._get_json(_SPACE_MYINFO)

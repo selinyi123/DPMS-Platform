@@ -17,14 +17,26 @@ export default function Orchestration() {
     setLoading(true);
     setError('');
     try {
-      const [campaign, draftList] = await Promise.all([
+      const [campaignResult, draftsResult] = await Promise.allSettled([
         fetchJSON('/orchestration/campaign'),
         fetchJSON('/orchestration/drafts'),
       ]);
-      setData(campaign);
-      setDrafts(draftList.items || []);
+      if (campaignResult.status === 'fulfilled') {
+        setData(campaignResult.value);
+      } else {
+        setData(null);
+      }
+      if (draftsResult.status === 'fulfilled') {
+        setDrafts(draftsResult.value.items || []);
+      } else {
+        setDrafts([]);
+      }
+      const failures = [campaignResult, draftsResult]
+        .filter(result => result.status === 'rejected')
+        .map(result => result.reason?.message || String(result.reason));
+      if (failures.length) setError(failures.join(' · '));
     } catch (err) {
-      setError(err.message);
+      setError(err.message || String(err));
     } finally {
       setLoading(false);
     }

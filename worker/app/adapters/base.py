@@ -22,5 +22,8 @@ class BaseAdapter:
     async def _comment(self, page):
         raise UnsupportedPlatformAction(f"{self.PLATFORM} comment action is not implemented")
 
+    async def _favorite(self, page):
+        raise UnsupportedPlatformAction(f"{self.PLATFORM} favorite action is not implemented")
+
     async def _repost(self, page):
         raise UnsupportedPlatformAction(f"{self.PLATFORM} repost action is not implemented")

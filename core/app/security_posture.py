@@ -8,7 +8,8 @@ refuses to start — so a real deployment can never run on the shipped default
 
 from __future__ import annotations
 
-import base64
+from shared.database_credentials import database_credential_problems
+from shared.runtime_secrets import encryption_key_problem
 
 # The values shipped in app.config as defaults. Running with these in production
 # means anyone who read the repo holds the admin token / update-signing secret.
@@ -26,15 +27,12 @@ def _weak_token(value: str | None, default: str) -> bool:
 
 
 def _encryption_key_problem(value: str | None) -> str | None:
-    if not value:
-        return "ENCRYPTION_KEY is not set"
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except Exception:
-        return "ENCRYPTION_KEY is not valid base64"
-    if len(raw) != 32:
-        return "ENCRYPTION_KEY must decode to 32 bytes"
-    return None
+    problem = encryption_key_problem(value)
+    return {
+        "encryption_key_missing": "ENCRYPTION_KEY is not set",
+        "encryption_key_invalid_base64": "ENCRYPTION_KEY is not valid base64",
+        "encryption_key_wrong_length": "ENCRYPTION_KEY must decode to 32 bytes",
+    }.get(problem)
 
 
 def secret_posture(
@@ -43,6 +41,7 @@ def secret_posture(
     update_secret: str | None,
     encryption_key: str | None,
     database_url: str | None = None,
+    database_runtime_user: str | None = None,
 ) -> list[dict]:
     """Return a list of secret-posture problems, each ``{key, issue}``.
 
@@ -56,8 +55,12 @@ def secret_posture(
     enc_problem = _encryption_key_problem(encryption_key)
     if enc_problem:
         problems.append({"key": "ENCRYPTION_KEY", "issue": enc_problem})
-    if database_url and ("user:password@" in database_url or ":password@" in database_url):
-        problems.append({"key": "DATABASE_URL", "issue": "uses the default database password"})
+    for issue in database_credential_problems(
+        database_url,
+        role="runtime",
+        expected_username=database_runtime_user,
+    ):
+        problems.append({"key": "DATABASE_URL", "issue": issue})
     return problems
 
 

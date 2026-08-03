@@ -37,6 +37,7 @@ SEARCH_TEXT_FIELDS = (
     "uname",
     "typename",
 )
+ZERO_WIDTH_TEXT = re.compile("[\u200b-\u200d\ufeff]")
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,88 @@ def extract_dynamic_text(dynamic: dict[str, Any]) -> str:
             append_text(chunks, block.get("desc_second"))
 
     return "\n".join(dict.fromkeys(chunk for chunk in chunks if chunk)).strip()
+
+
+def parse_bilibili_opus_detail(item: dict[str, Any]) -> dict[str, Any]:
+    """Extract exact visible opus text and author identity from detail v1.
+
+    The opus endpoint uses a module list rather than the dynamic feed's module
+    mapping. Text nodes are appended in paragraph order; link preview cards are
+    intentionally excluded because they are not part of the author's rule
+    prose.
+    """
+
+    if not isinstance(item, dict):
+        return {"title": "", "body": "", "full_text": "", "author": {}}
+    title = ""
+    author: dict[str, Any] = {}
+    paragraphs: list[str] = []
+    modules = item.get("modules")
+    if not isinstance(modules, list):
+        modules = []
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        module_type = str(module.get("module_type") or "")
+        if module_type == "MODULE_TYPE_TITLE":
+            title = clean_opus_text(
+                (module.get("module_title") or {}).get("text")
+            ).strip()
+        elif module_type == "MODULE_TYPE_AUTHOR":
+            raw_author = module.get("module_author") or {}
+            if isinstance(raw_author, dict):
+                author = {
+                    "mid": raw_author.get("mid"),
+                    "name": clean_opus_text(raw_author.get("name")).strip(),
+                    "jump_url": str(raw_author.get("jump_url") or "").strip(),
+                }
+        elif module_type == "MODULE_TYPE_CONTENT":
+            content = module.get("module_content") or {}
+            rows = content.get("paragraphs") if isinstance(content, dict) else []
+            for paragraph in rows if isinstance(rows, list) else ():
+                text = extract_opus_paragraph_text(paragraph)
+                if text:
+                    paragraphs.append(text)
+    body = "\n".join(paragraphs).strip()
+    full_text = "\n".join(part for part in (title, body) if part).strip()
+    return {
+        "title": title,
+        "body": body,
+        "full_text": full_text,
+        "author": author,
+    }
+
+
+def extract_opus_paragraph_text(paragraph: Any) -> str:
+    if not isinstance(paragraph, dict):
+        return ""
+    text_block = paragraph.get("text")
+    if not isinstance(text_block, dict):
+        return ""
+    nodes = text_block.get("nodes")
+    chunks: list[str] = []
+    for node in nodes if isinstance(nodes, list) else ():
+        if not isinstance(node, dict):
+            continue
+        word = node.get("word")
+        rich = node.get("rich")
+        user = node.get("user")
+        formula = node.get("formula")
+        value: Any = ""
+        if isinstance(word, dict):
+            value = word.get("words")
+        elif isinstance(rich, dict):
+            value = rich.get("orig_text") or rich.get("text")
+        elif isinstance(user, dict):
+            value = user.get("text") or user.get("name")
+        elif isinstance(formula, dict):
+            value = formula.get("latex") or formula.get("text")
+        chunks.append(clean_opus_text(value))
+    return "".join(chunks).strip()
+
+
+def clean_opus_text(value: Any) -> str:
+    return ZERO_WIDTH_TEXT.sub("", repair_mojibake(str(value or "")))
 
 
 def extract_search_text(item: dict[str, Any]) -> str:

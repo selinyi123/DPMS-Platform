@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { fetchJSON } from '../api';
 import MetricsCard from '../components/MetricsCard';
+import { knowledgeGapPresentation } from '../knowledgePresentation';
 import { useUi } from '../uiContext';
 
 const LEVEL_COLOR = {
@@ -137,18 +138,22 @@ export default function Knowledge() {
       <div className="panel">
         <div className="panel-title">{t('knowledge.learningGaps')}</div>
         <div className="gap-list">
-          {gaps.map(g => (
-            <div className="gap-item" key={g.code}>
-              <span className="badge" style={{ background: PRIORITY_COLOR[g.priority] || '#64748b', color: '#fff' }}>{g.priority}</span>
-              <div>
-                <div className="gap-title">{g.title}</div>
-                <div className="small-text muted-text">{g.detail}</div>
-                {g.evidence?.platforms && (
-                  <div className="small-text muted-text">{g.evidence.platforms.join(', ')}</div>
-                )}
+          {gaps.map(g => {
+            const localized = knowledgeGapPresentation(g, t);
+            return (
+              <div className="gap-item" key={g.code}>
+                <span className="badge" style={{ background: PRIORITY_COLOR[g.priority] || '#64748b', color: '#fff' }}>{g.priority}</span>
+                <div>
+                  <div className="small-text muted-text">{localized.label}</div>
+                  <div className="gap-title">{localized.title}</div>
+                  <div className="small-text muted-text">{localized.detail}</div>
+                  {g.evidence?.platforms && (
+                    <div className="small-text muted-text">{g.evidence.platforms.join(', ')}</div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {!gaps.length && <div className="empty-cell">{t('knowledge.noGaps')}</div>}
         </div>
       </div>

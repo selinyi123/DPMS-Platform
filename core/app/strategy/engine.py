@@ -8,8 +8,10 @@ keeps strategy decisions separated from data access.
 Safety boundary: this engine only *recommends* an execution mode and ranks
 targets. It never bypasses the real-run gate, hides automation, or evades
 platform protection. ``real_run`` is recommended only when the upstream gate
-inputs (calibrated account, adapter, probe evidence, global switch, closed
+inputs (account-scoped execution evidence, adapter, global switch, closed
 circuit breaker) are all satisfied; the API and worker still enforce the gate.
+An open breaker never authorizes ``real_run``, but it does not suppress the
+side-effect-free dry/shadow evidence ladder.
 """
 
 from __future__ import annotations
@@ -29,37 +31,59 @@ def choose_strategy_mode(
     dry_success: int,
     shadow_success: int,
     adapter_ready: bool,
-    probe_ready: bool,
     real_run_enabled: bool,
     breaker_allowed: bool,
     breaker_reason: str | None,
+    manual_assisted: bool = False,
+    execution_readiness_ready: bool | None = None,
+    probe_ready: bool | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Pick the safest next execution mode for a target.
 
     Returns ``(mode, reason_codes, blockers)``. The precedence is deliberately
-    conservative: any hard blocker short-circuits to ``blocked`` before a
-    progressive validation ladder (dry-run -> shadow-run -> real-run).
+    conservative: target/account concurrency blockers short-circuit before the
+    progressive validation ladder (dry-run -> shadow-run -> real-run). Circuit
+    breakers are mode-aware: they block the external-action rung only.
     """
     reasons: list[str] = []
     blockers: list[str] = []
+    # ``probe_ready`` remains an accepted keyword for callers compiled against
+    # the old helper contract, but is deliberately non-authoritative. Only an
+    # explicit account-scoped readiness result may authorize real-run.
+    exact_readiness_ready = execution_readiness_ready is True
     if active_runs > 0:
         return "blocked", ["active_run_in_progress"], ["target already has an active run"]
     if safe_accounts <= 0:
         return "blocked", ["no_safe_account"], ["no calibrated ready account"]
-    if not breaker_allowed:
-        return "blocked", ["circuit_breaker_open"], [breaker_reason or "circuit breaker open"]
+    # Manual-assisted platforms intentionally have no executable dry-run path:
+    # their only automated validation is a side-effect-free Shadow observation.
+    # Recommend that mode directly so the strategy queue never sends operators
+    # into a dry-run that the dispatch gate will permanently reject.
+    if manual_assisted:
+        return "shadow_run", ["manual_assisted_shadow_only"], blockers
+    # The account-scoped platform validator is more authoritative than the
+    # aggregate historical counters below. Bilibili binds a fresh probe and
+    # shadow pair; Weibo binds OAuth capability plus a fresh dry-run.
+    if (
+        adapter_ready
+        and exact_readiness_ready
+        and real_run_enabled
+        and breaker_allowed
+    ):
+        return "real_run", ["real_gate_ready"], blockers
     if dry_success <= 0:
         return "dry_run", ["dry_validation_needed"], blockers
     if shadow_success <= 0:
         return "shadow_run", ["shadow_validation_needed"], blockers
-    if adapter_ready and probe_ready and real_run_enabled:
-        return "real_run", ["real_gate_ready"], blockers
     if not adapter_ready:
         reasons.append("adapter_not_ready")
-    if not probe_ready:
-        reasons.append("probe_not_ready")
+    if not exact_readiness_ready:
+        reasons.append("execution_readiness_not_ready")
     if not real_run_enabled:
         reasons.append("real_run_disabled")
+    if not breaker_allowed:
+        reasons.append("circuit_breaker_open")
+        blockers.append(breaker_reason or "circuit breaker open")
     return "shadow_run", reasons or ["real_gate_not_ready"], blockers
 
 

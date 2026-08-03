@@ -34,6 +34,14 @@ export default defineConfig({
 
     emptyOutDir: true
 
+  },
+
+  // Platform import policies remain separate chunks inside the parser worker;
+  // ES module workers are required because IIFE workers cannot code-split.
+  worker: {
+
+    format: 'es'
+
   }
 
 });

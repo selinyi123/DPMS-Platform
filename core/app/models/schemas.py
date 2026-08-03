@@ -1,12 +1,18 @@
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from enum import StrEnum
 
-from typing import Optional
+from typing import Literal, Optional
 from typing import Any
 
 from datetime import datetime
+
+
+LOTTERY_SOURCE_TYPE_MAX_LENGTH = 32
+LOTTERY_SOURCE_ID_MAX_LENGTH = 64
+LOTTERY_RAW_URL_MAX_LENGTH = 512
+TRACKED_SOURCE_VALUE_MAX_LENGTH = 256
 
 
 
@@ -115,6 +121,19 @@ class AccountCalibrationRequest(BaseModel):
     force: bool = False
 
 
+class WeiboOAuthCapabilityAttestationRequest(BaseModel):
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_review_status: str = Field(min_length=1, max_length=16)
+
+    client_type: str = Field(min_length=1, max_length=16)
+
+    granted_actions: dict[str, Any]
+
+    confirm: bool = False
+
+
 
 class LotteryResponse(BaseModel):
 
@@ -175,11 +194,21 @@ class LotteryCreate(BaseModel):
 
     platform: str = "bilibili"
 
-    source_type: str = "manual"
+    source_type: str = Field(
+        default="manual",
+        min_length=1,
+        max_length=LOTTERY_SOURCE_TYPE_MAX_LENGTH,
+    )
 
-    source_id: Optional[str] = None
+    source_id: Optional[str] = Field(
+        default=None,
+        max_length=LOTTERY_SOURCE_ID_MAX_LENGTH,
+    )
 
-    raw_url: str = Field(min_length=8, max_length=2048)
+    raw_url: str = Field(
+        min_length=8,
+        max_length=LOTTERY_RAW_URL_MAX_LENGTH,
+    )
 
     canonical_url: Optional[str] = None
 
@@ -194,16 +223,37 @@ class LotteryActionPlanUpdate(BaseModel):
 
     rule_text: Optional[str] = None
 
-    reviewed: bool = True
+    # Review is an explicit operator attestation.  Omitting the field must
+    # never turn a draft into an executable plan.
+    reviewed: bool = False
+
+    # A review and a provenance attestation are deliberately separate.  A
+    # legacy client may still save a draft, but it cannot accidentally certify
+    # that a truncated discovery summary is the complete source rule.
+    rule_complete_confirmed: bool = False
+
+    # Keep the existing public-model default for generated clients.  The API
+    # distinguishes omission via ``model_fields_set`` and selects the target
+    # platform's safe default before persisting the plan.
+    execution_path_id: str = Field(default="bilibili_api_v2", min_length=1, max_length=128)
+
+    action_payloads: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class LotteryTargetImport(BaseModel):
 
     platform: str = "bilibili"
 
-    source_type: str = "manual_upload"
+    source_type: str = Field(
+        default="manual_upload",
+        min_length=1,
+        max_length=LOTTERY_SOURCE_TYPE_MAX_LENGTH,
+    )
 
-    source_id: Optional[str] = None
+    source_id: Optional[str] = Field(
+        default=None,
+        max_length=LOTTERY_SOURCE_ID_MAX_LENGTH,
+    )
 
     content: str = Field(min_length=1, max_length=200_000)
 
@@ -216,7 +266,13 @@ class TrackedSourceCreate(BaseModel):
 
     source_type: str = "url_list"
 
-    source_value: str = Field(min_length=1, max_length=2048)
+    # Keep request validation aligned with tracked_sources.source_value
+    # (VARCHAR(256)). Accepting a larger value here otherwise turns an
+    # ordinary client error into a database failure or silent truncation.
+    source_value: str = Field(
+        min_length=1,
+        max_length=TRACKED_SOURCE_VALUE_MAX_LENGTH,
+    )
 
     scan_interval_minutes: int = Field(default=30, ge=1, le=1440)
 
@@ -240,6 +296,39 @@ class RealRunSettingUpdate(BaseModel):
 class RuntimeRollbackRequest(BaseModel):
 
     reason: Optional[str] = "manual runtime rollback"
+
+
+class AutopilotHeartbeatReport(BaseModel):
+
+    """Bounded, non-secret status reported by the Autopilot process."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+
+    deployment_real_run_enabled: bool
+
+    real_run_ack_valid: bool
+
+    platform_allowlist: list[
+        Literal["bilibili", "weibo", "xiaohongshu", "douyin"]
+    ] = Field(default_factory=list, max_length=4)
+
+    platform_allowlist_valid: bool = True
+
+    poll_interval_seconds: float = Field(ge=1, le=3600)
+
+    round_status: Literal["ok", "error", "disabled"]
+
+    selected: int = Field(default=0, ge=0, le=100)
+
+    dispatched: int = Field(default=0, ge=0, le=100)
+
+    failures: int = Field(default=0, ge=0, le=100)
+
+    probes_requested: int = Field(default=0, ge=0, le=100)
+
+    deferred: int = Field(default=0, ge=0, le=100)
 
 
 class AdapterProbeRequest(BaseModel):

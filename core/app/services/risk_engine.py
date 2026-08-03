@@ -1,5 +1,5 @@
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.db import database, redis
 from app.event_store.service import record_event
@@ -102,6 +102,14 @@ async def incr_daily_count(account_id: int):
 async def check_all_accounts_health(cooldown_minutes: int = 15, stale_execution_minutes: int = 10):
     cooldown_minutes = max(1, min(int(cooldown_minutes), 1440))
     stale_execution_minutes = max(1, min(int(stale_execution_minutes), 120))
+    # Use one UTC snapshot for the whole pass. Besides keeping count/list/update
+    # decisions on the same boundary, direct comparisons let MySQL use the
+    # account/time indexes instead of evaluating TIMESTAMPDIFF for every row.
+    evaluation_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cooldown_cutoff = evaluation_now - timedelta(minutes=cooldown_minutes)
+    stale_execution_cutoff = evaluation_now - timedelta(
+        minutes=stale_execution_minutes
+    )
 
     missing_credentials = await database.fetch_one(
         """SELECT COUNT(*) AS cnt FROM accounts
@@ -121,15 +129,15 @@ async def check_all_accounts_health(cooldown_minutes: int = 15, stale_execution_
     stale_executing = await database.fetch_one(
         """SELECT COUNT(*) AS cnt FROM accounts
            WHERE status = 'executing'
-             AND TIMESTAMPDIFF(MINUTE, updated_at, NOW()) >= :minutes""",
-        {"minutes": stale_execution_minutes},
+              AND updated_at <= :stale_execution_cutoff""",
+        {"stale_execution_cutoff": stale_execution_cutoff},
     )
     stale_executing_accounts = await database.fetch_all(
         """SELECT id FROM accounts
            WHERE status = 'executing'
-             AND TIMESTAMPDIFF(MINUTE, updated_at, NOW()) >= :minutes
+              AND updated_at <= :stale_execution_cutoff
            LIMIT 500""",
-        {"minutes": stale_execution_minutes},
+        {"stale_execution_cutoff": stale_execution_cutoff},
     )
     await database.execute(
         """INSERT INTO risk_events (account_id, event_type, detail)
@@ -137,60 +145,63 @@ async def check_all_accounts_health(cooldown_minutes: int = 15, stale_execution_
                   JSON_OBJECT('reason', 'execution_timeout', 'minutes', :minutes)
            FROM accounts
            WHERE status = 'executing'
-             AND TIMESTAMPDIFF(MINUTE, updated_at, NOW()) >= :minutes""",
-        {"minutes": stale_execution_minutes},
+              AND updated_at <= :stale_execution_cutoff""",
+        {
+            "minutes": stale_execution_minutes,
+            "stale_execution_cutoff": stale_execution_cutoff,
+        },
     )
     await database.execute(
         """UPDATE accounts
            SET status = 'cooling', updated_at = NOW(), version = version + 1
            WHERE status = 'executing'
-             AND TIMESTAMPDIFF(MINUTE, updated_at, NOW()) >= :minutes""",
-        {"minutes": stale_execution_minutes},
+              AND updated_at <= :stale_execution_cutoff""",
+        {"stale_execution_cutoff": stale_execution_cutoff},
     )
 
     cooling_ready = await database.fetch_one(
         """SELECT COUNT(*) AS cnt FROM accounts a
            LEFT JOIN proxies p ON a.proxy_id = p.id
            WHERE a.status = 'cooling'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND TIMESTAMPDIFF(MINUTE, a.updated_at, NOW()) >= :minutes
-             AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
-             AND NOT EXISTS (
-               SELECT 1 FROM risk_events r
-               WHERE r.account_id = a.id
-                 AND TIMESTAMPDIFF(MINUTE, r.created_at, NOW()) < :minutes
-             )""",
-        {"minutes": cooldown_minutes},
+              AND OCTET_LENGTH(a.encrypted_credential) > 0
+              AND a.updated_at <= :cooldown_cutoff
+              AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
+              AND NOT EXISTS (
+                SELECT 1 FROM risk_events r
+                WHERE r.account_id = a.id
+                  AND r.created_at > :cooldown_cutoff
+              )""",
+        {"cooldown_cutoff": cooldown_cutoff},
     )
     cooling_ready_accounts = await database.fetch_all(
         """SELECT a.id FROM accounts a
            LEFT JOIN proxies p ON a.proxy_id = p.id
            WHERE a.status = 'cooling'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND TIMESTAMPDIFF(MINUTE, a.updated_at, NOW()) >= :minutes
-             AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
-             AND NOT EXISTS (
-               SELECT 1 FROM risk_events r
-               WHERE r.account_id = a.id
-                 AND TIMESTAMPDIFF(MINUTE, r.created_at, NOW()) < :minutes
-             )
+              AND OCTET_LENGTH(a.encrypted_credential) > 0
+              AND a.updated_at <= :cooldown_cutoff
+              AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
+              AND NOT EXISTS (
+                SELECT 1 FROM risk_events r
+                WHERE r.account_id = a.id
+                  AND r.created_at > :cooldown_cutoff
+              )
            LIMIT 500""",
-        {"minutes": cooldown_minutes},
+        {"cooldown_cutoff": cooldown_cutoff},
     )
     await database.execute(
         """UPDATE accounts a
            LEFT JOIN proxies p ON a.proxy_id = p.id
            SET a.status = 'ready', a.updated_at = NOW(), a.version = a.version + 1
            WHERE a.status = 'cooling'
-             AND OCTET_LENGTH(a.encrypted_credential) > 0
-             AND TIMESTAMPDIFF(MINUTE, a.updated_at, NOW()) >= :minutes
-             AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
-             AND NOT EXISTS (
-               SELECT 1 FROM risk_events r
-               WHERE r.account_id = a.id
-                 AND TIMESTAMPDIFF(MINUTE, r.created_at, NOW()) < :minutes
-             )""",
-        {"minutes": cooldown_minutes},
+              AND OCTET_LENGTH(a.encrypted_credential) > 0
+              AND a.updated_at <= :cooldown_cutoff
+              AND (a.proxy_id IS NULL OR p.cooldown_until IS NULL OR p.cooldown_until < NOW())
+              AND NOT EXISTS (
+                SELECT 1 FROM risk_events r
+                WHERE r.account_id = a.id
+                  AND r.created_at > :cooldown_cutoff
+              )""",
+        {"cooldown_cutoff": cooldown_cutoff},
     )
 
     for row in missing_credential_accounts:
